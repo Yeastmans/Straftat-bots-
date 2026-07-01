@@ -168,6 +168,244 @@ namespace StraftatBots
             return dx * dx + dz * dz;
         }
 
+        private float ScorePathCandidate(List<NavNode> path, Vector3 target)
+        {
+            if (path == null || path.Count == 0 || NavGraph.Instance == null)
+                return float.MinValue;
+
+            float startToTarget = Vector3.Distance(transform.position, target);
+            float endToTarget = Vector3.Distance(path[path.Count - 1].Position, target);
+            float closure = Mathf.Max(0f, startToTarget - endToTarget);
+            float targetHeightDelta = target.y - transform.position.y;
+            bool wantsVertical = Mathf.Abs(targetHeightDelta) > 2.25f;
+            float endHeightError = Mathf.Abs(path[path.Count - 1].Position.y - target.y);
+
+            float specialBonus = 0f;
+            float confidenceBonus = 0f;
+            float playerBonus = 0f;
+            float turnPenalty = 0f;
+            Vector3 prevDir = Vector3.zero;
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                var edge = NavGraph.Instance.GetEdgeBetween(path[i].Id, path[i + 1].Id);
+                if (edge == null) continue;
+                var from = NavGraph.Instance.GetNodeById(edge.From);
+                var to = NavGraph.Instance.GetNodeById(edge.To);
+                float gain = from != null && to != null ? to.Position.y - from.Position.y : 0f;
+                bool usefulVertical = wantsVertical && Mathf.Sign(gain) == Mathf.Sign(targetHeightDelta)
+                    && Mathf.Abs(gain) > 0.5f;
+
+                if (edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump)
+                    specialBonus += usefulVertical ? 2.4f : 0.6f;
+                else if (edge.Type == EdgeType.Ladder)
+                    specialBonus += usefulVertical ? 3.0f : 0.45f;
+                else if (edge.Type == EdgeType.Teleporter)
+                    specialBonus += wantsVertical ? 2.0f : 0.6f;
+                else if (edge.Type == EdgeType.Slide)
+                    specialBonus += 0.25f;
+                else if (edge.Type == EdgeType.Walk && usefulVertical)
+                    specialBonus += 1.0f;
+
+                confidenceBonus += Mathf.Clamp(edge.Confidence, 0f, 2f) * 0.18f;
+                if (from != null && from.PlayerSourced) playerBonus += 0.18f;
+                if (to != null && to.PlayerSourced) playerBonus += 0.18f;
+
+                if (from != null && to != null)
+                {
+                    Vector3 segDir = to.Position - from.Position;
+                    segDir.y = 0f;
+                    if (segDir.sqrMagnitude > 0.01f)
+                    {
+                        segDir.Normalize();
+                        if (prevDir.sqrMagnitude > 0.01f)
+                        {
+                            float dot = Vector3.Dot(prevDir, segDir);
+                            if (dot < 0.25f) turnPenalty += 0.45f;
+                            else if (dot < 0.65f) turnPenalty += 0.18f;
+                        }
+                        prevDir = segDir;
+                    }
+                }
+            }
+
+            float nodePenalty = path.Count * 0.3f;
+            float endPenalty = endToTarget * 0.8f;
+            float verticalPenalty = wantsVertical ? endHeightError * 2.2f : 0f;
+            return closure * 3f + specialBonus + confidenceBonus + playerBonus
+                - nodePenalty - endPenalty - verticalPenalty - turnPenalty;
+        }
+
+        private bool IsRouteSafeForPlay(List<NavNode> path)
+        {
+            if (path == null || path.Count <= 1 || NavGraph.Instance == null) return true;
+            if (NavGraph.Instance.Mode != NavMode.Play) return true;
+
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                var edge = NavGraph.Instance.GetEdgeBetween(path[i].Id, path[i + 1].Id);
+                if (edge == null || edge.Confidence <= 0f) return false;
+                if (NavGraph.Instance.IsBadForPlay(edge)) return false;
+
+                var from = NavGraph.Instance.GetNodeById(edge.From);
+                var to = NavGraph.Instance.GetNodeById(edge.To);
+                if (from == null || to == null) return false;
+
+                if ((edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump)
+                    && !IsPlayerProvenJumpEdge(edge)
+                    && !NavGraph.Instance.IsTrustedForPlay(edge))
+                    return false;
+
+                if (edge.Type == EdgeType.Fall)
+                {
+                    float drop = from.Position.y - to.Position.y;
+                    if (!NavGraph.Instance.IsTrustedForPlay(edge) || drop > 2.75f || to.NearEdge) return false;
+                }
+
+                if (to.NearEdge && edge.Type == EdgeType.Walk)
+                    return false;
+            }
+            return true;
+        }
+
+        private int CountRouteSpecialEdges(List<NavNode> path)
+        {
+            if (path == null || NavGraph.Instance == null) return 0;
+            int count = 0;
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                var edge = NavGraph.Instance.GetEdgeBetween(path[i].Id, path[i + 1].Id);
+                if (edge == null) continue;
+                if (edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump
+                    || edge.Type == EdgeType.Ladder || edge.Type == EdgeType.Teleporter
+                    || edge.Type == EdgeType.Slide)
+                    count++;
+            }
+            return count;
+        }
+
+        private bool ShouldHoldCurrentRoute(Vector3 target, bool hasWorkingPath, bool targetMoved)
+        {
+            if (!hasWorkingPath || _graphPath == null || _graphPathIndex >= _graphPath.Count) return false;
+            if (Time.time >= _routeCommitUntil) return false;
+            if (_progressState == ProgressState.HardStuck || _stuckTimer > 1.4f) return false;
+
+            float movedFromCommit = Vector3.Distance(_routeCommitTarget, target);
+            int specialEdges = CountRouteSpecialEdges(_graphPath);
+            float allowedTargetMove = specialEdges > 0 ? 11f : 7f;
+            if (movedFromCommit > allowedTargetMove) return false;
+
+            return !targetMoved || specialEdges > 0;
+        }
+
+        private float GetWaypointReachRadius(NavNode node)
+        {
+            float radius = State == BotState.Hunt ? 1.15f : 0.95f;
+            if (node == null) return radius;
+
+            NavEdge edge = null;
+            if (_lastReachedNode != null)
+                edge = FindBestPathEdge(_lastReachedNode.Id, node.Id);
+
+            if (edge != null)
+            {
+                switch (edge.Type)
+                {
+                    case EdgeType.Ladder:
+                        radius = 1.55f;
+                        break;
+                    case EdgeType.Jump:
+                    case EdgeType.WallJump:
+                    case EdgeType.Fall:
+                        radius = 1.25f;
+                        break;
+                    case EdgeType.Slide:
+                        radius = 1.2f;
+                        break;
+                }
+            }
+
+            if (_currentHorizInput > 0.8f) radius += 0.15f;
+            if (Mathf.Abs(node.Position.y - transform.position.y) > 1.2f) radius += 0.2f;
+            return radius;
+        }
+
+        private void AcceptGraphRoute(List<NavNode> path, PathSource source, Vector3 target, float score)
+        {
+            _graphPath = path ?? new List<NavNode>();
+            _graphPathIndex = 0;
+            _lastAcceptedPathScore = score;
+            _routeCommitTarget = target;
+
+            int specialEdges = CountRouteSpecialEdges(_graphPath);
+            // Stickier commits = bots stop re-deciding their route every couple seconds (smoother,
+            // less direction-thrashing). Safe now that A* is deterministic, so the committed route
+            // is the same one a repath would pick anyway.
+            float commitTime = specialEdges > 0 ? 5.5f : 3.0f;
+            if (State == BotState.GoToWeapon) commitTime += 1.5f;
+            if (Mathf.Abs(target.y - transform.position.y) > 2.25f) commitTime += 1.5f;
+            _routeCommitUntil = Time.time + commitTime;
+
+            SwitchPathSource(source);
+        }
+
+        private List<NavNode> FindVerticalConnectorRoute(Vector3 target)
+        {
+            if (NavGraph.Instance == null || !NavGraph.Instance.HasData) return null;
+            float targetHeightDelta = target.y - transform.position.y;
+            if (Mathf.Abs(targetHeightDelta) < 2.25f) return null;
+
+            NavNode bestNode = null;
+            float bestScore = float.MinValue;
+            for (int i = 0; i < NavGraph.Instance.Nodes.Count; i++)
+            {
+                var node = NavGraph.Instance.Nodes[i];
+                if (node == null || node.Confidence <= 0f) continue;
+                var edges = NavGraph.Instance.GetEdgesFrom(node.Id);
+                if (edges == null || edges.Count == 0) continue;
+
+                foreach (var edge in edges)
+                {
+                    if (edge == null || edge.Confidence <= 0f) continue;
+                    if (edge.Type != EdgeType.Ladder && edge.Type != EdgeType.Jump
+                        && edge.Type != EdgeType.WallJump && edge.Type != EdgeType.Teleporter)
+                        continue;
+
+                    var to = NavGraph.Instance.GetNodeById(edge.To);
+                    if (to == null) continue;
+                    float gain = to.Position.y - node.Position.y;
+                    if (edge.Type != EdgeType.Teleporter && Mathf.Sign(gain) != Mathf.Sign(targetHeightDelta))
+                        continue;
+                    if (edge.Type != EdgeType.Teleporter && Mathf.Abs(gain) < 0.5f)
+                        continue;
+
+                    float nodeDist = Vector3.Distance(transform.position, node.Position);
+                    float exitHeightError = Mathf.Abs(to.Position.y - target.y);
+                    float exitTargetDist = Vector3.Distance(to.Position, target);
+                    float score = -nodeDist * 0.6f - exitHeightError * 2.8f - exitTargetDist * 0.35f;
+                    if (edge.Type == EdgeType.Ladder) score += 8f;
+                    if (edge.Type == EdgeType.Teleporter) score += 7f;
+                    if ((edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump) && IsPlayerProvenJumpEdge(edge))
+                        score += 6f;
+                    if (node.PlayerSourced) score += 2f;
+                    if (to.PlayerSourced) score += 2f;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestNode = node;
+                    }
+                }
+            }
+
+            if (bestNode == null) return null;
+            var path = NavGraph.Instance.FindPath(transform.position, bestNode.Position,
+                jitter: 0.02f, searchRadius: 80f, playerOnly: true, preferHeight: true);
+            if (path == null || path.Count <= 1)
+                path = NavGraph.Instance.FindPath(transform.position, bestNode.Position,
+                    jitter: 0.02f, searchRadius: 80f, preferHeight: true);
+            return path;
+        }
+
         private void MoveToward(Vector3 target, float speed)
         {
             if (_cc == null || !_cc.enabled) return;
@@ -181,11 +419,33 @@ namespace StraftatBots
                     _nodelessBounceCount = Mathf.Max(0, _nodelessBounceCount - 1);
 
                 // Bounce lock — set by ping-pong detection below. While the lock is active,
-                // skip graph entirely and path directly to the target. This lets the bot reach
-                // enemies even when the local graph cluster is tangled with bad edges.
+                // mostly use nodeless movement, but keep probing graph recovery.
                 if (_nodelessLockTimer > 0f)
                 {
                     _nodelessLockTimer -= Time.deltaTime;
+
+                    // Probe graph recovery during nodeless lock instead of waiting out the full timer.
+                    if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    {
+                        _repathTimer -= Time.deltaTime;
+                        if (_repathTimer <= 0f)
+                        {
+                            _repathTimer = 0.6f;
+                            var recoverPath = NavGraph.Instance.FindPath(transform.position, target, searchRadius: 45f);
+                            if (recoverPath != null && recoverPath.Count > 1)
+                            {
+                                _graphPath = recoverPath;
+                                _graphPathIndex = 0;
+                                _nodelessLockTimer = 0f;
+                                _noPathRecoveryStreak = 0;
+                                SwitchPathSource(PathSource.GraphRoute);
+                                Plugin.Log.LogInfo($"[{BotName}] Recovered graph route during nodeless ({recoverPath.Count} nodes)");
+                            }
+                        }
+                    }
+
+                    if (_nodelessLockTimer <= 0f && _graphPath != null && _graphPath.Count > 1 && _graphPathIndex < _graphPath.Count)
+                        return;
                     MoveTowardNodeless(target, speed);
                     return;
                 }
@@ -194,6 +454,7 @@ namespace StraftatBots
                     && NavGraph.Instance.NodeCount >= 10;
                 if (!graphUsable)
                 {
+                    SwitchPathSource(PathSource.ExploreBuildRoute);
                     MoveTowardNodeless(target, speed);
                     return;
                 }
@@ -201,6 +462,14 @@ namespace StraftatBots
                 var nearBot = NavGraph.Instance.FindNearestNode(transform.position, 8f);
                 if (nearBot == null)
                 {
+                    SwitchPathSource(PathSource.ExploreBuildRoute);
+                    MoveTowardNodeless(target, speed);
+                    return;
+                }
+
+                if (IsDegeneratePath(target))
+                {
+                    SwitchPathSource(PathSource.DirectTacticalRoute);
                     MoveTowardNodeless(target, speed);
                     return;
                 }
@@ -267,55 +536,103 @@ namespace StraftatBots
                     || (_intentionalJumpTimer > 0f && !_cc.isGrounded);
                 // Don't repath if we have a working path and are making progress
                 bool hasWorkingPath = _graphPath.Count > 0 && _graphPathIndex < _graphPath.Count;
-                bool targetMoved = distToTarget > 5f; // Only repath if target moved significantly
+                bool routeHasSpecial = hasWorkingPath && CountRouteSpecialEdges(_graphPath) > 0;
+                bool targetMoved = distToTarget > (routeHasSpecial ? 10f : 5f);
 
-                if (!suppressRepath && (!hasWorkingPath || _repathTimer <= 0f || targetMoved))
+                if (!suppressRepath && ShouldHoldCurrentRoute(target, hasWorkingPath, targetMoved))
+                {
+                    // Keep executing the committed corridor. This prevents flicker between
+                    // equally plausible routes while climbing, jumping, or chasing weapons.
+                }
+                else if (!suppressRepath && (!hasWorkingPath || _repathTimer <= 0f || targetMoved))
                 {
                     // Adaptive repath interval: fast when no path, slow when path is working
-                    _repathTimer = hasWorkingPath ? 2f : 1f;
+                    bool weaponPath = State == BotState.GoToWeapon || (State == BotState.FindWeapon && _weaponTarget != null);
+                    _repathTimer = hasWorkingPath ? 2f : (weaponPath ? 1.8f : 1f);
                     _lastPathTarget = target;
 
-                    // Try cached route first (instant), then A*
-                    // Prefer height-gaining paths when target is above us
+                    // Weighted multi-candidate routing. Prefer routes that materially close
+                    // objective distance and include useful traversal edges (jump/ladder),
+                    // including player-only routes when regular graphing is weak.
                     bool wantHeight = target.y > transform.position.y + 2f;
-                    _graphPath = NavGraph.Instance.GetCachedRoute(transform.position, target);
-                    if (_graphPath.Count == 0)
-                        _graphPath = NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight);
-                    _graphPathIndex = 0;
 
-                    // No connected path to target — try alternatives
-                    if (_graphPath.Count == 0)
+                    List<NavNode> bestPath = null;
+                    float bestScore = float.MinValue;
+                    PathSource bestSrc = PathSource.DirectTacticalRoute;
+
+                    void ConsiderCandidate(List<NavNode> candidate, PathSource src)
                     {
-                        // Try wider search radius
-                        _graphPath = NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f);
-                        _graphPathIndex = 0;
-                    }
-                    if (_graphPath.Count == 0)
-                    {
-                        // Try closest reachable node near target
-                        var closestReachable = NavGraph.Instance.FindClosestReachableNode(
-                            transform.position, target);
-                        if (closestReachable != null)
+                        if (candidate == null || candidate.Count == 0) return;
+                        if (!IsRouteSafeForPlay(candidate)) return;
+                        float score = ScorePathCandidate(candidate, target);
+                        if (score > bestScore)
                         {
-                            _graphPath = NavGraph.Instance.FindPath(transform.position, closestReachable.Position);
-                            _graphPathIndex = 0;
+                            bestScore = score;
+                            bestPath = candidate;
+                            bestSrc = src;
                         }
                     }
-                    // Try patrol routes as highways — find a saved route that passes near the target
-                    if (_graphPath.Count == 0)
+
+                    bool combatPath = State == BotState.Hunt && _playerTarget != null;
+                    ConsiderCandidate(NavGraph.Instance.GetCachedRoute(transform.position, target), PathSource.GraphRoute);
+                    ConsiderCandidate(FindVerticalConnectorRoute(target), PathSource.GraphRoute);
+                    if (!combatPath)
                     {
-                        var patrolPath = NavGraph.Instance.FindNearestPatrolRoute(transform.position, target);
-                        if (patrolPath.Count > 0)
-                        {
-                            _graphPath = patrolPath;
-                            _graphPathIndex = 0;
-                        }
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight), PathSource.GraphRoute);
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
                     }
+                    ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                    if (weaponPath)
+                    {
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
+                    }
+
+                    var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
+                    if (closestReachable != null)
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
+
+                    ConsiderCandidate(NavGraph.Instance.FindNearestPatrolRoute(transform.position, target), PathSource.ExploreBuildRoute);
+
+                    // Wider keep-margin: only abandon the current route for a MATERIALLY better one
+                    // (was 0.75). Prevents swapping between near-equal routes — a key jitter source.
+                    if (hasWorkingPath && bestPath != null && _lastAcceptedPathScore > float.MinValue + 1f
+                        && bestScore < _lastAcceptedPathScore + 1.5f && !targetMoved)
+                    {
+                        _repathTimer = 1.0f;
+                        bestPath = _graphPath;
+                        bestSrc = PathSource.GraphRoute;
+                        bestScore = _lastAcceptedPathScore;
+                    }
+
+                    AcceptGraphRoute(bestPath ?? new List<NavNode>(), bestSrc, target, bestScore);
+
                     if (_graphPath.Count == 0)
                     {
                         // All graph pathing failed — fall back to nodeless direct movement
+                        SwitchPathSource(PathSource.DirectTacticalRoute);
                         MoveTowardNodeless(target, speed);
                         return;
+                    }
+                    _noPathRecoveryStreak = 0;
+
+                    // Single-node "paths" are usually just our current node and do not provide
+                    // actionable movement toward the target. Treat them as no-path so bots keep
+                    // pushing in nodeless mode instead of bouncing on node-repeat logic.
+                    if (_graphPath.Count == 1)
+                    {
+                        float onlyNodeDist = Vector3.Distance(transform.position, _graphPath[0].Position);
+                        float targetDist = Vector3.Distance(transform.position, target);
+                        bool verticalGoal = Mathf.Abs(target.y - transform.position.y) > 2.25f;
+                        bool keepVerticalConnector = verticalGoal && Mathf.Abs(_graphPath[0].Position.y - transform.position.y) > 0.75f;
+                        if (!keepVerticalConnector && onlyNodeDist < 2f && targetDist > 4f)
+                        {
+                            _graphPath.Clear();
+                            _graphPathIndex = 0;
+                            SwitchPathSource(PathSource.DirectTacticalRoute);
+                            MoveTowardNodeless(target, speed);
+                            return;
+                        }
                     }
                 }
 
@@ -323,22 +640,46 @@ namespace StraftatBots
                 while (_graphPathIndex < _graphPath.Count)
                 {
                     float distToNode = Vector3.Distance(transform.position, _graphPath[_graphPathIndex].Position);
-                    if (distToNode < 0.7f)
+                    bool reachedNodeThisFrame = distToNode < GetWaypointReachRadius(_graphPath[_graphPathIndex]);
+
+                    // Pure-pursuit style advancement: if the bot has already crossed the
+                    // waypoint plane, do not make it turn back to kiss the exact node.
+                    if (!reachedNodeThisFrame && _lastReachedNode != null)
+                    {
+                        Vector3 seg = _graphPath[_graphPathIndex].Position - _lastReachedNode.Position;
+                        seg.y = 0f;
+                        Vector3 botAlong = transform.position - _lastReachedNode.Position;
+                        botAlong.y = 0f;
+                        float segLen = seg.magnitude;
+                        if (segLen > 0.3f)
+                        {
+                            Vector3 segDir = seg / segLen;
+                            float along = Vector3.Dot(botAlong, segDir);
+                            float lateral = (botAlong - segDir * along).magnitude;
+                            if (along >= segLen - 0.25f && lateral < 1.35f)
+                                reachedNodeThisFrame = true;
+                        }
+                    }
+
+                    if (reachedNodeThisFrame)
                     {
                         var reachedNode = _graphPath[_graphPathIndex];
 
-                        // Report success — rehabilitates bad nodes, boosts confidence
-                        if (_lastReachedNode != null)
+                        bool trainingGraph = NavGraph.Instance.Mode == NavMode.Training;
+
+                        // Training success feeds certification; Play stays read-only here.
+                        if (trainingGraph && _lastReachedNode != null)
                             NavGraph.Instance.ReportSuccess(_lastReachedNode.Id, reachedNode.Id);
 
                         // Compress clusters around well-traveled areas (every 5th node to avoid spam)
-                        if (reachedNode.VisitCount % 5 == 0)
+                        if (trainingGraph && reachedNode.VisitCount % 5 == 0)
                             NavGraph.Instance.CompressNearby(reachedNode.Position);
 
                         // Track recent node history for ping-pong detection
                         _recentNodeIds[_recentNodeIdx] = reachedNode.Id;
                         _recentNodeIdx = (_recentNodeIdx + 1) % _recentNodeIds.Length;
                         if (_recentNodeCount < _recentNodeIds.Length) _recentNodeCount++;
+                        PushLoopSignature(reachedNode.Id, nextEdgeType, _lastMoveDir);
 
                         // Detect ping-pong: A→B→A→B pattern in recent history
                         // Detect ping-pong: A→B→A→B→A→B pattern — need 3 full cycles (6 entries)
@@ -354,6 +695,7 @@ namespace StraftatBots
                             if (n0 == n2 && n2 == n4 && n1 == n3 && n3 == n5 && n0 != n1)
                                 pingPong = true;
                         }
+                        if (!pingPong && HasLoopCycle()) pingPong = true;
 
                         // Track repeated node visits — delete bad edges
                         if (reachedNode.Id == _lastNodeRepeatedId)
@@ -361,42 +703,63 @@ namespace StraftatBots
                             _nodeRepeatCount++;
                         }
 
-                        if ((_nodeRepeatCount >= 10 || pingPong) && NavGraph.Instance != null)
+                        if (_graphPath.Count >= 2 && (_nodeRepeatCount >= 10 || pingPong) && NavGraph.Instance != null)
                         {
-                            // Bouncing between nodes — penalize the edges causing it
-                            Plugin.Log.LogInfo($"[{BotName}] {(pingPong ? "Ping-pong" : "Repeat")} detected at node {reachedNode.Id}");
-                            var badEdges = NavGraph.Instance.GetEdgesFrom(reachedNode.Id);
-                            foreach (var be in badEdges)
+                            if (Plugin.IsValidateMode && _validationRouteNodeIds.Count > 1)
                             {
-                                if (be.Type == EdgeType.Jump || be.Type == EdgeType.Fall || be.Type == EdgeType.WallJump)
-                                {
-                                    // Check if the target is one of our recent nodes (we keep going back to it)
-                                    bool isRecent = false;
-                                    for (int ri = 0; ri < _recentNodeCount; ri++)
-                                        if (_recentNodeIds[ri] == be.To) { isRecent = true; break; }
-                                    if (isRecent)
-                                    {
-                                        be.Confidence = Mathf.Max(be.Confidence - 0.5f, -1f);
-                                        if (be.Confidence <= 0f) be.Confidence = -1f;
-                                        Plugin.Log.LogInfo($"[{BotName}] Penalized bounce edge {reachedNode.Id}->{be.To}");
-                                    }
-                                }
+                                string label = string.IsNullOrWhiteSpace(_validationRouteLabel) ? "route" : _validationRouteLabel;
+                                NavGraph.Instance.ReportRouteValidation(_validationRouteNodeIds, success: false,
+                                    $"{BotName} ping-ponged while executing {label}");
+                                NavGraph.Instance.SuppressValidationLabel(label, 18f,
+                                    $"PATH FOLLOWER FAILED: {label}. Bots will try other routes; if it repeats, walk it yourself once.");
+                                _validationRouteNodeIds.Clear();
+                                _validationRouteTimer = 0f;
+                                _validationRouteTarget = Vector3.zero;
+                                _validationRouteLabel = null;
                             }
+
+                            if (Time.time < _loopBlacklistUntil)
+                            {
+                                _graphPath.Clear();
+                                _graphPathIndex = 0;
+                                _repathTimer = 0f;
+                                SwitchPathSource(PathSource.DirectTacticalRoute);
+                                MoveTowardNodeless(target, speed);
+                                return;
+                            }
+                            // Bouncing between nodes is almost always a STEERING/controller artifact
+                            // (equally-scored routes, waypoint twitch), NOT bad graph data. Break the
+                            // loop via repath + nodeless recovery below; do NOT destroy the shared
+                            // edge confidence — that was wiping out validly-trained jumps for a
+                            // movement bug the bot can recover from on its own.
+                            Plugin.Log.LogInfo($"[{BotName}] {(pingPong ? "Ping-pong" : "Repeat")} detected at node {reachedNode.Id} — breaking loop (graph data preserved)");
                             _nodeRepeatCount = 0;
                             _recentNodeCount = 0;
+                            _loopBreaks++;
+                            _loopBlacklistUntil = Time.time + 4f;
                             _graphPath.Clear();
                             _graphPathIndex = 0;
                             _repathTimer = 0f;
                             _stuckTimer = 1f; // Trigger stuck recovery
 
-                            // ENGAGE NODELESS LOCK — bypass the graph entirely for a window so the
-                            // bot can actually reach the target. Escalate on repeat bounces so a
-                            // bot stuck in a persistent tangle gets longer nodeless windows each time.
                             _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
                             _lastBounceTime = Time.time;
-                            // 4s base + 2s per escalation, up to 14s
-                            _nodelessLockTimer = Mathf.Min(14f, 4f + 2f * _nodelessBounceCount);
-                            Plugin.Log.LogInfo($"[{BotName}] Nodeless lock engaged for {_nodelessLockTimer:F1}s (bounce #{_nodelessBounceCount})");
+
+                            // First bounce: force quick repath retry without entering nodeless lock.
+                            // Repeated bounces: short lock window, then probe back into graph.
+                            if (_nodelessBounceCount < 2 && _progressState != ProgressState.HardStuck)
+                            {
+                                _nextRepathAllowedAt = Time.time + 0.2f;
+                                _noPathRecoveryStreak = Mathf.Max(_noPathRecoveryStreak, 1);
+                                SwitchPathSource(PathSource.GraphRoute);
+                                Plugin.Log.LogInfo($"[{BotName}] Repeat detected -> forcing repath retry");
+                            }
+                            else
+                            {
+                                _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
+                                SwitchPathSource(PathSource.DirectTacticalRoute);
+                                Plugin.Log.LogInfo($"[{BotName}] Nodeless lock engaged for {_nodelessLockTimer:F1}s (bounce #{_nodelessBounceCount})");
+                            }
                             break;
                         }
 
@@ -405,7 +768,7 @@ namespace StraftatBots
                         // Shortcut detection: bot walked prev → last → reached cleanly.
                         // If prev → reached is directly walkable, add the shortcut edge and
                         // decay the detour so A* prefers the straight route next time.
-                        if (_prevReachedNode != null && _lastReachedNode != null && NavGraph.Instance != null)
+                        if (trainingGraph && _prevReachedNode != null && _lastReachedNode != null && NavGraph.Instance != null)
                         {
                             NavGraph.Instance.TryShortcut(_prevReachedNode.Id, _lastReachedNode.Id, reachedNode.Id);
                         }
@@ -417,7 +780,7 @@ namespace StraftatBots
                         _graphPathIndex++;
 
                         // Re-check NearEdge: bot walked here, new nodes may exist below nearby edges
-                        if (reachedNode.NearEdge && NavGraph.Instance != null)
+                        if (trainingGraph && reachedNode.NearEdge && NavGraph.Instance != null)
                         {
                             reachedNode.NearEdge = NavGraph.Instance.CheckNearEdgePublic(reachedNode.Position);
                         }
@@ -427,6 +790,7 @@ namespace StraftatBots
 
                 if (_graphPathIndex < _graphPath.Count)
                 {
+                    SwitchPathSource(PathSource.GraphRoute);
                     Vector3 nodePos = _graphPath[_graphPathIndex].Position;
                     dir = nodePos - transform.position;
                     float distToNext = new Vector3(dir.x, 0, dir.z).magnitude;
@@ -441,6 +805,7 @@ namespace StraftatBots
                             toSkip.normalized, toSkip.magnitude, WALL_MASK, QueryTriggerInteraction.Ignore);
                         if (canSeeSkip)
                         {
+                            NavGraph.Instance.ReportBadNode(_graphPath[_graphPathIndex].Id, "skipped blocked waypoint", 1, silent: true);
                             _graphPathIndex++; // Skip blocked node
                             nodePos = _graphPath[_graphPathIndex].Position;
                             dir = nodePos - transform.position;
@@ -456,6 +821,28 @@ namespace StraftatBots
                         {
                             nextEdgeType = nextEdge.Type;
                             nextEdgeFromNode = _lastReachedNode;
+                        }
+                    }
+
+                    // Walk-route lookahead: once close to the current waypoint, steer a
+                    // little farther down the corridor. This removes the hard left-right
+                    // twitch that caused bots to ping-pong between valid planned nodes.
+                    if (nextEdgeType == EdgeType.Walk && _graphPathIndex + 1 < _graphPath.Count && distToNext < 2.1f)
+                    {
+                        var aheadNode = _graphPath[_graphPathIndex + 1];
+                        var aheadEdge = FindBestPathEdge(_graphPath[_graphPathIndex].Id, aheadNode.Id);
+                        if (aheadEdge != null && aheadEdge.Type == EdgeType.Walk
+                            && (NavGraph.Instance == null || !NavGraph.Instance.IsBadForPlay(aheadEdge)))
+                        {
+                            Vector3 aheadPos = aheadNode.Position;
+                            Vector3 toAhead = aheadPos - transform.position;
+                            toAhead.y = 0f;
+                            if (toAhead.sqrMagnitude > 0.25f)
+                            {
+                                nodePos = Vector3.Lerp(nodePos, aheadPos, 0.65f);
+                                dir = nodePos - transform.position;
+                                distToNext = new Vector3(dir.x, 0, dir.z).magnitude;
+                            }
                         }
                     }
 
@@ -477,7 +864,11 @@ namespace StraftatBots
                     if (nextEdgeType == EdgeType.Teleporter)
                     {
                         if (TryFollowTeleporterEdge(nextEdgeFromNode, _graphPath[_graphPathIndex], nextEdge, speed))
+                        {
+                            SwitchPathSource(PathSource.GraphRoute);
                             return;
+                        }
+                        SwitchPathSource(PathSource.DirectTacticalRoute);
                         MoveTowardNodeless(target, speed);
                         return;
                     }
@@ -602,32 +993,40 @@ namespace StraftatBots
                     if (nextEdgeType == EdgeType.Jump || nextEdgeType == EdgeType.WallJump)
                     {
                         // Look up the actual edge for locked data + fail tracking
-                        NavEdge jumpEdge = null;
-                        if (_lastReachedNode != null && NavGraph.Instance != null)
+                        NavEdge jumpEdge = nextEdge;
+                        if (jumpEdge == null && _lastReachedNode != null && NavGraph.Instance != null)
                             jumpEdge = NavGraph.Instance.GetEdgeBetween(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id);
 
                         Vector3 jumpToNode = nodePos - transform.position;
-                        float jumpTotalDist = jumpToNode.magnitude;
-                        float jumpHeightDiff = Mathf.Abs(jumpToNode.y);
+                        // Measure feasibility from the TAKEOFF NODE (the recorded edge length),
+                        // NOT the bot's transient position. Measuring from transform.position
+                        // condemned valid edges whenever the bot reached the waypoint plane a
+                        // little short/long — a positioning artifact, not a bad edge.
+                        Vector3 takeoffRef = _lastReachedNode != null ? _lastReachedNode.Position : transform.position;
+                        float jumpTotalDist = Vector3.Distance(takeoffRef, nodePos);
+                        float jumpHeightDiff = Mathf.Abs(nodePos.y - takeoffRef.y);
                         float maxJump = Plugin.GetMaxJumpDist();
 
-                        // DELETE impossible jumps — too far, too many failures, or no ground
+                        // Decide whether this jump is unreachable for the bot right now.
                         bool impossible = jumpTotalDist > maxJump || jumpHeightDiff > maxJump * 0.5f;
-                        if (jumpEdge != null && jumpEdge.FailCount >= 5) impossible = true;
                         bool destHasGround = Physics.Raycast(nodePos + Vector3.up * 2f, Vector3.down, 6f,
                             GROUND_MASK, QueryTriggerInteraction.Ignore);
                         bool isPlayMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play;
                         if (isPlayMode && !destHasGround) impossible = true;
+                        if (isPlayMode && (jumpEdge == null
+                            || (!IsPlayerProvenJumpEdge(jumpEdge) && !NavGraph.Instance.IsTrustedForPlay(jumpEdge))))
+                            impossible = true;
 
                         if (impossible)
                         {
-                            if (jumpEdge != null && jumpEdge.FailCount >= 5)
-                            {
-                                jumpEdge.Confidence = -1f; // Delete the edge permanently
-                                Plugin.Log.LogInfo($"[{BotName}] Deleted impossible jump edge ({jumpEdge.FailCount} fails)");
-                            }
-                            if (_lastReachedNode != null)
-                                NavGraph.Instance?.ReportFallOnEdge(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id, BotId);
+                            // The bot has NOT jumped — this is a PATHING decision, not a traversal
+                            // failure. Do NOT slam the edge with a death-level fall penalty and do
+                            // NOT single-bot-delete it (that destroyed validly-trained jumps). Only
+                            // a jump genuinely beyond the envelope FROM ITS TAKEOFF NODE gets one
+                            // consensus-gated strike; the play-mode "untrusted/no-ground" cases just repath.
+                            bool trulyTooFar = jumpTotalDist > maxJump || jumpHeightDiff > maxJump * 0.5f;
+                            if (trulyTooFar && jumpEdge != null && _lastReachedNode != null && NavGraph.Instance != null)
+                                NavGraph.Instance.ReportFallOnEdge(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id, BotId);
                             _graphPath.Clear();
                             _graphPathIndex = 0;
                             _repathTimer = 0f;
@@ -636,8 +1035,8 @@ namespace StraftatBots
                     }
                     if (nextEdgeType == EdgeType.Jump || nextEdgeType == EdgeType.WallJump)
                     {
-                        NavEdge jumpEdge = null;
-                        if (_lastReachedNode != null && NavGraph.Instance != null)
+                        NavEdge jumpEdge = nextEdge;
+                        if (jumpEdge == null && _lastReachedNode != null && NavGraph.Instance != null)
                             jumpEdge = NavGraph.Instance.GetEdgeBetween(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id);
 
                         // Check if we can just walk to the target — no jump needed
@@ -657,10 +1056,12 @@ namespace StraftatBots
                                 // Convert to walk — delete the jump edge, create walk edge
                                 if (jumpEdge != null)
                                 {
-                                    jumpEdge.Confidence = -1f;
+                                    // Add a parallel Walk edge so the bot can stroll this segment,
+                                    // but PRESERVE the jump edge + its recorded trajectory. We no
+                                    // longer delete demonstrated jumps just because a straight
+                                    // ground/LoS sample reads as walkable (it can cross rails/lava).
                                     NavGraph.Instance.AddEdge(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id,
                                         EdgeType.Walk, Vector3.Distance(fromPos, toPos));
-                                    Plugin.Log.LogInfo($"[{BotName}] Converted jump edge to walk — ground is walkable");
                                 }
                                 nextEdgeType = EdgeType.Walk;
                             }
@@ -668,9 +1069,10 @@ namespace StraftatBots
                     }
                     if (nextEdgeType == EdgeType.Jump || nextEdgeType == EdgeType.WallJump)
                     {
-                        NavEdge jumpEdge = null;
-                        if (_lastReachedNode != null && NavGraph.Instance != null)
+                        NavEdge jumpEdge = nextEdge;
+                        if (jumpEdge == null && _lastReachedNode != null && NavGraph.Instance != null)
                             jumpEdge = NavGraph.Instance.GetEdgeBetween(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id);
+                        NavNode takeoffNode = _lastReachedNode ?? nextEdgeFromNode;
 
                         Vector3 jumpToNode = nodePos - transform.position;
                         Vector3 jumpFaceDir = new Vector3(jumpToNode.x, 0, jumpToNode.z);
@@ -700,13 +1102,13 @@ namespace StraftatBots
                         if (_cc.isGrounded)
                         {
                             // PHASE 1: Walk to takeoff node
-                            float distToTakeoff = _lastReachedNode != null ?
-                                Vector3.Distance(transform.position, _lastReachedNode.Position) : 0f;
+                            float distToTakeoff = takeoffNode != null ?
+                                Vector3.Distance(transform.position, takeoffNode.Position) : 0f;
 
-                            if (distToTakeoff > 0.5f && _lastReachedNode != null)
+                            if (distToTakeoff > 0.5f && takeoffNode != null)
                             {
                                 // Walk to takeoff position — sprint if in a jump chain
-                                Vector3 toTakeoff = _lastReachedNode.Position - transform.position;
+                                Vector3 toTakeoff = takeoffNode.Position - transform.position;
                                 toTakeoff.y = 0;
                                 if (toTakeoff.sqrMagnitude > 0.1f) dir = toTakeoff.normalized;
                                 speed = _inJumpChain ? _sprintSpeed : _walkSpeed;
@@ -907,23 +1309,26 @@ namespace StraftatBots
                 }
             }
 
-            // Proactive slide/crouch: detect low ceilings and slide-only passages
-            // Two triggers: (1) immediate when head blocked + crouch clear, (2) when stuck 0.5s
+            // Proactive low-clearance handling.
+            // Trigger 1: immediate crouch when head is blocked but crouch lane is clear.
+            // Trigger 2: slide when a crawl-space wall blocks waist movement and we're stuck.
             if (!zoneLaunched && !commitActive && !jumped && _cc.isGrounded && !_isSliding && !_onLadder
                 && _intentionalJumpTimer <= 0f)
             {
                 var slideObs = CheckObstructions(dir);
 
-                // Trigger 1: head blocked but crouch clear — low ceiling passage, slide immediately
-                // Trigger 2: waist blocked + crouch clear + stuck — wall with crawl space
-                bool shouldSlide = false;
                 if (slideObs.CrouchClear && slideObs.HeadBlocked && !slideObs.WaistBlocked)
-                    shouldSlide = true; // Low ceiling — slide right away
-                else if (slideObs.CrouchClear && slideObs.WaistBlocked && _stuckTimer > 0.3f)
-                    shouldSlide = true; // Wall with crawl space — slide after brief stuck
-
-                if (shouldSlide)
                 {
+                    // Low ceiling corridor: crouch and keep moving instead of head-bumping.
+                    if (!_isCrouching)
+                        StartCrouch(0.8f);
+                    else
+                        _crouchTimer = Mathf.Max(_crouchTimer, 0.25f);
+                    _stuckTimer = 0f;
+                }
+                else if (slideObs.CrouchClear && slideObs.WaistBlocked && _stuckTimer > 0.7f)
+                {
+                    // Wall with crawl space — burst through with a slide.
                     InitSlide(dir);
                     _stuckTimer = 0f;
                 }
@@ -976,8 +1381,17 @@ namespace StraftatBots
 
                 if (edgeDetected)
                 {
+                    bool isPlayMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play;
+                    bool provenGraphJump = false;
+                    if (_lastReachedNode != null && _graphPath.Count > 0 && _graphPathIndex < _graphPath.Count && NavGraph.Instance != null)
+                    {
+                        var edge = NavGraph.Instance.GetEdgeBetween(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id);
+                        provenGraphJump = IsPlayerProvenJumpEdge(edge);
+                    }
                     bool shouldJump = nextEdgeType == EdgeType.Jump || nextEdgeType == EdgeType.Fall
                         || nextEdgeType == EdgeType.WallJump || targetAcrossGap;
+                    if (isPlayMode && !provenGraphJump)
+                        shouldJump = false;
 
                     if (shouldJump)
                     {
@@ -1011,6 +1425,12 @@ namespace StraftatBots
                     {
                         // No target across — turn away from edge
                         dir = TryAngledDirections(dir, wallMask);
+                        if (!HasGroundFootprintAhead(dir, 0.8f) && TryGetSafeEdgeEscapeDir(gapJumpDir, out Vector3 escapeDir))
+                        {
+                            dir = escapeDir;
+                            _commitDir = escapeDir;
+                            _commitTimer = Mathf.Max(_commitTimer, 0.45f);
+                        }
                     }
                 }
             }
@@ -1380,12 +1800,8 @@ namespace StraftatBots
             // Sprint slide
             if (sprinting && grounded && !_isSliding && !_isShooting && _slideResetTimer <= 0f)
             {
-                _sprintSlideChance -= Time.deltaTime;
-                if (_sprintSlideChance <= 0f)
-                {
-                    _sprintSlideChance = Random.Range(3f, 7f);
-                    StartSprintSlide(0.6f);
-                }
+                // Disable random sprint-slide flavor during normal navigation; looked too spammy.
+                _sprintSlideChance = Mathf.Max(_sprintSlideChance, 2f);
             }
 
             // Don't accelerate during landing pause — keep at zero
@@ -1423,10 +1839,20 @@ namespace StraftatBots
             // Prevents permanent crouch state from bugs
             if (_isCrouching && !_isSliding && _crouchTimer <= 0f && grounded)
             {
-                _isCrouching = false;
-                if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
-                if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
-                if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
+                bool standBlocked = Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.up, 1.2f,
+                    WALL_MASK, QueryTriggerInteraction.Ignore);
+                if (!standBlocked)
+                {
+                    _isCrouching = false;
+                    if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
+                    if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
+                    if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
+                }
+                else
+                {
+                    // Keep crouch while headroom is still blocked in low-clearance passages.
+                    _crouchTimer = 0.2f;
+                }
             }
 
             // Decay slide force
@@ -1460,12 +1886,14 @@ namespace StraftatBots
                 // Face into the ladder
                 LookAtDirection(_ladderFaceDir);
             }
-            else if (_ladderDismountTimer > 0f && _ladderFaceDir.sqrMagnitude > 0.01f)
+            else if (_ladderDismountTimer > 0f)
             {
-                // Push OVER the top of the ladder — forward (into ladder) + up.
-                // Stronger forward push (0.7 → 1.0 sprint) + higher lift (3 → 5) so the bot
-                // reliably clears the top lip and lands on the platform.
-                move = _ladderFaceDir * _sprintSpeed + Vector3.up * 5f;
+                // Push toward the actual exit/platform, not blindly into the ladder face.
+                // This stops bots from climbing a bit, colliding with the lip, then dropping.
+                Vector3 exitDir = _ladderExitDir.sqrMagnitude > 0.01f
+                    ? _ladderExitDir
+                    : PickLadderExitDir(GetLadderObjective());
+                move = exitDir * _sprintSpeed + Vector3.up * 4.2f;
                 _intentionalJumpTimer = 0.35f;
             }
             else
@@ -1480,12 +1908,27 @@ namespace StraftatBots
                 Vector3 horizMove = new Vector3(move.x, 0, move.z);
                 if (horizMove.sqrMagnitude > 0.01f)
                 {
-                    Vector3 nextPos = transform.position + horizMove.normalized * 0.8f;
-                    if (!Physics.Raycast(nextPos + Vector3.up * 2f, Vector3.down, 5f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                    if (!HasGroundFootprintAhead(horizMove, 0.8f))
                     {
-                        // No ground 0.8m ahead — kill horizontal movement
-                        move.x = 0f;
-                        move.z = 0f;
+                        if (TryGetSafeEdgeEscapeDir(horizMove, out Vector3 escapeDir))
+                        {
+                            move.x = escapeDir.x * _walkSpeed * 0.75f;
+                            move.z = escapeDir.z * _walkSpeed * 0.75f;
+                            _commitDir = escapeDir;
+                            _commitTimer = Mathf.Max(_commitTimer, 0.35f);
+                        }
+                        else
+                        {
+                            move.x = 0f;
+                            move.z = 0f;
+                        }
+                        _slideForceFactor = 0f;
+                        if (_graphPath.Count > 0)
+                        {
+                            _graphPath.Clear();
+                            _graphPathIndex = 0;
+                            _repathTimer = 0f;
+                        }
                     }
                 }
             }
@@ -1554,8 +1997,10 @@ namespace StraftatBots
 
             bool jumped = false;
 
-            // Shared reactive steering — same logic as MoveToward's Phase 2
-            ReactiveSteer(ref dir, ref jumped, target, WALL_MASK);
+            // Shared reactive steering. On untrained maps (no usable graph), run in a
+            // relaxed mode so bots don't get trapped in edge-reverse oscillation.
+            bool relaxedNoGraph = NavGraph.Instance == null || !NavGraph.Instance.HasData || NavGraph.Instance.NodeCount < 10;
+            ReactiveSteer(ref dir, ref jumped, target, WALL_MASK, relaxedNoGraph);
 
             // Proactive ladder seeking: if target is above us, scan for ladders nearby
             if (_cc.isGrounded && !_onLadder && target.y > transform.position.y + 2f && _stuckTimer > 1f)
@@ -1587,9 +2032,22 @@ namespace StraftatBots
                 Vector3 hm = new Vector3(move.x, 0, move.z);
                 if (hm.sqrMagnitude > 0.01f)
                 {
-                    Vector3 np = transform.position + hm.normalized * 0.8f;
-                    if (!Physics.Raycast(np + Vector3.up * 2f, Vector3.down, 5f, GROUND_MASK, QueryTriggerInteraction.Ignore))
-                    { move.x = 0f; move.z = 0f; }
+                    if (!HasGroundFootprintAhead(hm, 0.8f))
+                    {
+                        if (TryGetSafeEdgeEscapeDir(hm, out Vector3 escapeDir))
+                        {
+                            move.x = escapeDir.x * _walkSpeed * 0.75f;
+                            move.z = escapeDir.z * _walkSpeed * 0.75f;
+                            _commitDir = escapeDir;
+                            _commitTimer = Mathf.Max(_commitTimer, 0.35f);
+                        }
+                        else
+                        {
+                            move.x = 0f;
+                            move.z = 0f;
+                        }
+                        _slideForceFactor = 0f;
+                    }
                 }
             }
 
@@ -1752,6 +2210,72 @@ namespace StraftatBots
             return !Physics.Raycast(checkPos + Vector3.up * 2.5f, Vector3.down, 5f, GROUND_MASK, QueryTriggerInteraction.Ignore);
         }
 
+        private bool HasGroundFootprintAhead(Vector3 dir, float checkDist = 0.9f)
+        {
+            if (dir.sqrMagnitude < 0.001f) return true;
+            dir.y = 0f;
+            dir.Normalize();
+            Vector3 side = Vector3.Cross(Vector3.up, dir).normalized * 0.35f;
+            Vector3 center = transform.position + dir * checkDist;
+            return Physics.Raycast(center + Vector3.up * 2.5f, Vector3.down, 5.5f, GROUND_MASK, QueryTriggerInteraction.Ignore)
+                && Physics.Raycast(center + side + Vector3.up * 2.5f, Vector3.down, 5.5f, GROUND_MASK, QueryTriggerInteraction.Ignore)
+                && Physics.Raycast(center - side + Vector3.up * 2.5f, Vector3.down, 5.5f, GROUND_MASK, QueryTriggerInteraction.Ignore);
+        }
+
+        private bool IsPlayerProvenJumpEdge(NavEdge edge)
+        {
+            if (edge == null || NavGraph.Instance == null) return false;
+            if (edge.Type != EdgeType.Jump && edge.Type != EdgeType.WallJump) return false;
+            var from = NavGraph.Instance.GetNodeById(edge.From);
+            var to = NavGraph.Instance.GetNodeById(edge.To);
+            return from != null && to != null && from.PlayerSourced && to.PlayerSourced;
+        }
+
+        private bool TryGetSafeEdgeEscapeDir(Vector3 unsafeDir, out Vector3 escapeDir)
+        {
+            escapeDir = Vector3.zero;
+            unsafeDir.y = 0f;
+            if (unsafeDir.sqrMagnitude < 0.001f) unsafeDir = transform.forward;
+            unsafeDir.Normalize();
+
+            Vector3 right = Vector3.Cross(Vector3.up, unsafeDir).normalized;
+            Vector3 toLastGround = _lastGroundedPos - transform.position;
+            toLastGround.y = 0f;
+
+            Vector3[] candidates =
+            {
+                -unsafeDir,
+                right,
+                -right,
+                (-unsafeDir + right).normalized,
+                (-unsafeDir - right).normalized,
+                toLastGround.sqrMagnitude > 0.25f ? toLastGround.normalized : -unsafeDir
+            };
+
+            float bestScore = float.MinValue;
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                Vector3 d = candidates[i];
+                if (d.sqrMagnitude < 0.001f) continue;
+                d.y = 0f;
+                d.Normalize();
+                if (!HasGroundFootprintAhead(d, 0.65f)) continue;
+                if (Physics.Raycast(transform.position + Vector3.up * 0.9f, d, 0.7f, WALL_MASK, QueryTriggerInteraction.Ignore))
+                    continue;
+
+                float score = Vector3.Dot(d, -unsafeDir);
+                if (toLastGround.sqrMagnitude > 0.25f)
+                    score += Vector3.Dot(d, toLastGround.normalized) * 0.5f;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    escapeDir = d;
+                }
+            }
+
+            return escapeDir.sqrMagnitude > 0.001f;
+        }
+
         /// <summary>
         /// Check for edges on both sides perpendicular to movement direction.
         /// Only corrects if the bot is very close to a drop (0.6m).
@@ -1880,7 +2404,7 @@ namespace StraftatBots
         /// Handles: obstacle jump, proactive slide, edge detection, wall redirect,
         /// collision deflection, explore jump, emergency edge stop.
         /// </summary>
-        private void ReactiveSteer(ref Vector3 dir, ref bool jumped, Vector3 target, int wallMask)
+        private void ReactiveSteer(ref Vector3 dir, ref bool jumped, Vector3 target, int wallMask, bool relaxedNoGraph = false)
         {
             bool zoneLaunched = _zoneForceDuration > 0f;
             bool commitActive = _commitTimer > 0f && _commitDir.sqrMagnitude > 0.01f;
@@ -1938,10 +2462,16 @@ namespace StraftatBots
             }
 
             // Edge detection: check for gaps ahead, jump if target is across
-            if (!zoneLaunched && !commitActive && !jumped && _cc.isGrounded && _intentionalJumpTimer <= 0f && !_onLadder)
+            if (!relaxedNoGraph && !zoneLaunched && !commitActive && !jumped && _cc.isGrounded && _intentionalJumpTimer <= 0f && !_onLadder)
             {
                 if (IsEdgeAhead(dir, 1f))
                 {
+                    if (NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play)
+                    {
+                        dir = TryAngledDirections(dir, wallMask);
+                        return;
+                    }
+
                     Vector3 toTarget = target - transform.position;
                     float hDist = new Vector3(toTarget.x, 0, toTarget.z).magnitude;
                     if (hDist > 1f && hDist < Plugin.GetMaxJumpDist())
@@ -2028,7 +2558,22 @@ namespace StraftatBots
             if (!commitActive && _cc.isGrounded && !jumped && _intentionalJumpTimer <= 0f)
             {
                 if (IsEdgeAhead(dir, 0.5f))
-                    dir = -dir;
+                {
+                    if (relaxedNoGraph)
+                    {
+                        // On sparse/no-graph maps, hard reverse creates left-right ping-pong.
+                        // Side-step and commit briefly instead to keep forward pressure.
+                        Vector3 side = Vector3.Cross(Vector3.up, dir).normalized;
+                        if ((BotId & 1) == 0) side = -side;
+                        _commitDir = side;
+                        _commitTimer = 0.8f;
+                        dir = side;
+                    }
+                    else
+                    {
+                        dir = -dir;
+                    }
+                }
             }
         }
 
@@ -2038,19 +2583,62 @@ namespace StraftatBots
 
         private bool _nearLadder; // Ladder within 2m — suppresses jump/wall slide/edge detection
 
+        private Vector3 GetLadderObjective()
+        {
+            if (_graphPath != null && _graphPath.Count > 0)
+            {
+                int idx = Mathf.Clamp(_graphPathIndex, 0, _graphPath.Count - 1);
+                return _graphPath[idx].Position;
+            }
+            if (_weaponTarget != null) return _weaponTarget.position;
+            if (_playerTarget != null) return _playerTarget.position;
+            if (_hasWanderTarget) return _wanderTarget;
+            return transform.position + Vector3.up * 3f;
+        }
+
+        private Vector3 PickLadderExitDir(Vector3 objective)
+        {
+            Vector3 toObjective = objective - transform.position;
+            toObjective.y = 0f;
+            if (toObjective.sqrMagnitude > 0.25f && IsLadderExitClear(toObjective.normalized))
+                return toObjective.normalized;
+
+            if (_lastMoveDir.sqrMagnitude > 0.25f && IsLadderExitClear(_lastMoveDir.normalized))
+                return _lastMoveDir.normalized;
+
+            if (_ladderFaceDir.sqrMagnitude > 0.25f)
+            {
+                Vector3 away = -_ladderFaceDir.normalized;
+                if (IsLadderExitClear(away)) return away;
+                if (IsLadderExitClear(_ladderFaceDir.normalized)) return _ladderFaceDir.normalized;
+            }
+
+            return transform.forward;
+        }
+
+        private bool IsLadderExitClear(Vector3 dir)
+        {
+            if (dir.sqrMagnitude < 0.01f) return false;
+            dir.y = 0f;
+            dir.Normalize();
+            Vector3 chest = transform.position + Vector3.up * 1.2f;
+            return !Physics.SphereCast(chest, 0.3f, dir, out _, 1.15f, WALL_MASK, QueryTriggerInteraction.Ignore);
+        }
+
         private void HandleLadder()
         {
-            // WATCHDOG: if we claim to be on a ladder but haven't actually touched one in >0.5s,
+            // WATCHDOG: if we claim to be on a ladder but haven't actually touched one in >1.2s,
             // force-clear the state. Without this, a stuck _onLadder=true causes ApplyGravity to
             // early-return and _verticalVelocity stays at _ladderSpeed — bot flies into the sky.
-            if (_onLadder && Time.time - _lastLadderTouchTime > 0.5f)
+            if (_onLadder && Time.time - _lastLadderTouchTime > 1.2f)
             {
+                _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                 _onLadder = false;
                 _ladderStuckTimer = 0f;
                 _ladderClimbTimer = 0f;
                 _ladderFaceDirPinned = false;
                 _verticalVelocity = Mathf.Min(_verticalVelocity, 0f);
-                Plugin.Log.LogInfo($"[{BotName}] Ladder watchdog — no ladder touched >0.5s, force-cleared stuck state");
+                Plugin.Log.LogInfo($"[{BotName}] Ladder watchdog — no ladder touched >1.2s, force-cleared stuck state");
             }
 
             // WATCHDOG: mid-ladder freeze. If we're on a ladder but haven't actually climbed
@@ -2062,15 +2650,22 @@ namespace StraftatBots
                 if (Time.time - _ladderYSampleTime > 1.2f)
                 {
                     float deltaY = transform.position.y - _ladderLastYSample;
-                    if (deltaY < 0.2f)
+                    if (deltaY < 0.05f)
                     {
+                        _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                         _onLadder = false;
-                        _ladderDismountTimer = 0.7f;
+                        _ladderDismountTimer = 0.35f;
                         _ladderStuckTimer = 0f;
                         _ladderClimbTimer = 0f;
                         _ladderFaceDirPinned = false;
                         _verticalVelocity = _jumpForce * 0.5f; // bump outward
-                        Plugin.Log.LogInfo($"[{BotName}] Ladder freeze watchdog — no Y progress, dismounting");
+                        if (NavGraph.Instance != null)
+                        {
+                            var badNode = NavGraph.Instance.FindNearestNode(transform.position, 2f);
+                            if (badNode != null)
+                                NavGraph.Instance.ReportBadNode(badNode.Id, "ladder climb made no progress", 1, silent: true);
+                        }
+                        Plugin.Log.LogInfo($"[{BotName}] Ladder freeze watchdog — no Y progress, nudging off");
                     }
                     _ladderLastYSample = transform.position.y;
                     _ladderYSampleTime = Time.time;
@@ -2166,10 +2761,22 @@ namespace StraftatBots
 
             if (_ladderLayer.value != 0)
             {
-                int colCount = Physics.OverlapSphereNonAlloc(transform.position + Vector3.up * 0.5f, 0.5f, _overlapBuffer, _ladderLayer);
+                Vector3 probe0 = transform.position + Vector3.up * 0.55f;
+                Vector3 probe1 = transform.position + Vector3.up * 1.15f;
+                int colCount = Physics.OverlapSphereNonAlloc(probe0, 0.75f, _overlapBuffer, _ladderLayer);
                 for (int ci = 0; ci < colCount; ci++)
                 {
                     var c = _overlapBuffer[ci];
+                    if (c == null) continue;
+                    touching = true;
+                    float d = Vector3.Distance(transform.position, c.ClosestPoint(transform.position));
+                    if (d < closestDist) { closestDist = d; closestLadder = c; }
+                }
+                int colCount2 = Physics.OverlapSphereNonAlloc(probe1, 0.75f, _overlapBuffer, _ladderLayer);
+                for (int ci = 0; ci < colCount2; ci++)
+                {
+                    var c = _overlapBuffer[ci];
+                    if (c == null) continue;
                     touching = true;
                     float d = Vector3.Distance(transform.position, c.ClosestPoint(transform.position));
                     if (d < closestDist) { closestDist = d; closestLadder = c; }
@@ -2179,7 +2786,7 @@ namespace StraftatBots
             // Tag fallback (same radius as FPC)
             if (!touching)
             {
-                int tagCount = Physics.OverlapSphereNonAlloc(transform.position + Vector3.up * 0.5f, 0.6f, _overlapBuffer, ~0, QueryTriggerInteraction.Collide);
+                int tagCount = Physics.OverlapSphereNonAlloc(transform.position + Vector3.up * 0.8f, 0.9f, _overlapBuffer, ~0, QueryTriggerInteraction.Collide);
                 for (int ci = 0; ci < tagCount; ci++)
                 {
                     var c = _overlapBuffer[ci];
@@ -2215,7 +2822,7 @@ namespace StraftatBots
                             // Also check movement direction — bot might be walking toward it
                             float faceDot = Vector3.Dot(transform.forward, normal);
                             float moveDot = Vector3.Dot(rayDir, -normal);
-                            frontSide = faceDot < -0.2f || moveDot > 0.5f;
+                            frontSide = faceDot < -0.2f || moveDot > 0.5f || _onLadder;
                             if (frontSide)
                             {
                                 // STABILIZE: pin the face-dir on first good read so the per-frame
@@ -2228,7 +2835,13 @@ namespace StraftatBots
                                 _ladderFaceDir = _ladderPinnedFaceDir;
                             }
                             else
+                            {
+                                // Many STRAFTAT ladder colliders are effectively double-sided.
+                                // Treat the contact as climbable and use the approach direction
+                                // instead of dropping the bot back down.
+                                frontSide = true;
                                 _ladderFaceDir = rayDir;
+                            }
                         }
                         else
                             _ladderFaceDir = _ladderFaceDirPinned ? _ladderPinnedFaceDir : rayDir;
@@ -2245,8 +2858,8 @@ namespace StraftatBots
 
                     // Safety: max ladder climb time (10s) — no ladder is that tall
                     _ladderClimbTimer += Time.deltaTime;
-                    if (_ladderClimbTimer > 10f)
-                        ceilingBlocked = true; // Force dismount
+                    if (_ladderClimbTimer > 4f)
+                        ceilingBlocked = true; // Force dismount — bounds sky-flight if top detection misses
 
                     if (ceilingBlocked)
                     {
@@ -2275,6 +2888,7 @@ namespace StraftatBots
                             else
                             {
                                 // No clearance anywhere — dismount and delete bad ladder node
+                                _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                                 _onLadder = false;
                                 _verticalVelocity = -2f;
                                 _ladderDismountTimer = 0.5f;
@@ -2286,7 +2900,7 @@ namespace StraftatBots
                                     var badNode = NavGraph.Instance.FindNearestNode(transform.position, 2f);
                                     if (badNode != null)
                                     {
-                                        badNode.Confidence = -1f;
+                                        NavGraph.Instance.ReportBadNode(badNode.Id, "bad ladder-side waypoint", 3, silent: true);
                                         Plugin.Log.LogInfo($"[{BotName}] Removed bad ladder node {badNode.Id}");
                                     }
                                 }
@@ -2294,6 +2908,7 @@ namespace StraftatBots
                         }
                         else
                         {
+                            _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                             _onLadder = false;
                             _verticalVelocity = -2f;
                             _ladderDismountTimer = 0.5f;
@@ -2302,12 +2917,47 @@ namespace StraftatBots
                     }
                     else
                     {
+                        // Fresh-grab intent gate: don't launch up a ladder we have no REAL reason to
+                        // climb. GetLadderObjective falls back to "+3 up" when idle, so we require an
+                        // actual objective source (path / weapon / target / wander) AND that it's
+                        // above us. This stops bots grabbing ladders they walk past and flying skyward.
+                        if (!_onLadder && !_wasOnLadder)
+                        {
+                            bool hasRealObjective = (_graphPath != null && _graphPath.Count > 0)
+                                || _weaponTarget != null || _playerTarget != null || _hasWanderTarget;
+                            Vector3 intentObj = GetLadderObjective();
+                            if (!hasRealObjective || intentObj.y <= transform.position.y + 1.0f)
+                            {
+                                _onLadder = false;
+                                return; // near a ladder but nothing above to reach — keep walking
+                            }
+                        }
+
                         _onLadder = true;
                         _verticalVelocity = _ladderSpeed;
                         _coyoteTimer = 0.15f;
 
                         Vector3 ladderCenter = closestLadder.bounds.center;
                         _lastLadderPos = ladderCenter;
+
+                        Vector3 ladderObjective = GetLadderObjective();
+                        // Dismount at the top of ANY ladder collider (not just "tall" ones) so the bot
+                        // never keeps climbing past the top into open sky.
+                        bool nearColliderTop = transform.position.y >= closestLadder.bounds.max.y - 1.1f;
+                        bool reachedPathExit = ladderObjective.y <= transform.position.y + 0.8f
+                            && ladderObjective.y >= transform.position.y - 1.2f
+                            && HorizontalDist(transform.position, ladderObjective) < 4f;
+                        if (nearColliderTop || reachedPathExit)
+                        {
+                            _ladderExitDir = PickLadderExitDir(ladderObjective);
+                            _onLadder = false;
+                            _ladderDismountTimer = 0.85f;
+                            _ladderStuckTimer = 0f;
+                            _ladderClimbTimer = 0f;
+                            _verticalVelocity = Mathf.Max(_verticalVelocity, _jumpForce * 0.45f);
+                            _nearLadder = true;
+                            return;
+                        }
 
                         // Pull toward ladder center horizontally — prevents side-climbing
                         Vector3 toCenter = ladderCenter - transform.position;
@@ -2324,6 +2974,13 @@ namespace StraftatBots
             }
             else
             {
+                if (_wasOnLadder && Time.time - _lastLadderTouchTime < 1.0f)
+                {
+                    _onLadder = true;
+                    _nearLadder = true;
+                    return;
+                }
+
                 _onLadder = false;
                 _ladderStuckTimer = 0f;
                 _ladderClimbTimer = 0f;
@@ -2331,6 +2988,7 @@ namespace StraftatBots
                 // Dismount detection: was climbing, now off ladder — push AWAY from ladder
                 if (_wasOnLadder && _ladderFaceDir.sqrMagnitude > 0.01f)
                 {
+                    _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                     _ladderDismountTimer = 0.9f; // Longer push to clear the top edge
                     _verticalVelocity = _jumpForce * 0.5f; // Stronger upward boost for top step-off
                 }
@@ -2344,6 +3002,7 @@ namespace StraftatBots
                 _ladderStuckTimer += Time.deltaTime;
                 if (_ladderStuckTimer > 5f)
                 {
+                    _ladderExitDir = PickLadderExitDir(GetLadderObjective());
                     _onLadder = false;
                     _ladderDismountTimer = 0.6f;
                     _ladderStuckTimer = 0f;
@@ -2688,9 +3347,12 @@ namespace StraftatBots
             else
                 _vaultKillTimer = 0f;
 
-            // Graph jump edge: set up trajectory replay
+            // Graph jump edge: set up trajectory replay. Replay whenever we have at least a
+            // takeoff+landing pair (>=2 samples) — short/fast recorded jumps used to fall back
+            // to recomputed physics and miss. (Replay's t=0 is re-stamped at the real launch
+            // instant in ApplyGravity's charge-fire so the arc lines up.)
             _currentJumpEdge = jumpEdge;
-            if (jumpEdge != null && jumpEdge.AirSampleCount > 2)
+            if (jumpEdge != null && jumpEdge.AirSampleCount >= 2)
             {
                 _trajActive = true;
                 _trajIndex = 0;
@@ -2748,6 +3410,12 @@ namespace StraftatBots
                     _verticalVelocity = _pendingJumpForce;
                     _pendingJumpForce = 0f;
                     _jumpChargeTimer = 0f;
+                    // The impulse fires NOW — this is the real launch instant. Re-stamp the
+                    // jump start so trajectory replay indexes recorded AirTimestamps from the
+                    // ACTUAL liftoff, not from the ~35ms-earlier TryJump call. That offset made
+                    // the replayed arc lead the bot and caused overshoot/undershoot.
+                    _jumpStartTime = Time.time;
+                    _trajIndex = 0;
                     // Fall through to normal gravity handling this frame so
                     // the impulse takes effect immediately.
                 }

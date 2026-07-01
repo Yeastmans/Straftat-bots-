@@ -89,6 +89,8 @@ namespace StraftatBots
         public static void DrawAll()
         {
             InitStyles();
+            var liveCert = NavGraph.Instance != null ? NavGraph.Instance.GetCertificationReport() : null;
+            DrawWorldTrainingMarker(liveCert);
 
             float x = _panelPos.x;
             float y = _panelPos.y;
@@ -114,8 +116,8 @@ namespace StraftatBots
             }
 
             // Expanded panel
-            float panelW = 250f;
-            float panelH = 520f;
+            float panelW = 280f;
+            float panelH = 560f;
             Rect panel = new Rect(x, y, panelW, panelH);
             GUI.Box(panel, "", _boxStyle);
 
@@ -168,25 +170,35 @@ namespace StraftatBots
                 FreeCam.Toggle();
             cy += 28f;
 
-            // ---- Bot Behavior ----
-            GUI.Label(new Rect(cx, cy, cw, 18), "BEHAVIOR", _sectionStyle);
+            // ---- Training control ----
+            // The STAGE panel below (STATUS) is the single source of truth: its button drives
+            // Explore / Validate / Play and tells you WHEN to progress. The old free-floating
+            // None/Explore/Validate buttons here fought that, so they're gone. The one manual
+            // choice that does NOT conflict is pausing the bots so you can walk the map yourself.
+            GUI.Label(new Rect(cx, cy, cw, 18), "TRAINING", _sectionStyle);
             cy += 20f;
 
-            string[] behaviors = { "None", "Explore" };
-            string[] configValues = { "None", "Explore" };
-            string current = Plugin.TrainingBehavior?.Value ?? "Explore";
+            string curBehavior = Plugin.TrainingBehavior?.Value ?? "Explore";
+            bool botsPaused = curBehavior == "None";
+            string doing = botsPaused ? "PAUSED — you train, bots wait"
+                : curBehavior == "Validate" ? "Bots: validating routes"
+                : "Bots: exploring / building mesh";
+            var doingStyle = new GUIStyle(_labelStyle);
+            doingStyle.normal.textColor = botsPaused ? new Color(1f, 0.78f, 0.25f) : new Color(0.45f, 1f, 0.55f);
+            GUI.Label(new Rect(cx, cy, cw, 18), doing, doingStyle);
+            cy += 20f;
 
-            for (int i = 0; i < behaviors.Length; i++)
+            string pauseLabel = botsPaused ? "Resume bot training" : "Pause bots (I'll walk it myself)";
+            if (GUI.Button(new Rect(cx, cy, cw, 24), pauseLabel, botsPaused ? _activeButtonStyle : _buttonStyle))
             {
-                bool active = current == configValues[i];
-                GUIStyle style = active ? _activeButtonStyle : _buttonStyle;
-                float bw = cw / 2f - 2f;
-                float bx = cx + i * (bw + 4f);
-
-                if (GUI.Button(new Rect(bx, cy, bw, 24), behaviors[i], style))
+                if (Plugin.TrainingBehavior != null)
                 {
-                    if (Plugin.TrainingBehavior != null)
-                        Plugin.TrainingBehavior.Value = configValues[i];
+                    if (botsPaused)
+                    {
+                        string rec = liveCert?.RecommendedBehavior;
+                        Plugin.TrainingBehavior.Value = (string.IsNullOrWhiteSpace(rec) || rec == "None") ? "Explore" : rec;
+                    }
+                    else Plugin.TrainingBehavior.Value = "None";
                 }
             }
             cy += 32f;
@@ -194,7 +206,7 @@ namespace StraftatBots
             // ---- Bots ----
             GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
             cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "BOTS", _sectionStyle);
+            GUI.Label(new Rect(cx, cy, cw, 18), "BOT COUNT", _sectionStyle);
             cy += 20f;
 
             GUI.Label(new Rect(cx, cy, 80, 18), "Bot Count:", _labelStyle);
@@ -220,51 +232,18 @@ namespace StraftatBots
             }
             cy += 28f;
 
-            // ---- Teach (Watch Me) ----
+            // ---- Teach (just walk) ----
             GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
             cy += 6f;
             GUI.Label(new Rect(cx, cy, cw, 18), "TEACH", _sectionStyle);
             cy += 20f;
-
-            bool watching = PlayerRecorder.WatchMeActive;
-            string wmLabel = watching
-                ? $"Stop Watching ({PlayerRecorder.WatchMeSampleCount} nodes)"
-                : "Watch Me: Start Recording";
-            GUIStyle wmStyle = watching ? _activeButtonStyle : _buttonStyle;
-            if (GUI.Button(new Rect(cx, cy, cw, 24), wmLabel, wmStyle))
-            {
-                if (watching) PlayerRecorder.StopWatchMe();
-                else          PlayerRecorder.StartWatchMe();
-            }
-            cy += 28f;
-
-            if (watching)
-            {
-                if (GUI.Button(new Rect(cx, cy, cw, 24), "Cancel (discard)", _buttonStyle))
-                    PlayerRecorder.CancelWatchMe();
-                cy += 28f;
-
-                GUI.Label(new Rect(cx, cy, cw, 16),
-                    $"Recording: {PlayerRecorder.WatchMeName}", _sectionStyle);
-                cy += 18f;
-            }
-            else
-            {
-                int routeCount = NavGraph.Instance != null ? NavGraph.Instance.ProvenRoutes.Count : 0;
-                GUI.Label(new Rect(cx, cy, cw, 16),
-                    $"Saved routes: {routeCount}", _sectionStyle);
-                cy += 18f;
-
-                if (routeCount > 0 && GUI.Button(new Rect(cx, cy, cw, 24), "Clear Proven Routes", _buttonStyle))
-                {
-                    if (NavGraph.Instance != null)
-                    {
-                        NavGraph.Instance.ClearProvenRoutes();
-                        NavGraph.Instance.Save();
-                    }
-                }
-                if (routeCount > 0) cy += 28f;
-            }
+            var teachStyle = new GUIStyle(_labelStyle);
+            teachStyle.wordWrap = true;
+            teachStyle.normal.textColor = new Color(0.8f, 0.85f, 0.9f);
+            GUI.Label(new Rect(cx, cy, cw, 34),
+                "Just walk the map. Every route you take is trusted instantly and bots prefer your paths. No recording button needed.",
+                teachStyle);
+            cy += 38f;
 
             // ---- Graph Settings ----
             GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
@@ -316,20 +295,195 @@ namespace StraftatBots
             cy += 20f;
             if (NavGraph.Instance != null)
             {
-                int nodes = NavGraph.Instance.NodeCount;
-                int edges = NavGraph.Instance.EdgeCount;
                 string map = NavGraph.Instance.CurrentMap ?? "?";
-                GUI.Label(new Rect(cx, cy, cw, 18), $"{map}: {nodes} nodes, {edges} edges", _labelStyle);
+                GUI.Label(new Rect(cx, cy, cw, 18), $"Map: {map}", _labelStyle);
                 cy += 20f;
                 string behavior = Plugin.TrainingBehavior?.Value ?? "?";
                 GUI.Label(new Rect(cx, cy, cw, 18), $"Mode: {behavior}", _labelStyle);
                 cy += 20f;
+                var cert = liveCert ?? NavGraph.Instance.GetCertificationReport();
+                cy = DrawTrainingPlan(cx, cy, cw, cert);
+                if (!string.IsNullOrWhiteSpace(cert.DemoHint))
+                {
+                    var warnStyle = new GUIStyle(_labelStyle);
+                    warnStyle.normal.textColor = new Color(1f, 0.78f, 0.25f);
+                    warnStyle.fontStyle = FontStyle.Bold;
+                    warnStyle.wordWrap = true;
+                    GUI.Label(new Rect(cx, cy, cw, 46), cert.DemoHint, warnStyle);
+                    cy += 50f;
+                }
             }
 
             // Store content height for next frame so scroll area auto-sizes
             _lastContentH = cy + 40f;
 
             GUI.EndScrollView();
+        }
+
+        private static float DrawTrainingPlan(float x, float y, float w, MapCertificationReport cert)
+        {
+            var titleStyle = new GUIStyle(_labelStyle);
+            titleStyle.fontSize = 13;
+            titleStyle.fontStyle = FontStyle.Bold;
+            titleStyle.normal.textColor = cert.NeedsTraining ? new Color(1f, 0.82f, 0.35f) : new Color(0.45f, 1f, 0.55f);
+
+            GUI.Label(new Rect(x, y, w, 20), $"{cert.StageName ?? "Training"} - {cert.Score:F0}% certified", titleStyle);
+            y += 22f;
+            y = DrawProgressBar(x, y, w, "Current stage", cert.StageProgress, cert.NeedsTraining ? _accentTex : _activeTex);
+            y += 4f;
+
+            y = DrawProgressBar(x, y, w, "Coverage", cert.CoverageProgress, _accentTex);
+            y = DrawProgressBar(x, y, w, "Area links", cert.ConnectionProgress, _accentTex);
+            y = DrawProgressBar(x, y, w, "Weapon routes", cert.WeaponProgress, _accentTex);
+            y = DrawProgressBar(x, y, w, "Route trust", cert.TrustProgress, _accentTex);
+            y = DrawProgressBar(x, y, w, "Cleanup", cert.CleanupProgress, cert.BadNodeCount > 0 ? _dangerTex : _activeTex);
+            y += 4f;
+
+            var wrap = new GUIStyle(_labelStyle);
+            wrap.wordWrap = true;
+            wrap.normal.textColor = new Color(0.9f, 0.9f, 0.9f);
+            GUI.Label(new Rect(x, y, w, 34), cert.StageInstruction ?? "", wrap);
+            y += 36f;
+
+            var actionStyle = new GUIStyle(wrap);
+            actionStyle.fontStyle = FontStyle.Bold;
+            actionStyle.normal.textColor = Color.white;
+            GUI.Label(new Rect(x, y, w, 46), "NEXT: " + (cert.PrimaryAction ?? "Keep training."), actionStyle);
+            y += 50f;
+
+            if (cert.HasTargetPosition)
+            {
+                var targetStyle = new GUIStyle(_labelStyle);
+                targetStyle.normal.textColor = new Color(1f, 0.78f, 0.25f);
+                targetStyle.fontStyle = FontStyle.Bold;
+                targetStyle.wordWrap = true;
+                GUI.Label(new Rect(x, y, w, 34), $"MARKER: {cert.TargetLabel ?? "training target"}", targetStyle);
+                y += 36f;
+            }
+
+            string buttonLabel = cert.NextButtonLabel ?? "Run Training";
+            GUIStyle buttonStyle = cert.BadNodeCount > 0 ? MakeDangerButtonStyle() : _activeButtonStyle;
+            if (GUI.Button(new Rect(x, y, w, 26), buttonLabel, buttonStyle))
+                ExecuteTrainingStageAction(cert);
+            y += 32f;
+
+            // Spell out the staged flow and WHEN each step unlocks (this panel is the single
+            // control now — there are no separate behavior buttons fighting it).
+            var flowStyle = new GUIStyle(_labelStyle);
+            flowStyle.fontSize = 10;
+            flowStyle.wordWrap = true;
+            flowStyle.normal.textColor = new Color(0.62f, 0.66f, 0.74f);
+            GUI.Label(new Rect(x, y, w, 40),
+                "STEPS:  1 Build mesh  ->  2 Validate  ->  3 Play.\n" +
+                "The button above runs the current step; it advances on its own once the bars fill " +
+                "(Build: coverage + area links; Validate: route trust). You don't pick Explore/Validate manually.",
+                flowStyle);
+            y += 44f;
+
+            if (cert.BadNodeCount > 0)
+            {
+                GUI.Label(new Rect(x, y, w, 18),
+                    $"Bad route points: {cert.BadNodeCount} | worst: {cert.WorstBadNodeStrikes}/3", _labelStyle);
+                y += 20f;
+            }
+            GUI.Label(new Rect(x, y, w, 18),
+                $"Weapons ready: {cert.ValidatedWeaponRoutes}/{Mathf.Max(1, cert.WeaponAnchorCount)}", _labelStyle);
+            y += 20f;
+            GUI.Label(new Rect(x, y, w, 18),
+                $"Trusted routes: {cert.BotValidatedEdges} bot + {cert.PlayerProvenEdges} player", _labelStyle);
+            y += 20f;
+            if (cert.NeedsDemoEdges > 0)
+            {
+                GUI.Label(new Rect(x, y, w, 18), $"Routes to walk yourself: {cert.NeedsDemoEdges}", _labelStyle);
+                y += 20f;
+            }
+
+            return y;
+        }
+
+        private static float DrawProgressBar(float x, float y, float w, string label, float value, Texture2D fill)
+        {
+            value = Mathf.Clamp01(value);
+            GUI.Label(new Rect(x, y, w, 16), $"{label}: {value * 100f:F0}%", _labelStyle);
+            y += 15f;
+            GUI.DrawTexture(new Rect(x, y, w, 8), _dragBarTex);
+            GUI.DrawTexture(new Rect(x, y, Mathf.Max(2f, w * value), 8), fill);
+            return y + 14f;
+        }
+
+        private static GUIStyle MakeDangerButtonStyle()
+        {
+            var style = new GUIStyle(_buttonStyle);
+            style.normal.background = _dangerTex;
+            style.normal.textColor = Color.white;
+            style.fontStyle = FontStyle.Bold;
+            return style;
+        }
+
+        private static void ExecuteTrainingStageAction(MapCertificationReport cert)
+        {
+            if (cert == null) return;
+            if (Plugin.NavGraphMode != null && Plugin.NavGraphMode.Value != "Training")
+                Plugin.NavGraphMode.Value = "Training";
+            if (Plugin.ShowOverlay != null) Plugin.ShowOverlay.Value = true;
+
+            if (cert.BadNodeCount > 0)
+            {
+                NavGraph.Instance?.PruneBadNodes(50);
+                if (Plugin.TrainingBehavior != null) Plugin.TrainingBehavior.Value = "Validate";
+                return;
+            }
+
+            if (cert.StageNumber >= 3)
+            {
+                // Ready — hand off to Play (bots keep learning there too).
+                if (Plugin.NavGraphMode != null) Plugin.NavGraphMode.Value = "Play";
+                return;
+            }
+
+            if (Plugin.TrainingBehavior != null)
+                Plugin.TrainingBehavior.Value = string.IsNullOrWhiteSpace(cert.RecommendedBehavior)
+                    ? "Validate"
+                    : cert.RecommendedBehavior;
+        }
+
+        private static void DrawWorldTrainingMarker(MapCertificationReport cert)
+        {
+            if (cert == null || !cert.HasTargetPosition) return;
+            Camera cam = Camera.main;
+            if (cam == null) return;
+
+            if (cert.HasRouteTarget)
+            {
+                DrawWorldLabel(cam, cert.RouteStartPosition, "WALK FROM HERE", _activeTex);
+                DrawWorldLabel(cam, cert.RouteEndPosition, "...TO HERE", _dangerTex);
+                DrawWorldLabel(cam, cert.TargetPosition, "WALK THIS ROUTE", _accentTex);
+                return;
+            }
+
+            string label = cert.BadNodeCount > 0
+                ? "FIX BAD ROUTE POINT"
+                : (cert.TargetLabel ?? "TRAIN HERE");
+            DrawWorldLabel(cam, cert.TargetPosition, label, cert.BadNodeCount > 0 ? _dangerTex : _accentTex);
+        }
+
+        private static void DrawWorldLabel(Camera cam, Vector3 worldPos, string label, Texture2D background)
+        {
+            Vector3 screen = cam.WorldToScreenPoint(worldPos + Vector3.up * 1.4f);
+            if (screen.z <= 0f) return;
+
+            float x = screen.x;
+            float y = Screen.height - screen.y;
+            var box = new GUIStyle(GUI.skin.box);
+            box.normal.background = background;
+            box.normal.textColor = Color.white;
+            box.fontStyle = FontStyle.Bold;
+            box.fontSize = 12;
+            box.alignment = TextAnchor.MiddleCenter;
+            box.wordWrap = true;
+
+            GUI.Box(new Rect(x - 85f, y - 26f, 170f, 38f), label, box);
+            GUI.Label(new Rect(x - 10f, y + 9f, 20f, 22f), "v", box);
         }
 
         private static void DrawHelpPage(float x, float y)

@@ -46,6 +46,10 @@ namespace StraftatBots
                     w.Write(e.SuccessCount);
                     w.Write(e.FailCount);
                     w.Write(e.Cost);
+                    w.Write((byte)e.TrustState);
+                    w.Write(e.BotValidationSuccesses);
+                    w.Write(e.BotValidationFailures);
+                    w.Write(e.LastValidationTime);
 
                     // V3: trajectory data for jump/fall/walljump edges
                     w.Write(e.TakeoffDir.x); w.Write(e.TakeoffDir.y); w.Write(e.TakeoffDir.z);
@@ -96,13 +100,14 @@ namespace StraftatBots
                     _dirty = true;
                     return;
                 }
-                if (version != 2 && version != 3 && version != 4)
+                if (version != 2 && version != 3 && version != 4 && version != 5)
                 {
                     Plugin.Log.LogWarning($"[NavGraph] File version {version} unknown, skipping");
                     return;
                 }
                 bool hasTrajectory = (version >= 3);
                 bool hasProvenRoutes = (version >= 4);
+                bool hasTrustState = (version >= 5);
 
                 _nextNodeId = r.ReadInt32();
 
@@ -140,6 +145,18 @@ namespace StraftatBots
                     edge.Confidence = conf;
                     edge.SuccessCount = success;
                     edge.FailCount = fail;
+
+                    if (hasTrustState)
+                    {
+                        edge.TrustState = NormalizeTrustState(r.ReadByte());
+                        edge.BotValidationSuccesses = r.ReadInt32();
+                        edge.BotValidationFailures = r.ReadInt32();
+                        edge.LastValidationTime = r.ReadSingle();
+                    }
+                    else
+                    {
+                        edge.TrustState = EdgeTrustState.Candidate;
+                    }
 
                     // V3: trajectory data
                     if (hasTrajectory)
@@ -223,6 +240,7 @@ namespace StraftatBots
                     }
                 }
                 RebuildProvenEdgeSet();
+                RebuildTrustStatesFromLegacy();
 
                 if (version < FILE_VERSION)
                 {
@@ -315,6 +333,10 @@ namespace StraftatBots
                     w.Write(e.SuccessCount);
                     w.Write(e.FailCount);
                     w.Write(e.Cost);
+                    w.Write((byte)e.TrustState);
+                    w.Write(e.BotValidationSuccesses);
+                    w.Write(e.BotValidationFailures);
+                    w.Write(e.LastValidationTime);
                     w.Write(e.TakeoffDir.x); w.Write(e.TakeoffDir.y); w.Write(e.TakeoffDir.z);
                     w.Write(e.TakeoffSpeed);
                     w.Write(e.LockedSpeed);
@@ -386,6 +408,10 @@ namespace StraftatBots
                         int success = r.ReadInt32();
                         int fail = r.ReadInt32();
                         float cost = r.ReadSingle();
+                        EdgeTrustState trustState = NormalizeTrustState(r.ReadByte());
+                        int validationSuccesses = r.ReadInt32();
+                        int validationFailures = r.ReadInt32();
+                        float lastValidationTime = r.ReadSingle();
 
                         // Read trajectory data
                         Vector3 takeoffDir = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
@@ -419,6 +445,11 @@ namespace StraftatBots
                             if (edge != null)
                             {
                                 edge.Confidence = Mathf.Max(edge.Confidence, conf);
+                                if (trustState > edge.TrustState)
+                                    edge.TrustState = trustState;
+                                edge.BotValidationSuccesses = Mathf.Max(edge.BotValidationSuccesses, validationSuccesses);
+                                edge.BotValidationFailures = Mathf.Max(edge.BotValidationFailures, validationFailures);
+                                edge.LastValidationTime = Mathf.Max(edge.LastValidationTime, lastValidationTime);
                                 // Keep trajectory from whichever source has data
                                 if (sc > 0 && edge.AirSampleCount == 0)
                                 {
@@ -434,6 +465,8 @@ namespace StraftatBots
                         }
                     }
 
+                    RebuildTrustStatesFromLegacy();
+                    _cachedCertification = null;
                     Plugin.Log.LogInfo($"[NavGraph] Merged remote data: {nodeCount} nodes, {edgeCount} edges");
                 }
             }

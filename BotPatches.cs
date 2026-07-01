@@ -20,6 +20,8 @@ namespace StraftatBots
         // Cached reflection — avoid GetField in hot paths
         private static readonly Dictionary<(Type, string), FieldInfo> _patchFieldCache = new Dictionary<(Type, string), FieldInfo>();
         private static readonly Dictionary<(Type, string), MethodInfo> _patchMethodCache = new Dictionary<(Type, string), MethodInfo>();
+        private static readonly Dictionary<string, float> _recentKillFeedVictims = new Dictionary<string, float>();
+        private static int _allowNextBotKillFeedLines;
         private static readonly BindingFlags _allFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
 
         private static FieldInfo GetField(Type type, string name)
@@ -47,6 +49,31 @@ namespace StraftatBots
                 // Solo play: skip player count checks
                 PatchPostfix(typeof(LobbyController), "HasEnoughPlayers", nameof(HasEnoughPlayers_Postfix));
                 PatchPrefix(typeof(PauseManager), "HandleServerStateWhenOnePlayerIsLeft", nameof(HandleOnePlayer_Prefix));
+                try { PatchPrefix(typeof(PauseManager), "WriteLog", nameof(PauseManagerWriteLog_Prefix)); }
+                catch { Plugin.Log.LogWarning("  Could not patch PauseManager.WriteLog"); }
+                try
+                {
+                    var replaceNames = typeof(ClientInstance).GetMethod(
+                        "ReplaceAllPlayerNameTags",
+                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                        null,
+                        new[] { typeof(string) },
+                        null);
+                    if (replaceNames != null)
+                    {
+                        var post = typeof(BotPatches).GetMethod(nameof(ReplaceAllPlayerNameTags_Postfix), BindingFlags.Public | BindingFlags.Static);
+                        _harmony.Patch(replaceNames, postfix: new HarmonyMethod(post));
+                        Plugin.Log.LogInfo("  Patched: ClientInstance.ReplaceAllPlayerNameTags");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("  Could not find ClientInstance.ReplaceAllPlayerNameTags");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Plugin.Log.LogWarning($"  Could not patch ClientInstance.ReplaceAllPlayerNameTags: {e.Message}");
+                }
 
                 // Suppress round/take progression in training mode (transpilers)
                 try
@@ -78,6 +105,9 @@ namespace StraftatBots
                 // Bot lifecycle
                 PatchPostfix(typeof(PlayerManager), "OnLoadSceneEnd", nameof(OnLoadSceneEnd_Postfix));
                 PatchPostfix(typeof(PlayerManager), "RoundSpawn", nameof(RoundSpawn_Postfix));
+                PatchPostfix(typeof(GameManager), "ProgressToNextTake", nameof(ProgressToNextTake_Postfix));
+                try { PatchPrefix(typeof(RoundManager), "NextRoundCall", nameof(RoundManagerNextRoundCall_Prefix)); }
+                catch { Plugin.Log.LogWarning("  Could not patch RoundManager.NextRoundCall"); }
                 PatchPostfix(typeof(SteamLobby), "LeaveMatch", nameof(LeaveMatch_Postfix));
 
                 // Player position recording for NavGraph (host only)
@@ -143,6 +173,36 @@ namespace StraftatBots
                     }
                 }
                 catch { }
+                try
+                {
+                    var setLeftObjMethod = typeof(PlayerPickup).GetMethod("SetObjectInLeftHandObserver",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (setLeftObjMethod != null)
+                    {
+                        var postfix = typeof(BotPatches).GetMethod(nameof(SetObjectInHand_Postfix), BindingFlags.Public | BindingFlags.Static);
+                        _harmony.Patch(setLeftObjMethod, postfix: new HarmonyMethod(postfix));
+                        Plugin.Log.LogInfo("  Patched: PlayerPickup.SetObjectInLeftHandObserver (postfix)");
+                    }
+                }
+                catch { }
+
+                // Strip hat + cig from bots. The game's ChangeDress ALWAYS instantiates a hat and a
+                // cig (PlayerSetup.cs:232/242) that render as white untextured slabs on bots. Keep
+                // the suit (applied in the same method); drop the cosmetics. Runs on every dress,
+                // including respawn, so it's the authoritative fix.
+                try
+                {
+                    var changeDress = typeof(PlayerSetup).GetMethod("ChangeDress",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                        null, new[] { typeof(GameObject), typeof(GameObject), typeof(Vector3) }, null);
+                    if (changeDress != null)
+                    {
+                        var postfix = typeof(BotPatches).GetMethod(nameof(ChangeDress_Postfix), BindingFlags.Public | BindingFlags.Static);
+                        _harmony.Patch(changeDress, postfix: new HarmonyMethod(postfix));
+                        Plugin.Log.LogInfo("  Patched: PlayerSetup.ChangeDress (strip bot hat/cig)");
+                    }
+                }
+                catch (Exception e) { Plugin.Log.LogWarning($"  ChangeDress patch failed: {e.Message}"); }
 
                 // Suppress SceneMotor.Update NRE
                 // SceneMotor.Update — finalizer to suppress NRE (no copy-paste of original)
@@ -211,6 +271,23 @@ namespace StraftatBots
                 }
                 catch { }
 
+                // Bot-held guns are fired by BotController manually. If vanilla Gun.Update ever
+                // gets re-enabled by observer hand sync, ShootServer dereferences player-only
+                // objects and spams NREs.
+                try
+                {
+                    var shootServer = typeof(Gun).GetMethod("ShootServer",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (shootServer != null)
+                    {
+                        var pre = typeof(BotPatches).GetMethod(nameof(GunShootServer_Prefix), BindingFlags.Public | BindingFlags.Static);
+                        var fin = typeof(BotPatches).GetMethod(nameof(GunShootServer_Finalizer), BindingFlags.Public | BindingFlags.Static);
+                        _harmony.Patch(shootServer, prefix: new HarmonyMethod(pre), finalizer: new HarmonyMethod(fin));
+                        Plugin.Log.LogInfo("  Patched: Gun.ShootServer (bot guard)");
+                    }
+                }
+                catch { Plugin.Log.LogWarning("  Could not patch Gun.ShootServer"); }
+
                 // Suppress SendKillLog on every weapon type when killer is a bot (uses host name otherwise).
                 // Not on Weapon base class — patched per subclass.
                 try
@@ -249,6 +326,8 @@ namespace StraftatBots
                 // mid-run and kills damage/VFX/audio for bot frag + regular grenades.
                 try { PatchPrefix(typeof(PhysicsGrenade), "KillShockWave", nameof(PhysicsGrenade_KillShockWave_Prefix)); }
                 catch { Plugin.Log.LogWarning("  Could not patch PhysicsGrenade.KillShockWave"); }
+                try { PatchPrefix(typeof(PlayerHealth), "TaserEnemy", nameof(PlayerHealth_TaserEnemy_Prefix)); }
+                catch { Plugin.Log.LogWarning("  Could not patch PlayerHealth.TaserEnemy"); }
                 try { PatchPrefix(typeof(Claymore), "SendKillLog", nameof(ExplosiveSendKillLog_Prefix)); } catch { }
                 try { PatchPrefix(typeof(ProximityMine), "SendKillLog", nameof(ExplosiveSendKillLog_Prefix)); } catch { }
 
@@ -413,6 +492,10 @@ namespace StraftatBots
                 try { PatchPrefix(typeof(MeleeWeapon), "RpcLogic___BumpPlayerServer_1076951378", nameof(BumpPlayerServer_Prefix)); }
                 catch { Plugin.Log.LogWarning("  Could not patch MeleeWeapon.BumpPlayerServer"); }
 
+                // Patch PhysicsProp.BumpPlayerServer for null/bot PlayerHealth RPC crashes
+                try { PatchPrefix(typeof(PhysicsProp), "RpcLogic___BumpPlayerServer_1076951378", nameof(PhysicsPropBumpPlayerServer_Prefix)); }
+                catch { Plugin.Log.LogWarning("  Could not patch PhysicsProp.BumpPlayerServer"); }
+
                 // Patch ItemBehaviour.OnCollisionEnter for bots (prefix + finalizer)
                 try
                 {
@@ -439,9 +522,10 @@ namespace StraftatBots
                         null, new Type[] { typeof(int), typeof(Dictionary<int, int>) }, null);
                     if (hudMethod != null)
                     {
+                        var prefixPatch = typeof(BotPatches).GetMethod(nameof(MatchPointsHUD_UpdateVisuals_Prefix), BindingFlags.Public | BindingFlags.Static);
                         var finalizerPatch = typeof(BotPatches).GetMethod(nameof(MatchPointsHUD_Finalizer), BindingFlags.Public | BindingFlags.Static);
-                        _harmony.Patch(hudMethod, finalizer: new HarmonyMethod(finalizerPatch));
-                        Plugin.Log.LogInfo("  Patched (finalizer): MatchPoitnsHUD.UpdateVisuals");
+                        _harmony.Patch(hudMethod, prefix: new HarmonyMethod(prefixPatch), finalizer: new HarmonyMethod(finalizerPatch));
+                        Plugin.Log.LogInfo("  Patched (prefix+finalizer): MatchPoitnsHUD.UpdateVisuals");
                     }
                 }
                 catch { Plugin.Log.LogWarning("  Could not patch MatchPoitnsHUD.UpdateVisuals"); }
@@ -473,6 +557,29 @@ namespace StraftatBots
             Plugin.Log.LogInfo($"  Patched: {type.Name}.{methodName}");
         }
 
+        /// <summary>Strip the hat + cig the game's ChangeDress instantiates on bots (they render
+        /// as white untextured slabs). Suit is applied earlier in ChangeDress and is left intact.</summary>
+        public static void ChangeDress_Postfix(PlayerSetup __instance)
+        {
+            try
+            {
+                if (__instance == null || __instance.GetComponent<BotController>() == null) return;
+                if (__instance.hat != null) { UnityEngine.Object.Destroy(__instance.hat); __instance.hat = null; }
+                var mount = __instance.hatToWearPosition;
+                if (mount != null)
+                {
+                    for (int i = mount.childCount - 1; i >= 0; i--)
+                    {
+                        var child = mount.GetChild(i);
+                        if (child.GetComponent<HatPosition>() != null)
+                            UnityEngine.Object.Destroy(child.gameObject);
+                    }
+                    mount.gameObject.SetActive(false);
+                }
+            }
+            catch (Exception e) { Plugin.Log.LogWarning($"ChangeDress_Postfix: {e.Message}"); }
+        }
+
         private static void EnsureBotManager()
         {
             if (BotManager.Instance == null)
@@ -487,6 +594,269 @@ namespace StraftatBots
 
         // Skip solo kick
         public static bool HandleOnePlayer_Prefix() => false;
+
+        public static bool PauseManagerWriteLog_Prefix(ref string __0)
+        {
+            try
+            {
+                if (_allowNextBotKillFeedLines > 0)
+                {
+                    _allowNextBotKillFeedLines--;
+                    string plain = StripRichText(__0).Trim();
+                    if (LooksLikeKillFeedLine(plain))
+                    {
+                        string key = NormalizeKillFeedVictimKey(ExtractKillFeedVictim(plain));
+                        if (!string.IsNullOrWhiteSpace(key))
+                            _recentKillFeedVictims[key] = Time.time;
+                    }
+                    RewriteBlankWinnerLine(ref __0);
+                    return true;
+                }
+
+                if (ShouldSuppressKillFeedDuplicate(__0))
+                    return false;
+                RewriteBlankWinnerLine(ref __0);
+            }
+            catch { }
+            return true;
+        }
+
+        internal static void AllowNextKillFeedLine()
+        {
+            _allowNextBotKillFeedLines = Math.Min(_allowNextBotKillFeedLines + 1, 4);
+        }
+
+        public static void ReplaceAllPlayerNameTags_Postfix(string __0, ref string __result)
+        {
+            try
+            {
+                RewriteBlankWinnerLine(ref __result);
+            }
+            catch { }
+        }
+
+        private static void RewriteBlankWinnerLine(ref string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            string plain = StripRichText(text).Trim();
+            bool takeMsg = plain.EndsWith("won the take", StringComparison.OrdinalIgnoreCase);
+            bool roundMsg = plain.EndsWith("won the round", StringComparison.OrdinalIgnoreCase);
+            if (!takeMsg && !roundMsg) return;
+
+            // Only rewrite broken winner lines; keep normal player messages untouched.
+            bool blankWinner = plain.StartsWith("blank ", StringComparison.OrdinalIgnoreCase)
+                || plain.StartsWith("won the ", StringComparison.OrdinalIgnoreCase)
+                || plain.StartsWith(" won the ", StringComparison.OrdinalIgnoreCase)
+                || plain.Contains("  won the ");
+            if (!blankWinner) return;
+
+            string winnerName = ResolveLikelyWinnerName();
+            if (string.IsNullOrWhiteSpace(winnerName)) return;
+            string winnerLabel = BuildWinnerLabel(winnerName);
+
+            text = takeMsg
+                ? $"{winnerLabel} won the take"
+                : $"{winnerLabel} won the round";
+        }
+
+        private static bool ShouldSuppressBrokenUnknownKillLine(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string plain = StripRichText(text).Trim().ToLowerInvariant();
+            if (!plain.Contains("was killed")) return false;
+            return plain.Contains("was killed by unknown")
+                || plain.EndsWith(" by unknown", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static void MarkKillFeedVictim(string victimName)
+        {
+            string key = NormalizeKillFeedVictimKey(victimName);
+            if (string.IsNullOrWhiteSpace(key)) return;
+            _recentKillFeedVictims[key] = Time.time;
+        }
+
+        private static bool ShouldSuppressKillFeedDuplicate(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            if (ShouldSuppressBrokenUnknownKillLine(text)) return true;
+
+            string plain = StripRichText(text).Trim();
+            if (!LooksLikeKillFeedLine(plain)) return false;
+
+            string victim = ExtractKillFeedVictim(plain);
+            string key = NormalizeKillFeedVictimKey(victim);
+            if (string.IsNullOrWhiteSpace(key)) return false;
+
+            float now = Time.time;
+            if (_recentKillFeedVictims.TryGetValue(key, out float last) && now - last < 1.25f)
+                return true;
+
+            _recentKillFeedVictims[key] = now;
+            if (_recentKillFeedVictims.Count > 64)
+            {
+                var stale = new List<string>();
+                foreach (var kv in _recentKillFeedVictims)
+                    if (now - kv.Value > 8f) stale.Add(kv.Key);
+                foreach (var k in stale) _recentKillFeedVictims.Remove(k);
+            }
+            return false;
+        }
+
+        private static bool LooksLikeKillFeedLine(string plain)
+        {
+            if (string.IsNullOrWhiteSpace(plain)) return false;
+            string lower = plain.ToLowerInvariant();
+            return lower.Contains(" was killed")
+                || lower.Contains(" was headshot")
+                || lower.Contains(" was beheaded")
+                || lower.Contains(" was slain");
+        }
+
+        private static string ExtractKillFeedVictim(string plain)
+        {
+            if (string.IsNullOrWhiteSpace(plain)) return "";
+            string lower = plain.ToLowerInvariant();
+            foreach (string marker in new[] { " was killed", " was headshot", " was beheaded", " was slain" })
+            {
+                int idx = lower.IndexOf(marker, StringComparison.Ordinal);
+                if (idx > 0) return plain.Substring(0, idx).Trim();
+            }
+            return "";
+        }
+
+        private static string NormalizeKillFeedVictimKey(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            value = StripRichText(value).Trim().ToLowerInvariant();
+            if (value.StartsWith("blank ")) value = value.Substring(6).Trim();
+            return value;
+        }
+
+        private static string BuildWinnerLabel(string winnerName)
+        {
+            if (string.IsNullOrWhiteSpace(winnerName)) return "<b>Unknown</b>";
+            string safe = winnerName;
+            bool isBot = false;
+            try
+            {
+                if (BotManager.Instance != null)
+                {
+                    foreach (var bot in BotManager.Instance.LobbyBots)
+                    {
+                        if (bot != null && string.Equals(bot.Name, winnerName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            isBot = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (isBot) return $"<b><color=#6CD4FF>{safe}</color></b>";
+
+            string playerColor = "FFFFFF";
+            try
+            {
+                if (PauseManager.Instance != null && !string.IsNullOrWhiteSpace(PauseManager.Instance.selfNameLogColor))
+                    playerColor = PauseManager.Instance.selfNameLogColor;
+            }
+            catch { }
+            return $"<b><color=#{playerColor}>{safe}</color></b>";
+        }
+
+        private static string ResolveLikelyWinnerName()
+        {
+            try
+            {
+                if (BotManager.Instance != null)
+                {
+                    int aliveCount = 0;
+                    BotController aliveBot = null;
+                    var bots = BotManager.Instance.GetActiveBots();
+                    for (int i = 0; i < bots.Count; i++)
+                    {
+                        var b = bots[i];
+                        if (b == null || b.IsDead) continue;
+                        aliveCount++;
+                        aliveBot = b;
+                    }
+                    if (aliveCount == 1 && aliveBot != null && !string.IsNullOrWhiteSpace(aliveBot.BotName))
+                        return aliveBot.BotName;
+                }
+            }
+            catch { }
+
+            // Fallback: pick the bot whose team currently leads the take.
+            try
+            {
+                if (BotManager.Instance != null && ScoreManager.Instance != null)
+                {
+                    var bots = BotManager.Instance.GetActiveBots();
+                    int bestScore = int.MinValue;
+                    string bestName = null;
+                    for (int i = 0; i < bots.Count; i++)
+                    {
+                        var b = bots[i];
+                        if (b == null || string.IsNullOrWhiteSpace(b.BotName)) continue;
+                        int teamId = ScoreManager.Instance.GetTeamId(b.PlayerId);
+                        int score = ScoreManager.Instance.GetRoundScore(teamId);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestName = b.BotName;
+                        }
+                    }
+                    if (bestScore >= 0 && !string.IsNullOrWhiteSpace(bestName))
+                        return bestName;
+                }
+            }
+            catch { }
+
+            // Last fallback: match leader by game points in case round score has already reset.
+            try
+            {
+                if (BotManager.Instance != null && ScoreManager.Instance != null)
+                {
+                    var bots = BotManager.Instance.GetActiveBots();
+                    int bestPoints = int.MinValue;
+                    string bestName = null;
+                    for (int i = 0; i < bots.Count; i++)
+                    {
+                        var b = bots[i];
+                        if (b == null || string.IsNullOrWhiteSpace(b.BotName)) continue;
+                        int teamId = ScoreManager.Instance.GetTeamId(b.PlayerId);
+                        int points = ScoreManager.Instance.GetPoints(teamId);
+                        if (points > bestPoints)
+                        {
+                            bestPoints = points;
+                            bestName = b.BotName;
+                        }
+                    }
+                    if (bestPoints >= 0 && !string.IsNullOrWhiteSpace(bestName))
+                        return bestName;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        private static string StripRichText(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return "";
+            var chars = new char[input.Length];
+            int w = 0;
+            bool inTag = false;
+            for (int i = 0; i < input.Length; i++)
+            {
+                char c = input[i];
+                if (c == '<') { inTag = true; continue; }
+                if (c == '>') { inTag = false; continue; }
+                if (!inTag) chars[w++] = c;
+            }
+            return new string(chars, 0, w);
+        }
 
         /// <summary>Returns true if training mode is active — used by transpilers to guard method entry.</summary>
         public static bool IsTrainingMode()
@@ -536,6 +906,85 @@ namespace StraftatBots
         // Force enough players
         public static void HasEnoughPlayers_Postfix(ref bool __result) => __result = true;
 
+        private static bool IsBotOwnedWeapon(Weapon weapon)
+        {
+            if (weapon == null) return false;
+            try
+            {
+                if (weapon.rootObject != null
+                    && (weapon.rootObject.GetComponent<BotController>() != null
+                        || weapon.rootObject.GetComponentInParent<BotController>() != null))
+                    return true;
+            }
+            catch { }
+
+            try
+            {
+                var item = weapon.GetComponent<ItemBehaviour>();
+                if (item != null)
+                {
+                    if (item.rootObject != null
+                        && (item.rootObject.GetComponent<BotController>() != null
+                            || item.rootObject.GetComponentInParent<BotController>() != null))
+                        return true;
+                    if (item.lastPlayerHolder != null
+                        && (item.lastPlayerHolder.GetComponent<BotController>() != null
+                            || item.lastPlayerHolder.GetComponentInParent<BotController>() != null))
+                        return true;
+                }
+            }
+            catch { }
+
+            try
+            {
+                return weapon.GetComponentInParent<BotController>() != null;
+            }
+            catch { return false; }
+        }
+
+        public static bool GunShootServer_Prefix(Gun __instance)
+        {
+            return !IsBotOwnedWeapon(__instance);
+        }
+
+        public static Exception GunShootServer_Finalizer(Gun __instance, Exception __exception)
+        {
+            if (__exception == null) return null;
+            return IsBotOwnedWeapon(__instance) ? null : __exception;
+        }
+
+        private static void DisableBotHeldWeaponScripts(GameObject obj, GameObject player)
+        {
+            if (obj == null || player == null) return;
+
+            var item = obj.GetComponent<ItemBehaviour>();
+            if (item != null)
+            {
+                item.rootObject = player;
+                item.lastPlayerHolder = player;
+                item.enabled = false;
+            }
+
+            var weapon = obj.GetComponent<Weapon>();
+            if (weapon != null)
+            {
+                weapon.rootObject = player;
+                var pv = player.GetComponent<PlayerValues>();
+                if (pv != null) weapon.playerValues = pv;
+            }
+
+            foreach (var wb in obj.GetComponents<MonoBehaviour>())
+            {
+                if (wb is Gun || wb is Shotgun || wb is ChargeGun || wb is Minigun
+                    || wb is BeamGun || wb is LargeRaycastGun || wb is BumpGun
+                    || wb is DualLauncher || wb is WeaponHandSpawner || wb is MeleeWeapon)
+                    wb.enabled = false;
+            }
+
+            foreach (var mcc in obj.GetComponentsInChildren<MeleeChildCollision>(true))
+                mcc.enabled = false;
+        }
+
         // After SetObjectInHandObserver runs on host for bot weapons, undo the host-side mess
         // The RPC sends to clients normally — we just fix the host afterward
         public static void SetObjectInHand_Postfix(PlayerPickup __instance, GameObject obj, GameObject player)
@@ -552,6 +1001,7 @@ namespace StraftatBots
             // 2. Re-disable ItemBehaviour (observer re-enabled it)
             var beh = obj.GetComponent<ItemBehaviour>();
             if (beh != null) beh.enabled = false;
+            DisableBotHeldWeaponScripts(obj, player);
             // 3. Force layer 0 (Default) — visible to all cameras, no see-through-walls
             obj.layer = 0;
             foreach (Transform child in obj.transform)

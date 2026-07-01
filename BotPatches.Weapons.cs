@@ -1,9 +1,11 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 using DG.Tweening;
 using FishNet;
+using TMPro;
 
 namespace StraftatBots
 {
@@ -12,6 +14,9 @@ namespace StraftatBots
         private static readonly FieldInfo _kcEnemyField = typeof(KillCam).GetField("enemy", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly FieldInfo _kcFreeCamField = typeof(KillCam).GetField("freeCam", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly FieldInfo _kcTimerField = typeof(KillCam).GetField("timer", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly HashSet<int> _tabScoreSetupItems = new HashSet<int>();
+        private static readonly Dictionary<int, TMP_Text> _tabScoreTexts = new Dictionary<int, TMP_Text>();
+        private static readonly List<GameObject> _roundEndExtraObjects = new List<GameObject>();
 
         public static bool KillCamUpdate_Prefix(KillCam __instance)
         {
@@ -121,6 +126,34 @@ namespace StraftatBots
             }
             catch { }
             return true;
+        }
+
+        // Game TaserEnemy RPC path assumes a real player client/camera stack and NREs on bots.
+        // Route bot victims to bot-local stun handling instead.
+        public static bool PlayerHealth_TaserEnemy_Prefix(PlayerHealth __instance, PlayerHealth enemyHealth, float stunTime)
+        {
+            try
+            {
+                var victim = enemyHealth != null ? enemyHealth : __instance;
+                if (victim == null) return true;
+                var bot = victim.GetComponent<BotController>() ?? victim.GetComponentInParent<BotController>();
+                if (bot == null) return true;
+                bot.ApplyStun(stunTime > 0f ? stunTime : 3f);
+                return false;
+            }
+            catch { return false; }
+        }
+
+        private static void ApplyStunToVictim(PlayerHealth victim, float stunTime)
+        {
+            if (victim == null) return;
+            var bot = victim.GetComponent<BotController>() ?? victim.GetComponentInParent<BotController>();
+            if (bot != null)
+            {
+                bot.ApplyStun(stunTime > 0f ? stunTime : 3f);
+                return;
+            }
+            try { victim.TaserEnemy(victim, stunTime > 0f ? stunTime : 3f); } catch { }
         }
 
         // Suppress Weapon.SendKillLog when the killer is a bot.
@@ -478,8 +511,7 @@ namespace StraftatBots
                 try { WriteExplosiveKillFeed(rootObj, victim, "Bublee"); } catch { }
                 try
                 {
-                    int pid = victim.playerValues.playerClient.PlayerId;
-                    BotDamageSync.SyncKill(pid, killerBot.BotName, "Bublee", false,
+                    BotDamageSync.SyncKill(victim, killerBot.BotName, "Bublee", false,
                         direction, ragdollForce, hitPoint, hitName);
                 }
                 catch { }
@@ -530,8 +562,7 @@ namespace StraftatBots
                     try { WriteExplosiveKillFeed(rootObj, ph, weaponName); } catch { }
                     try
                     {
-                        int pid = ph.playerValues.playerClient.PlayerId;
-                        BotDamageSync.SyncKill(pid, killerBot.BotName, weaponName, false,
+                        BotDamageSync.SyncKill(ph, killerBot.BotName, weaponName, false,
                             direction, ragdollForce, hitPoint, "Torso");
                     }
                     catch { }
@@ -711,12 +742,28 @@ namespace StraftatBots
                     rootObj = ResolveProjectileRoot(__instance, _bubbleRootField, _bubbleCharField);
                 else if (rootObj == null && __instance is Obus)
                     rootObj = ResolveProjectileRoot(__instance, _obusRootField, _obusCharField);
+                else if (rootObj == null && __instance is PhysicsGrenade)
+                    rootObj = ResolveProjectileRoot(__instance, _pgRootField, null);
                 if (__instance is Bubble && rootObj != null && rootObj.GetComponent<BotController>() != null)
                     radius = Mathf.Max(radius, 4.5f);
+                string resolvedWeaponName = ResolveExplosiveWeaponName(__instance);
+                bool isGlandGrenade = !string.IsNullOrWhiteSpace(resolvedWeaponName)
+                    && resolvedWeaponName.IndexOf("gland", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isStunMine = IsStunMineInstance(__instance);
+                bool isStunGrenade = IsStunGrenadeInstance(__instance);
+                bool isStunExplosive = isStunMine || isStunGrenade;
+                radius = Mathf.Clamp(radius, 0.5f, 8f);
+                damage = Mathf.Clamp(damage, 0f, 200f);
+                ragdollForce = Mathf.Clamp(ragdollForce, 1f, 120f);
+                if (isGlandGrenade)
+                {
+                    radius = Mathf.Min(radius, 3.25f);
+                    damage = Mathf.Min(damage, 65f);
+                }
                 // Claymore + Proximity Mine = instant kill. AP Mine (ProximityMine with low damage) = multi-hit at 50 dmg.
                 bool isAPMine = IsApMineInstance(__instance);
                 bool isInstantKill = __instance is Claymore;
-                if (__instance is ProximityMine && !isAPMine)
+                if (__instance is ProximityMine && !isAPMine && !isStunMine)
                     isInstantKill = true; // Proximity mine = instant kill
                 if (isAPMine)
                     damage = 50f; // AP mine: 2 hits to kill (50 x 2 = 100)
@@ -796,6 +843,7 @@ namespace StraftatBots
                     Collider[] hits = Physics.OverlapSphere(__instance.transform.position, radius, hitMask);
                     var handled = new System.Collections.Generic.HashSet<BotController>();
 
+                    Vector3 blastOrigin = __instance.transform.position + Vector3.up * 0.1f;
                     foreach (var hit in hits)
                     {
                         BotController victimBot = hit.GetComponentInParent<BotController>();
@@ -806,10 +854,23 @@ namespace StraftatBots
                         if (ph == null || ph.isKilled) continue;
                         if (IsOwnProjectileVictim(__instance, rootObj, ph)) continue;
 
+                        Vector3 targetPoint = ph.transform.position + Vector3.up * 0.8f;
+                        float dist = Vector3.Distance(blastOrigin, targetPoint);
+                        if (dist > radius) continue;
+
+                        if (isStunExplosive)
+                        {
+                            ApplyStunToVictim(ph, 3f);
+                            continue;
+                        }
+
                         // Apply damage to bot (game's IsOwner check skips server-owned bots)
                         if (ph.health > 0f && damage > 0f)
                         {
-                            try { ph.RemoveHealth(damage); } catch { }
+                            float falloff = 1f - Mathf.Clamp01(dist / radius);
+                            float minEdgeDamageScale = isGlandGrenade ? 0.15f : 0.35f;
+                            float appliedDamage = Mathf.Max(1f, damage * Mathf.Lerp(minEdgeDamageScale, 1f, falloff));
+                            try { ph.RemoveHealth(appliedDamage); } catch { }
                             if (rootObj != null)
                                 try { ph.SetKiller(rootObj.transform); } catch { }
                         }
@@ -830,7 +891,7 @@ namespace StraftatBots
                             }
 
                             // Kill feed — game's SendKillLog never runs because KillShockWave NREs on bots
-                            try { WriteExplosiveKillFeed(rootObj, ph, ResolveExplosiveWeaponName(__instance)); }
+                            try { WriteExplosiveKillFeed(rootObj, ph, resolvedWeaponName); }
                             catch { }
                         }
                     }
@@ -845,7 +906,7 @@ namespace StraftatBots
                         BotController expKillerBot = rootObj != null ? rootObj.GetComponent<BotController>() : null;
                         if (expKillerBot != null)
                         {
-                            string expWeaponName = ResolveExplosiveWeaponName(__instance);
+                            string expWeaponName = resolvedWeaponName;
                             var humanHandled = new System.Collections.Generic.HashSet<PlayerHealth>();
                             foreach (var hit2 in hits)
                             {
@@ -942,6 +1003,14 @@ namespace StraftatBots
 
             try
             {
+                var apDirect = GetField(instance.GetType(), "apmine");
+                if (apDirect != null && apDirect.FieldType == typeof(bool) && (bool)apDirect.GetValue(instance))
+                    return true;
+            }
+            catch { }
+
+            try
+            {
                 if (ContainsApMineText(instance.name)) return true;
             }
             catch { }
@@ -975,6 +1044,49 @@ namespace StraftatBots
             }
             catch { }
 
+            return false;
+        }
+
+        private static bool IsStunMineInstance(MonoBehaviour instance)
+        {
+            if (!(instance is ProximityMine)) return false;
+            try
+            {
+                foreach (string fieldName in new[] { "stunMine", "isStunMine", "stunGrenade", "isStun" })
+                {
+                    var f = GetField(instance.GetType(), fieldName);
+                    if (f != null && f.FieldType == typeof(bool) && (bool)f.GetValue(instance))
+                        return true;
+                }
+                foreach (string fieldName in new[] { "weaponName", "name" })
+                {
+                    var f = GetField(instance.GetType(), fieldName);
+                    var s = f != null ? f.GetValue(instance) as string : null;
+                    if (!string.IsNullOrWhiteSpace(s) && s.IndexOf("stun", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool IsStunGrenadeInstance(MonoBehaviour instance)
+        {
+            if (!(instance is PhysicsGrenade)) return false;
+            try
+            {
+                foreach (string fieldName in new[] { "stunGrenade", "isStunGrenade", "stun" })
+                {
+                    var f = GetField(instance.GetType(), fieldName);
+                    if (f != null && f.FieldType == typeof(bool) && (bool)f.GetValue(instance))
+                        return true;
+                }
+                string weaponName = ResolveExplosiveWeaponName(instance);
+                if (!string.IsNullOrWhiteSpace(weaponName)
+                    && weaponName.IndexOf("stun", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            catch { }
             return false;
         }
 
@@ -1258,6 +1370,26 @@ namespace StraftatBots
             return true;
         }
 
+        // Physics props can send this ServerRpc with null or bot-incomplete PlayerHealth.
+        // Vanilla dereferences player-only components, which breaks FishNet packet parsing.
+        public static bool PhysicsPropBumpPlayerServer_Prefix(Vector3 direction, float force, PlayerHealth ph)
+        {
+            if (ph == null || ph.gameObject == null) return false;
+
+            var bot = ph.GetComponent<BotController>() ?? ph.GetComponentInParent<BotController>();
+            if (bot != null)
+            {
+                if (!bot.IsDead)
+                    bot.ApplyZoneImpulse(direction * Mathf.Clamp(force, 0f, 60f));
+                return false;
+            }
+
+            // Human players should use the original path, but only when the expected
+            // player movement component exists.
+            return ph.GetComponent<FirstPersonController>() != null
+                || ph.GetComponentInParent<FirstPersonController>() != null;
+        }
+
         // Guard ItemBehaviour.OnCollisionEnter for bots.
         // For explosive items (grenades etc.) hitting a bot: block the collision damage entirely.
         // The fuse/HandleExplosion path handles bot deaths via Explosion_Postfix.
@@ -1354,6 +1486,560 @@ namespace StraftatBots
             }
 
             return true; // Human killer, human victim — let original run
+        }
+
+        public static bool RoundManagerNextRoundCall_Prefix(RoundManager __instance, int playerId, bool won, int winningTeamId)
+        {
+            try
+            {
+                if (__instance == null || ScoreManager.Instance == null || PauseManager.Instance == null
+                    || ClientInstance.playerInstances == null || ClientInstance.playerInstances.Count == 0)
+                    return true;
+
+                if (__instance.InterfaceSetupCoroutine != null)
+                {
+                    try { __instance.StopCoroutine(__instance.InterfaceSetupCoroutine); } catch { }
+                    __instance.InterfaceSetupCoroutine = null;
+                }
+
+                // Ensure bot client entries have a non-empty display name/tag used by round/take text.
+                if (BotManager.Instance != null)
+                {
+                    foreach (var bot in BotManager.Instance.LobbyBots)
+                    {
+                        if (!ClientInstance.playerInstances.TryGetValue(bot.PlayerId, out var botCi) || botCi == null) continue;
+                        if (string.IsNullOrWhiteSpace(botCi.PlayerName)
+                            || botCi.PlayerName.StartsWith("Player ", StringComparison.OrdinalIgnoreCase))
+                            botCi.PlayerName = bot.Name;
+                        try
+                        {
+                            var tagField = GetField(typeof(ClientInstance), "PlayerNameTag");
+                            if (tagField != null)
+                            {
+                                string cur = tagField.GetValue(botCi) as string;
+                                if (string.IsNullOrWhiteSpace(cur)
+                                    || cur.StartsWith("Player ", StringComparison.OrdinalIgnoreCase))
+                                    tagField.SetValue(botCi, bot.Name);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                var activeIds = new List<int>();
+                foreach (var kv in ClientInstance.playerInstances)
+                {
+                    if (kv.Value != null) activeIds.Add(kv.Key);
+                }
+                // Ensure active bots always appear on round-end scoreboard even if their
+                // ClientInstance entry is temporarily null/missing at round transition time.
+                try
+                {
+                    if (BotManager.Instance != null)
+                    {
+                        foreach (var bot in BotManager.Instance.LobbyBots)
+                        {
+                            if (bot == null || bot.PlayerId < 0) continue;
+                            if (!activeIds.Contains(bot.PlayerId)) activeIds.Add(bot.PlayerId);
+                        }
+                    }
+
+                    var bots = BotManager.ActiveBots;
+                    if (bots != null)
+                    {
+                        for (int i = 0; i < bots.Count; i++)
+                        {
+                            var b = bots[i];
+                            if (b == null) continue;
+                            if (b.PlayerId < 0) continue;
+                            if (!activeIds.Contains(b.PlayerId)) activeIds.Add(b.PlayerId);
+                        }
+                    }
+                }
+                catch { }
+                if (activeIds.Count == 0) return true;
+                activeIds.Sort();
+
+                int maxPid = 0;
+                foreach (var kv in ClientInstance.playerInstances)
+                    if (kv.Key > maxPid) maxPid = kv.Key;
+                for (int i = 0; i < activeIds.Count; i++)
+                    if (activeIds[i] > maxPid) maxPid = activeIds[i];
+                if (maxPid < 0) return true;
+
+                int len = maxPid + 1;
+                __instance.names = new string[len];
+                __instance.scores = new int[len];
+                __instance.players = new ClientInstance[len];
+
+                foreach (var kv in ClientInstance.playerInstances)
+                {
+                    int pid = kv.Key;
+                    var ci = kv.Value;
+                    if (pid < 0 || pid >= len || ci == null) continue;
+                    __instance.players[pid] = ci;
+                    __instance.names[pid] = ResolveScoreboardName(pid, ci);
+
+                    if (ScoreManager.Instance != null)
+                    {
+                        int teamId = ScoreManager.Instance.GetTeamId(pid);
+                        if (teamId >= 0)
+                            __instance.scores[pid] = ScoreManager.Instance.GetPoints(teamId);
+                    }
+                }
+
+                // Fill any missing rows (usually bots) from active IDs so names are never blank.
+                for (int i = 0; i < activeIds.Count; i++)
+                {
+                    int pid = activeIds[i];
+                    if (pid < 0 || pid >= len) continue;
+                    if (string.IsNullOrWhiteSpace(__instance.names[pid])
+                        || __instance.names[pid].StartsWith("Player ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ClientInstance ci = null;
+                        try { ClientInstance.playerInstances.TryGetValue(pid, out ci); } catch { }
+                        __instance.names[pid] = ResolveScoreboardName(pid, ci);
+                    }
+                    if (ScoreManager.Instance != null)
+                    {
+                        int teamId = ScoreManager.Instance.GetTeamId(pid);
+                        if (teamId >= 0)
+                            __instance.scores[pid] = ScoreManager.Instance.GetPoints(teamId);
+                    }
+                }
+
+                ResetRoundUiCaches();
+                if (won) Settings.Instance.IncreaseRoundsWon();
+                else Settings.Instance.IncreaseRoundsLost();
+
+                __instance.InterfaceSetupCoroutine = ExtendedRoundInterfaceSetup(__instance, playerId, won, winningTeamId, activeIds);
+                __instance.StartCoroutine(__instance.InterfaceSetupCoroutine);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"RoundManager.NextRoundCall prefix: {ex.Message}");
+                return true;
+            }
+        }
+
+        private static IEnumerator ExtendedRoundInterfaceSetup(RoundManager rm, int playerId, bool won, int winningTeamId, List<int> activeIds)
+        {
+            PauseManager.Instance.onEndRoundScreen = true;
+            yield return null;
+
+            foreach (var obj in _roundEndExtraObjects)
+            {
+                if (obj != null) UnityEngine.Object.Destroy(obj);
+            }
+            _roundEndExtraObjects.Clear();
+
+            var container = GetField(typeof(RoundManager), "container")?.GetValue(rm) as GameObject;
+            var background = GetField(typeof(RoundManager), "background")?.GetValue(rm) as GameObject;
+            var winText = GetField(typeof(RoundManager), "winText")?.GetValue(rm) as TextMeshProUGUI;
+            var selfPlusOne = GetField(typeof(RoundManager), "selfPlusOne")?.GetValue(rm) as GameObject;
+            var enemyPlusOne = GetField(typeof(RoundManager), "enemyPlusOne")?.GetValue(rm) as GameObject[];
+            float tweenTime = 0.75f;
+            try { tweenTime = (float)GetField(typeof(RoundManager), "tweenTime")?.GetValue(rm); } catch { }
+
+            if (selfPlusOne != null) selfPlusOne.transform.localScale = Vector3.zero;
+            if (enemyPlusOne != null)
+            {
+                for (int i = 0; i < enemyPlusOne.Length; i++)
+                    if (enemyPlusOne[i] != null) enemyPlusOne[i].transform.localScale = Vector3.zero;
+            }
+
+            var winClip = GetField(typeof(RoundManager), won ? "winClip" : "loseClip")?.GetValue(rm) as AudioClip;
+            if (winClip != null) SoundManager.Instance.PlaySound(winClip);
+
+            if (container != null) container.transform.localScale = Vector3.one;
+            if (background != null) background.transform.localScale = Vector3.one;
+
+            if (winText != null)
+            {
+                Color winColor = Color.white, loseColor = Color.white;
+                try { winColor = (Color)GetField(typeof(RoundManager), "winColor")?.GetValue(rm); } catch { }
+                try { loseColor = (Color)GetField(typeof(RoundManager), "loseColor")?.GetValue(rm); } catch { }
+                winText.color = won ? winColor : loseColor;
+                winText.text = won ? "victory" : "defeat";
+            }
+
+            var imgThree = GetField(typeof(RoundManager), "nextRoundImageThree")?.GetValue(rm) as Transform;
+            var imgFour = GetField(typeof(RoundManager), "nextRoundImageFour")?.GetValue(rm) as Transform;
+            var imgFive = GetField(typeof(RoundManager), "nextRoundImageFive")?.GetValue(rm) as Transform;
+            var imgSix = GetField(typeof(RoundManager), "nextRoundImageSix")?.GetValue(rm) as Transform;
+            if (imgThree != null) imgThree.localScale = Vector3.zero;
+            if (imgFour != null) imgFour.localScale = Vector3.zero;
+            if (imgFive != null) imgFive.localScale = Vector3.zero;
+            if (imgSix != null) imgSix.localScale = Vector3.zero;
+
+            var imgOne = GetField(typeof(RoundManager), "nextRoundImageOne")?.GetValue(rm) as Transform;
+            var imgTwo = GetField(typeof(RoundManager), "nextRoundImageTwo")?.GetValue(rm) as Transform;
+            var imgOneActive = GetField(typeof(RoundManager), "nextRoundImageOneActivePos")?.GetValue(rm) as Transform;
+            var imgTwoActive = GetField(typeof(RoundManager), "nextRoundImageTwoActivePos")?.GetValue(rm) as Transform;
+            var imgOneRest = GetField(typeof(RoundManager), "nextRoundImageOneRestPos")?.GetValue(rm) as Transform;
+            var imgTwoRest = GetField(typeof(RoundManager), "nextRoundImageTwoRestPos")?.GetValue(rm) as Transform;
+
+            var swoosh = GetField(typeof(RoundManager), "swooshClip")?.GetValue(rm) as AudioClip[];
+            if (swoosh != null && swoosh.Length > 0 && swoosh[0] != null) SoundManager.Instance.PlaySound(swoosh[0]);
+            if (imgOne != null && imgOneActive != null) imgOne.DOMove(imgOneActive.position, tweenTime).SetEase(Ease.OutSine);
+            if (imgTwo != null && imgTwoActive != null) imgTwo.DOMove(imgTwoActive.position, tweenTime).SetEase(Ease.OutSine);
+
+            int localPlayerId = playerId;
+            if (LobbyController.Instance?.LocalPlayerController != null)
+                localPlayerId = LobbyController.Instance.LocalPlayerController.PlayerId;
+
+            int halfCount = (activeIds.Count + 1) / 2;
+            var scoreTextMap = new Dictionary<int, TextMeshProUGUI>();
+            try
+            {
+                Plugin.Log.LogInfo($"[BOT] RoundEnd UI entries={activeIds.Count} ids=[{string.Join(",", activeIds)}]");
+            }
+            catch { }
+
+            if (container != null)
+            {
+                for (int idx = 0; idx < activeIds.Count; idx++)
+                {
+                    int pid = activeIds[idx];
+                    if (pid < 0 || pid >= rm.names.Length || pid >= rm.scores.Length) continue;
+
+                    int col = idx < halfCount ? 0 : 1;
+                    int row = idx < halfCount ? idx : idx - halfCount;
+                    float xBase = col == 0 ? -250f : 250f;
+                    float yBase = 120f - row * 70f;
+
+                    var nameGo = new GameObject($"RoundEndName_{pid}");
+                    nameGo.transform.SetParent(container.transform, false);
+                    var nameText = nameGo.AddComponent<TextMeshProUGUI>();
+                    bool isLocal = pid == localPlayerId;
+                    string displayName = ResolveScoreboardName(pid, rm.players[pid]);
+                    if (string.IsNullOrWhiteSpace(displayName)) displayName = rm.names[pid];
+                    if (string.IsNullOrWhiteSpace(displayName)) displayName = $"Player {pid}";
+                    nameText.text = isLocal ? displayName.ToLower() : displayName;
+                    nameText.fontSize = isLocal ? 34f : 30f;
+                    nameText.fontStyle = isLocal ? FontStyles.Bold : FontStyles.Normal;
+                    nameText.alignment = TextAlignmentOptions.Center;
+                    nameText.color = Color.white;
+                    var nameRt = nameText.GetComponent<RectTransform>();
+                    nameRt.anchorMin = nameRt.anchorMax = nameRt.pivot = new Vector2(0.5f, 0.5f);
+                    nameRt.anchoredPosition = new Vector2(xBase, yBase);
+                    nameRt.sizeDelta = new Vector2(400f, 40f);
+                    _roundEndExtraObjects.Add(nameGo);
+
+                    var scoreGo = new GameObject($"RoundEndScore_{pid}");
+                    scoreGo.transform.SetParent(container.transform, false);
+                    var scoreText = scoreGo.AddComponent<TextMeshProUGUI>();
+                    bool isWinTeam = ScoreManager.Instance.GetTeamId(pid) == winningTeamId;
+                    int preScore = isWinTeam ? Mathf.Max(0, rm.scores[pid] - 1) : rm.scores[pid];
+                    scoreText.text = preScore.ToString();
+                    scoreText.fontSize = 26f;
+                    scoreText.alignment = TextAlignmentOptions.Center;
+                    scoreText.color = new Color(0f, 1f, 1f);
+                    var scoreRt = scoreText.GetComponent<RectTransform>();
+                    scoreRt.anchorMin = scoreRt.anchorMax = scoreRt.pivot = new Vector2(0.5f, 0.5f);
+                    scoreRt.anchoredPosition = new Vector2(xBase, yBase - 32f);
+                    scoreRt.sizeDelta = new Vector2(100f, 30f);
+                    scoreTextMap[pid] = scoreText;
+                    _roundEndExtraObjects.Add(scoreGo);
+                }
+            }
+
+            yield return new WaitForSeconds(0.75f);
+            var plusOneClip = GetField(typeof(RoundManager), "plusOneClip")?.GetValue(rm) as AudioClip;
+            if (plusOneClip != null) SoundManager.Instance.PlaySound(plusOneClip);
+
+            yield return new WaitForSeconds(1.0f);
+            foreach (var kv in scoreTextMap)
+            {
+                int pid = kv.Key;
+                if (pid >= 0 && pid < rm.scores.Length && kv.Value != null)
+                    kv.Value.text = rm.scores[pid].ToString();
+            }
+
+            yield return new WaitForSeconds(1.25f);
+            if (swoosh != null && swoosh.Length > 1 && swoosh[1] != null) SoundManager.Instance.PlaySound(swoosh[1]);
+            if (imgOne != null && imgOneRest != null) imgOne.DOMove(imgOneRest.position, tweenTime).SetEase(Ease.OutSine);
+            if (imgTwo != null && imgTwoRest != null) imgTwo.DOMove(imgTwoRest.position, tweenTime).SetEase(Ease.OutSine);
+
+            yield return new WaitForSeconds(1f);
+            if (container != null) container.transform.localScale = Vector3.zero;
+            if (background != null) background.transform.localScale = Vector3.zero;
+
+            foreach (var obj in _roundEndExtraObjects)
+                if (obj != null) UnityEngine.Object.Destroy(obj);
+            _roundEndExtraObjects.Clear();
+
+            try { SceneMotor.Instance.ShowLoadingScreen(); } catch { }
+            PauseManager.Instance.onEndRoundScreen = false;
+            rm.InterfaceSetupCoroutine = null;
+            try { SceneMotor.Instance.ChangeNetworkScene(); } catch { }
+        }
+
+        private static void UpdateTabScoresBetweenRounds()
+        {
+            try
+            {
+                if (ScoreManager.Instance == null) return;
+                var lc = LobbyController.Instance;
+                if (lc == null) return;
+
+                var tabScreenField = GetField(typeof(LobbyController), "tabScreen");
+                var tabTransform = tabScreenField?.GetValue(lc) as Transform;
+                if (tabTransform == null) return;
+
+                var tabItems = tabTransform.GetComponentsInChildren<PlayerListItem>(true);
+                if (tabItems == null || tabItems.Length == 0) return;
+
+                foreach (var item in tabItems)
+                {
+                    if (item == null) continue;
+                    int id = item.GetInstanceID();
+                    if (!_tabScoreSetupItems.Contains(id))
+                    {
+                        _tabScoreSetupItems.Add(id);
+
+                        if (item.PlayerReadyText != null)
+                            item.PlayerReadyText.gameObject.SetActive(false);
+
+                        var go = new GameObject("BotRoundScore");
+                        go.transform.SetParent(item.transform, false);
+                        var st = go.AddComponent<TextMeshProUGUI>();
+                        st.fontSize = 30f;
+                        st.fontStyle = FontStyles.Bold;
+                        st.alignment = TextAlignmentOptions.Center;
+                        st.color = new Color(0f, 1f, 1f);
+                        var rt = st.GetComponent<RectTransform>();
+                        rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0.5f, 0.5f);
+                        rt.anchoredPosition = new Vector2(0f, 34f);
+                        rt.sizeDelta = new Vector2(150f, 40f);
+                        _tabScoreTexts[id] = st;
+                    }
+
+                    if (_tabScoreTexts.TryGetValue(id, out var scoreText) && scoreText != null)
+                    {
+                        int teamId = ScoreManager.Instance.GetTeamId(item.PlayerIdNumber);
+                        if (teamId >= 0)
+                            scoreText.text = ScoreManager.Instance.GetPoints(teamId).ToString();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"UpdateTabScoresBetweenRounds: {ex.Message}");
+            }
+        }
+
+        public static void ResetRoundUiCaches()
+        {
+            foreach (var kv in _tabScoreTexts)
+            {
+                try
+                {
+                    if (kv.Value != null && kv.Value.gameObject != null)
+                        UnityEngine.Object.Destroy(kv.Value.gameObject);
+                }
+                catch { }
+            }
+            _tabScoreSetupItems.Clear();
+            _tabScoreTexts.Clear();
+        }
+
+        private static string GetClientDisplayName(ClientInstance ci)
+        {
+            if (ci == null) return "";
+            try
+            {
+                var tagField = GetField(typeof(ClientInstance), "PlayerNameTag");
+                if (tagField != null)
+                {
+                    string tag = tagField.GetValue(ci) as string;
+                    if (!string.IsNullOrWhiteSpace(tag)) return tag;
+                }
+            }
+            catch { }
+
+            if (!string.IsNullOrWhiteSpace(ci.PlayerName)) return ci.PlayerName;
+            return $"Player {ci.PlayerId}";
+        }
+
+        private static string ResolveScoreboardName(int playerId, ClientInstance ci)
+        {
+            try
+            {
+                string clientName = GetClientDisplayName(ci);
+                if (!string.IsNullOrWhiteSpace(clientName)
+                    && !clientName.StartsWith("Player ", StringComparison.OrdinalIgnoreCase))
+                    return clientName;
+            }
+            catch { }
+
+            try
+            {
+                if (BotManager.Instance != null)
+                {
+                    foreach (var bot in BotManager.Instance.LobbyBots)
+                    {
+                        if (bot == null) continue;
+                        if (bot.PlayerId == playerId && !string.IsNullOrWhiteSpace(bot.Name))
+                            return bot.Name;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                var bots = BotManager.ActiveBots;
+                if (bots != null)
+                {
+                    for (int i = 0; i < bots.Count; i++)
+                    {
+                        var b = bots[i];
+                        if (b == null) continue;
+                        if (b.PlayerId == playerId && !string.IsNullOrWhiteSpace(b.BotName))
+                            return b.BotName;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                string clientName = GetClientDisplayName(ci);
+                if (!string.IsNullOrWhiteSpace(clientName))
+                    return clientName;
+            }
+            catch { }
+
+            return $"Player {playerId}";
+        }
+
+        public static bool MatchPointsHUD_UpdateVisuals_Prefix(MatchPoitnsHUD __instance, int winnerTeamId, Dictionary<int, int> roundScores)
+        {
+            try
+            {
+                if (__instance == null || ScoreManager.Instance == null) return false;
+
+                var secondaryPointObjects = GetField(typeof(MatchPoitnsHUD), "secondaryPointObjects")?.GetValue(__instance) as MeshRenderer[];
+                var pointsTextsObj = GetField(typeof(MatchPoitnsHUD), "pointsTexts")?.GetValue(__instance) as Array;
+                var primaryPointMesh = GetField(typeof(MatchPoitnsHUD), "primaryPointMesh")?.GetValue(__instance) as MeshRenderer;
+                var activeMaterials = GetField(typeof(MatchPoitnsHUD), "activeMaterials")?.GetValue(__instance) as Material[];
+                var inactiveMaterial = GetField(typeof(MatchPoitnsHUD), "inactiveMaterial")?.GetValue(__instance) as Material;
+
+                if (secondaryPointObjects == null || pointsTextsObj == null || primaryPointMesh == null
+                    || activeMaterials == null || inactiveMaterial == null)
+                    return false;
+
+                int activeTeamCount = 0;
+                foreach (var kv in ScoreManager.Instance.TeamIdToPlayerIds)
+                {
+                    bool hasConnected = false;
+                    foreach (int pid in kv.Value)
+                    {
+                        if (ClientInstance.playerInstances.ContainsKey(pid))
+                        {
+                            hasConnected = true;
+                            break;
+                        }
+                    }
+                    if (hasConnected) activeTeamCount++;
+                }
+
+                int neededSecondary = Math.Max(0, activeTeamCount - 2);
+                int activateSecondary = Math.Min(neededSecondary, secondaryPointObjects.Length);
+                for (int i = 0; i < secondaryPointObjects.Length; i++)
+                {
+                    if (secondaryPointObjects[i] != null)
+                        secondaryPointObjects[i].gameObject.SetActive(i < activateSecondary);
+                }
+
+                for (int i = 0; i < pointsTextsObj.Length; i++)
+                    SetPointsText(pointsTextsObj, i, "");
+
+                Material[] primaryMats = primaryPointMesh.materials;
+                int slot = 0;
+                foreach (var kv in ScoreManager.Instance.TeamIdToPlayerIds)
+                {
+                    int teamId = kv.Key;
+                    bool hasConnected = false;
+                    foreach (int pid in kv.Value)
+                    {
+                        if (ClientInstance.playerInstances.ContainsKey(pid))
+                        {
+                            hasConnected = true;
+                            break;
+                        }
+                    }
+                    if (!hasConnected) continue;
+
+                    if (slot >= 2 + secondaryPointObjects.Length) break;
+                    int roundScore = 0;
+                    if (roundScores != null && roundScores.TryGetValue(teamId, out int rs))
+                        roundScore = rs;
+                    UpdateMatchPointSlotSafe(slot, teamId == winnerTeamId, roundScore, primaryMats,
+                        secondaryPointObjects, pointsTextsObj, activeMaterials, inactiveMaterial);
+                    slot++;
+                }
+                primaryPointMesh.materials = primaryMats;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"MatchPoitnsHUD prefix swallowed: {ex.Message}");
+            }
+            return false;
+        }
+
+        private static void SetPointsText(Array pointsTextsObj, int index, string value)
+        {
+            if (pointsTextsObj == null || index < 0 || index >= pointsTextsObj.Length) return;
+            object textObj = pointsTextsObj.GetValue(index);
+            if (textObj == null) return;
+            try
+            {
+                var prop = textObj.GetType().GetProperty("text",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (prop != null && prop.CanWrite) { prop.SetValue(textObj, value, null); return; }
+
+                var field = textObj.GetType().GetField("text",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (field != null) field.SetValue(textObj, value);
+            }
+            catch { }
+        }
+
+        private static void UpdateMatchPointSlotSafe(int slot, bool isWinner, int roundScore,
+            Material[] primaryMats, MeshRenderer[] secondaryPointObjects, Array pointsTextsObj,
+            Material[] activeMaterials, Material inactiveMaterial)
+        {
+            Material mat = (roundScore > 0 && slot < activeMaterials.Length)
+                ? activeMaterials[slot]
+                : inactiveMaterial;
+
+            if (slot < 2)
+            {
+                int idx = slot == 0 ? 1 : 3;
+                if (primaryMats != null && idx < primaryMats.Length) primaryMats[idx] = mat;
+            }
+            else
+            {
+                int secIdx = slot - 2;
+                if (secIdx < secondaryPointObjects.Length && secondaryPointObjects[secIdx] != null)
+                {
+                    var mats = secondaryPointObjects[secIdx].materials;
+                    if (mats != null && mats.Length > 1)
+                    {
+                        mats[1] = mat;
+                        secondaryPointObjects[secIdx].materials = mats;
+                    }
+                }
+            }
+
+            if ((roundScore == 2 && !isWinner) || roundScore > 2)
+                SetPointsText(pointsTextsObj, slot, roundScore.ToString());
+
+            if (isWinner && primaryMats != null && primaryMats.Length > 2)
+                primaryMats[2] = mat;
         }
 
         public static Exception WaitForDraw_Finalizer(Exception __exception) => null;

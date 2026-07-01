@@ -61,68 +61,85 @@ namespace StraftatBots
 
         private static IEnumerator SpawnBotsDelayed()
         {
-            // Wait for player to actually spawn — some maps load slower
-            float waited = 0f;
-            while (waited < 5f)
+            try
             {
-                yield return new WaitForSeconds(0.25f);
-                waited += 0.25f;
-                // Check if any player has spawned (PlayerManager has active players)
-                if (ClientInstance.Instance?.PlayerSpawner?.player != null)
-                    break;
-            }
-            // Extra small buffer after player spawns
-            yield return new WaitForSeconds(0.3f);
-
-            // Reset per-map caches
-            BotController.ResetLadderCache();
-
-            // Load NavGraph for this map, apply mode from config
-            NavGraph.Init();
-            string modeStr = Plugin.NavGraphMode?.Value ?? "Training";
-            bool isPlayMode = modeStr.Equals("Play", System.StringComparison.OrdinalIgnoreCase);
-            NavGraph.Instance.Mode = isPlayMode ? NavMode.Play : NavMode.Training;
-
-            // Training mode: bots walk through each other (and players) so they don't block pathing
-            bool noClip = !isPlayMode;
-            Physics.IgnoreLayerCollision(11, 11, noClip); // Bot body vs bot body
-            Physics.IgnoreLayerCollision(3, 3, noClip);   // Bot CC vs bot CC (root layer)
-            Physics.IgnoreLayerCollision(3, 6, noClip);   // Bot CC vs player CC
-            string mapName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
-            NavGraph.Instance.LoadForMap(mapName);
-
-            // Register spawn points and weapon spawners as fixed nodes
-            NavGraph.Instance.RegisterMapLocations();
-
-            // Re-add custom patrol locations (cleared by RegisterMapLocations)
-            foreach (var (cpos, cid) in Plugin.CustomPatrolLocations)
-            {
-                var node = NavGraph.Instance.FindNearestNode(cpos, 3f);
-                if (node == null)
-                    node = NavGraph.Instance.AddPosition(cpos, isPlayer: true, force: true);
-                if (node != null)
+                // Wait for player to actually spawn — some maps load slower
+                float waited = 0f;
+                while (waited < 5f)
                 {
-                    node.Confidence = 1f;
-                    NavGraph.Instance.MapLocations.Add((cpos, "PatrolPoint", node.Id));
+                    yield return new WaitForSeconds(0.25f);
+                    waited += 0.25f;
+                    // Check if any player has spawned (PlayerManager has active players)
+                    if (ClientInstance.Instance?.PlayerSpawner?.player != null)
+                        break;
                 }
-            }
+                // Extra small buffer after player spawns
+                yield return new WaitForSeconds(0.3f);
 
-            if (NavGraph.Instance.NodeCount > 20)
+                // Reset per-map caches
+                BotController.ResetLadderCache();
+
+                // Load NavGraph for this map, apply mode from config
+                NavGraph.Init();
+                string modeStr = Plugin.NavGraphMode?.Value ?? "Training";
+                bool isPlayMode = modeStr.Equals("Play", System.StringComparison.OrdinalIgnoreCase);
+                NavGraph.Instance.Mode = isPlayMode ? NavMode.Play : NavMode.Training;
+
+                // Training mode: bots walk through each other (and players) so they don't block pathing
+                bool noClip = !isPlayMode;
+                Physics.IgnoreLayerCollision(11, 11, noClip); // Bot body vs bot body
+                Physics.IgnoreLayerCollision(3, 3, noClip);   // Bot CC vs bot CC (root layer)
+                Physics.IgnoreLayerCollision(3, 6, noClip);   // Bot CC vs player CC
+                string mapName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+                NavGraph.Instance.LoadForMap(mapName);
+
+                // Register spawn points and weapon spawners as fixed nodes
+                NavGraph.Instance.RegisterMapLocations();
+
+                // Re-add custom patrol locations (cleared by RegisterMapLocations)
+                foreach (var (cpos, cid) in Plugin.CustomPatrolLocations)
+                {
+                    var node = NavGraph.Instance.FindNearestNode(cpos, 3f);
+                    if (node == null)
+                        node = NavGraph.Instance.AddPosition(cpos, isPlayer: true, force: true);
+                    if (node != null)
+                    {
+                        node.Confidence = 1f;
+                        NavGraph.Instance.MapLocations.Add((cpos, "PatrolPoint", node.Id));
+                    }
+                }
+
+                if (NavGraph.Instance.NodeCount > 20)
+                {
+                    // Existing graph — validate before certification so Play cannot
+                    // pass on stale data that cleanup would immediately reject.
+                    NavGraph.Instance.ValidateAllNodes();
+                    NavGraph.Instance.DetectJumpEdges();
+                }
+
+                if (isPlayMode)
+                {
+                    // Play is a WARNING, not a hard block. Undertrained maps are allowed into
+                    // Play; bots keep learning as they go (LearnInPlay). Switch to Training for
+                    // faster, curated learning. We no longer force the map back to Training.
+                    string warning = NavGraph.Instance.GetPlayModeWarning();
+                    if (!string.IsNullOrWhiteSpace(warning))
+                        Plugin.Log.LogWarning($"[Certification] {warning} (Play allowed — bots keep learning the map as they go.)");
+                }
+
+                PlayerRecorder.Enable();
+
+                Plugin.Log.LogInfo("[BOT] Spawning bots now");
+                BotManager.Instance?.SpawnAllBots();
+
+                // Cache routes between key locations for fast pathing
+                if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    NavGraph.Instance.CacheKeyRoutes();
+            }
+            finally
             {
-                // Existing graph — validate and clean up
-                NavGraph.Instance.ValidateAllNodes();
-                NavGraph.Instance.DetectJumpEdges();
+                _spawnPending = false;
             }
-
-            PlayerRecorder.Enable();
-
-            Plugin.Log.LogInfo("[BOT] Spawning bots now");
-            BotManager.Instance?.SpawnAllBots();
-            _spawnPending = false;
-
-            // Cache routes between key locations for fast pathing
-            if (NavGraph.Instance != null && NavGraph.Instance.HasData)
-                NavGraph.Instance.CacheKeyRoutes();
         }
 
         // New round — despawn old bots and spawn fresh ones
@@ -138,35 +155,80 @@ namespace StraftatBots
 
         private static IEnumerator RespawnBotsNewRound()
         {
-            // Save NavGraph between rounds and sync to all clients
-            NavGraph.Instance?.Save();
-            BotDamageSync.SyncNavGraph();
-
-            // Safety: reset waitForDrawCoroutine in case it got stuck from a previous round
             try
             {
-                var field = GetField(typeof(GameManager), "waitForDrawCoroutine");
-                if (field != null && GameManager.Instance != null)
-                    field.SetValue(GameManager.Instance, null);
+                // Save NavGraph between rounds and sync to all clients
+                NavGraph.Instance?.Save();
+                BotDamageSync.SyncNavGraph();
+
+                // Safety: reset waitForDrawCoroutine in case it got stuck from a previous round
+                try
+                {
+                    var field = GetField(typeof(GameManager), "waitForDrawCoroutine");
+                    if (field != null && GameManager.Instance != null)
+                        field.SetValue(GameManager.Instance, null);
+                }
+                catch { }
+
+                // Reset the only-bots-alive draw timer
+                if (BotManager.Instance != null)
+                    BotManager.Instance.ResetDrawTimer();
+
+                // Despawn IMMEDIATELY — don't let old bots shoot into the new take
+                if (BotManager.Instance != null)
+                    BotManager.Instance.DespawnAllBots();
+
+                // Wait for players to spawn, then spawn fresh bots
+                yield return new WaitForSeconds(1.5f);
+                if (BotManager.Instance != null)
+                    BotManager.Instance.SpawnAllBots();
+
+                if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    NavGraph.Instance.CacheKeyRoutes();
             }
-            catch { }
+            finally
+            {
+                _spawnPending = false;
+            }
+        }
 
-            // Reset the only-bots-alive draw timer
-            if (BotManager.Instance != null)
-                BotManager.Instance.ResetDrawTimer();
+        public static void ProgressToNextTake_Postfix(GameManager __instance)
+        {
+            if (InstanceFinder.NetworkManager == null || !InstanceFinder.NetworkManager.IsServer) return;
+            if (BotManager.Instance == null) return;
+            if (_spawnPending) return;
+            __instance.StartCoroutine(RespawnFallbackAfterTakeProgress());
+        }
 
-            // Despawn IMMEDIATELY — don't let old bots shoot into the new take
-            if (BotManager.Instance != null)
+        private static IEnumerator RespawnFallbackAfterTakeProgress()
+        {
+            yield return new WaitForSeconds(2f);
+            if (InstanceFinder.NetworkManager == null || !InstanceFinder.NetworkManager.IsServer) yield break;
+            if (BotManager.Instance == null || _spawnPending) yield break;
+
+            bool hasLiveBot = false;
+            foreach (var bot in BotManager.Instance.GetActiveBots())
+            {
+                if (bot != null && !bot.IsDead)
+                {
+                    hasLiveBot = true;
+                    break;
+                }
+            }
+            if (hasLiveBot) yield break;
+
+            _spawnPending = true;
+            try
+            {
+                Plugin.Log.LogWarning("[BOT] RoundSpawn not observed after ProgressToNextTake; applying respawn fallback");
                 BotManager.Instance.DespawnAllBots();
-
-            // Wait for players to spawn, then spawn fresh bots
-            yield return new WaitForSeconds(1.5f);
-            if (BotManager.Instance != null)
+                yield return new WaitForSeconds(0.75f);
                 BotManager.Instance.SpawnAllBots();
-            _spawnPending = false;
-
-            if (NavGraph.Instance != null && NavGraph.Instance.HasData)
-                NavGraph.Instance.CacheKeyRoutes();
+            }
+            finally
+            {
+                _spawnPending = false;
+            }
         }
 
         // Clean up on leave
@@ -175,6 +237,7 @@ namespace StraftatBots
             Plugin.Log.LogInfo("[BOT] LeaveMatch fired");
             NavGraph.Instance?.Save();
             PlayerRecorder.Disable();
+            ResetRoundUiCaches();
             BotManager.Instance?.DespawnAllBots();
         }
 

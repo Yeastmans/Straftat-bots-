@@ -14,6 +14,7 @@ namespace StraftatBots
         public const uint MOD_ID = 83927462;
         private static BotDamageSync _instance;
         private static System.Reflection.FieldInfo _dlProjectileField;
+        private static readonly Dictionary<int, int> _botVisualSerials = new Dictionary<int, int>();
 
 
         void Awake()
@@ -41,18 +42,40 @@ namespace StraftatBots
         /// Call from BotController after a human is killed.
         /// Sends ragdoll + kill feed to non-host clients.
         /// </summary>
-        public static void SyncKill(int victimPlayerId, string killerName, string weaponName, bool headshot,
-            Vector3 direction, float ragdollForce, Vector3 hitPoint, string boneName)
+        public static void SyncKill(int victimNetId, string killerName, string weaponName, bool headshot,
+            Vector3 direction, float ragdollForce, Vector3 hitPoint, string boneName, int visualSerial = 0)
         {
             if (_instance == null) return;
             try
             {
                 MyceliumNetwork.RPC(MOD_ID, nameof(RPC_PlayerKilled), ReliableType.Reliable,
-                    victimPlayerId, killerName, weaponName, headshot,
+                    victimNetId, killerName, weaponName, headshot,
                     direction.x, direction.y, direction.z,
-                    ragdollForce, hitPoint.x, hitPoint.y, hitPoint.z, boneName);
+                    ragdollForce, hitPoint.x, hitPoint.y, hitPoint.z, boneName, visualSerial);
             }
             catch { }
+        }
+
+        public static void SyncKill(PlayerHealth victim, string killerName, string weaponName, bool headshot,
+            Vector3 direction, float ragdollForce, Vector3 hitPoint, string boneName, int visualSerial = 0)
+        {
+            if (victim == null) return;
+            int netId = -1;
+            try
+            {
+                var nob = victim.GetComponent<FishNet.Object.NetworkObject>()
+                    ?? victim.GetComponentInParent<FishNet.Object.NetworkObject>();
+                if (nob != null) netId = (int)nob.ObjectId;
+            }
+            catch { }
+
+            if (netId < 0)
+            {
+                try { netId = victim.playerValues.playerClient.PlayerId; } catch { }
+            }
+
+            if (netId >= 0)
+                SyncKill(netId, killerName, weaponName, headshot, direction, ragdollForce, hitPoint, boneName, visualSerial);
         }
 
         /// <summary>
@@ -118,13 +141,13 @@ namespace StraftatBots
         /// <summary>
         /// Sync bot skin to non-host clients.
         /// </summary>
-        public static void SyncSkin(int botNetId, int suitIndex, int hatIndex = -1, int cigIndex = 0)
+        public static void SyncSkin(int botNetId, int suitIndex, int hatIndex = -1, int cigIndex = 0, int visualSerial = 0)
         {
             if (_instance == null) return;
             try
             {
                 MyceliumNetwork.RPC(MOD_ID, nameof(RPC_SyncSkin), ReliableType.Reliable,
-                    botNetId, suitIndex, hatIndex, cigIndex);
+                    botNetId, suitIndex, hatIndex, cigIndex, visualSerial);
             }
             catch { }
         }
@@ -220,27 +243,38 @@ namespace StraftatBots
 
         [CustomRPC]
         public void RPC_PlayerKilled(int victimNetId, string killerName, string weaponName, bool headshot,
-            float dx, float dy, float dz, float force, float hx, float hy, float hz, string boneName)
+            float dx, float dy, float dz, float force, float hx, float hy, float hz, string boneName, int visualSerial)
         {
             // Skip on server — host already handled it
             if (FishNet.InstanceFinder.IsServer) return;
 
             // Find victim by NetworkObject ID (works on non-host where PlayerId lookup fails)
-            var ph = FindPlayerHealthByNetId(victimNetId);
-            if (ph == null || ph.isKilled) return;
+            var ph = FindPlayerHealthByNetOrPlayerId(victimNetId);
+            if (ph == null) return;
+
+            if (visualSerial > 0
+                && _botVisualSerials.TryGetValue(victimNetId, out int currentSerial)
+                && currentSerial > visualSerial)
+                return;
+
+            bool alreadyKilled = ph.isKilled;
 
             // Set death state on this client
             ph.isShot = true;
             ph.health = -8f;
+            try { ph.ChangeKilledState(true); } catch { }
             ph.isKilled = true;
 
             // Ragdoll
-            try
+            if (!alreadyKilled)
             {
-                ph.Explode(false, true, boneName,
-                    new Vector3(dx, dy, dz), force, new Vector3(hx, hy, hz));
+                try
+                {
+                    ph.Explode(false, true, boneName,
+                        new Vector3(dx, dy, dz), force, new Vector3(hx, hy, hz));
+                }
+                catch { }
             }
-            catch { }
 
             // Hide bot model — BotController doesn't exist on non-host so Die()/HideGraphicsDelayed never runs
             try
@@ -266,6 +300,7 @@ namespace StraftatBots
                     col.enabled = false;
                 var cc = ph.GetComponent<CharacterController>();
                 if (cc != null) cc.enabled = false;
+                try { ph.DisablePlayerObjectWhenKilled(); } catch { }
             }
             catch { }
 
@@ -356,12 +391,15 @@ namespace StraftatBots
         }
 
         [CustomRPC]
-        public void RPC_SyncSkin(int botNetId, int suitIndex, int hatIndex, int cigIndex)
+        public void RPC_SyncSkin(int botNetId, int suitIndex, int hatIndex, int cigIndex, int visualSerial)
         {
             if (FishNet.InstanceFinder.IsServer) return;
 
             try
             {
+                if (visualSerial > 0)
+                    _botVisualSerials[botNetId] = visualSerial;
+
                 foreach (var nob in Object.FindObjectsOfType<FishNet.Object.NetworkObject>())
                 {
                     if ((int)nob.ObjectId != botNetId) continue;
@@ -374,8 +412,31 @@ namespace StraftatBots
                         CigIndex = cigIndex
                     };
                     BotManager.ApplyAllCosmetics(nob.gameObject, tempData);
+                    RestoreLiveVisuals(nob.gameObject);
                     break;
                 }
+            }
+            catch { }
+        }
+
+        private static void RestoreLiveVisuals(GameObject obj)
+        {
+            if (obj == null) return;
+            var ph = obj.GetComponent<PlayerHealth>();
+            if (ph != null && ph.isKilled) return;
+
+            try
+            {
+                if (ph != null && ph.graphics != null)
+                    ph.graphics.SetActive(true);
+                foreach (var anim in obj.GetComponentsInChildren<Animator>(true))
+                    anim.enabled = true;
+                foreach (var netAnim in obj.GetComponentsInChildren<FishNet.Component.Animating.NetworkAnimator>(true))
+                    netAnim.enabled = true;
+                foreach (var r in obj.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                    r.enabled = true;
+                foreach (var r in obj.GetComponentsInChildren<MeshRenderer>(true))
+                    r.enabled = true;
             }
             catch { }
         }
@@ -457,16 +518,26 @@ namespace StraftatBots
             catch { }
         }
 
-        private PlayerHealth FindPlayerHealthByNetId(int netId)
+        private PlayerHealth FindPlayerHealthByNetOrPlayerId(int id)
         {
-            if (netId < 0) return null;
+            if (id < 0) return null;
             foreach (var nob in Object.FindObjectsOfType<FishNet.Object.NetworkObject>())
             {
-                if ((int)nob.ObjectId == netId)
+                if ((int)nob.ObjectId == id)
                 {
                     var ph = nob.GetComponent<PlayerHealth>();
                     if (ph != null) return ph;
                 }
+            }
+
+            foreach (var ph in Object.FindObjectsOfType<PlayerHealth>())
+            {
+                try
+                {
+                    if (ph?.playerValues?.playerClient != null && ph.playerValues.playerClient.PlayerId == id)
+                        return ph;
+                }
+                catch { }
             }
             return null;
         }

@@ -43,6 +43,20 @@ namespace StraftatBots
         FrontierWalk    // Walk to frontier nodes at boundary of explored territory
     }
 
+    public enum PathSource
+    {
+        GraphRoute,
+        DirectTacticalRoute,
+        ExploreBuildRoute
+    }
+
+    public enum ProgressState
+    {
+        Progressing,
+        Stalled,
+        HardStuck
+    }
+
     public partial class BotController : MonoBehaviour
     {
         // Const layer masks — avoid recomputation every frame
@@ -53,6 +67,9 @@ namespace StraftatBots
         // Pre-allocated physics buffers — shared across all bots (Unity is single-threaded)
         private static readonly Collider[] _overlapBuffer = new Collider[32];
         private static readonly Collider[] _zoneOverlapBuffer = new Collider[128];
+        private static float _globalRepathWindowStart;
+        private static int _globalRepathCountInWindow;
+        private static int _nextVisualSerial = 1;
 
         // Bot instance tracking — avoid GetComponent<BotController> in hot paths
         private static readonly HashSet<int> _botInstanceIds = new HashSet<int>();
@@ -60,8 +77,15 @@ namespace StraftatBots
         public int BotId;
         public string BotName;
         public int PlayerId;
+        public int VisualSerial { get; private set; }
 
         public bool IsDead = false;
+
+        public void RefreshVisualSerial()
+        {
+            VisualSerial = _nextVisualSerial++;
+            if (_nextVisualSerial < 0) _nextVisualSerial = 1;
+        }
 
         public BotState State = BotState.FindWeapon;
 
@@ -99,6 +123,7 @@ namespace StraftatBots
         private float _nodelessLockTimer;
         private int _nodelessBounceCount;    // Escalate lock duration on repeated bounces
         private float _lastBounceTime;       // Track recency so the escalation decays over time
+        private int _noPathRecoveryStreak;   // Consecutive failed stuck-repaths before nodeless lock
 
         // Projectile weapon cache
         private bool _isProjectileWeapon;
@@ -137,6 +162,8 @@ namespace StraftatBots
         // Weapon validity cache — avoids per-item GetComponent in FindNearestWeapon
         private static Dictionary<int, bool> _weaponValidCache = new Dictionary<int, bool>();
         private static float _weaponValidCacheTime;
+        private static Dictionary<int, bool> _weaponReachCache = new Dictionary<int, bool>();
+        private static float _weaponReachCacheTime;
 
         // Static caches — shared across all bots, refreshed periodically
         private static SpawnPoint[] _cachedSpawns;
@@ -162,6 +189,7 @@ namespace StraftatBots
             _fieldCache.Clear();
             _botInstanceIds.Clear();
             _weaponValidCache.Clear();
+            _weaponReachCache.Clear();
         }
 
         private static SpawnPoint[] GetCachedSpawns()
@@ -281,12 +309,19 @@ namespace StraftatBots
         private HashSet<long> _exploredCells = new HashSet<long>();
         private float _exploredCellTimer;
         private int _exploredStaleCount; // How many times we've revisited explored areas
+        private List<int> _validationRouteNodeIds = new List<int>();
+        private float _validationRouteTimer;
+        private Vector3 _validationRouteTarget;
+        private string _validationRouteLabel;
 
         // NavGraph pathfinding
         private List<NavNode> _graphPath = new List<NavNode>();
         private int _graphPathIndex;
         private float _repathTimer;
         private Vector3 _lastPathTarget;
+        private float _routeCommitUntil;
+        private Vector3 _routeCommitTarget;
+        private float _lastAcceptedPathScore = float.MinValue;
         private NavNode _lastReachedNode;       // Last graph node we successfully reached
         private NavNode _prevReachedNode;       // Node before _lastReachedNode — used for shortcut (A-B-C → A-C)
         private Vector3 _lastGroundedPos;       // For recording to graph + death tracking
@@ -374,12 +409,15 @@ namespace StraftatBots
         // when the bot drifts; once we've locked a good face-dir we keep it for the climb.
         private Vector3 _ladderPinnedFaceDir;
         private bool _ladderFaceDirPinned;
+        private Vector3 _ladderExitDir;
         // LADDER: re-path watchdog. Every ~2 sec while on a ladder, re-check whether the
         // current path is still valid; if not, dismount gracefully.
         private float _ladderRepathTimer;
 
         // Weapon pursuit
         private float _weaponPursuitTimer;
+        private float _weaponLastDist = float.MaxValue;
+        private float _weaponNoProgressTimer;
         private System.Collections.Generic.Dictionary<ItemBehaviour, float> _blacklistedWeapons = new System.Collections.Generic.Dictionary<ItemBehaviour, float>();
 
         // Sliding (exact FPC slide)
@@ -408,6 +446,11 @@ namespace StraftatBots
         private float _smoothedApproach;
         private float _huntSubState; // -1 = backing up, 0 = strafing, 1 = advancing; smoothed to avoid boundary flicker
         private float _huntSubStateHold; // debounce timer for sub-state switch
+        private float _huntNoLosTimer;
+        private bool _huntHasLastSeenTarget;
+        private Vector3 _huntLastSeenTargetPos;
+        private float _huntNoLosSideSwitchTimer;
+        private int _huntNoLosSide = 1;
 
 
         // Crouch
@@ -423,8 +466,6 @@ namespace StraftatBots
         private float _stunTimer;
 
         // Explosive avoidance
-        private float _explosiveCheckTimer;
-        private float _explosiveFleeTimer;
 
         // Placed claymores — bots avoid these positions (with timestamp for expiry)
         private static System.Collections.Generic.List<(Vector3 pos, float time)> _placedClaymorePositions = new System.Collections.Generic.List<(Vector3, float)>();
@@ -628,7 +669,7 @@ namespace StraftatBots
                 _wallHitTimer += Time.deltaTime;
                 if (_wallHitTimer > 1f && _graphPath.Count == 0)
                 {
-                    _stuckTimer += 1f; // Force stuck detection in nodeless mode
+                    _stuckTimer += 0.35f; // Nudge recovery without instantly escalating hard-stuck
                     _wallHitTimer = 0f;
                 }
 
@@ -771,6 +812,7 @@ namespace StraftatBots
                 _graphPathIndex = 0;
                 _repathTimer = 0f;
                 _stuckTimer = 0f;
+                PlayerRecorder.ClearPlayer(BotId);
                 _nodelessLockTimer = 0f;
                 _nextTeleportAttemptTime = Time.time + 0.4f;
 
@@ -916,104 +958,8 @@ namespace StraftatBots
                 return;
             }
 
-            // Prune placement tracking — only needed for the 10s own-mine grace window.
-            // Anything older than 12s is irrelevant (OverlapSphere handles avoidance after that).
-            for (int i = _placedClaymorePositions.Count - 1; i >= 0; i--)
-            {
-                if (Time.time - _placedClaymorePositions[i].time > 12f)
-                    _placedClaymorePositions.RemoveAt(i);
-            }
-
-            // Avoid nearby explosives (grenades, rockets, obus in flight, mines/claymores).
-            // Blast radius is ~3m — 4m gives a tight safety margin without creating
-            // huge no-go zones that cause bots to run into walls forever.
-            _explosiveCheckTimer -= Time.deltaTime;
-            if (_explosiveCheckTimer <= 0f)
-            {
-                _explosiveCheckTimer = 0.3f;
-                float fleeRadius = 4f;
-                Vector3 nearestExplosive = Vector3.zero;
-                float nearestDist = float.MaxValue;
-
-                // Use OverlapSphere instead of FindObjectsOfType (much cheaper).
-                // Already catches own-placed mines too — no need for the separate
-                // _placedClaymorePositions loop that used to live below.
-                int nearCount = Physics.OverlapSphereNonAlloc(transform.position, fleeRadius, _overlapBuffer, EXPLOSIVE_MASK, QueryTriggerInteraction.Collide);
-                for (int ci = 0; ci < nearCount; ci++)
-                {
-                    var col = _overlapBuffer[ci];
-                    // Check explosive types directly — includes grenades, rockets, mines
-                    MonoBehaviour mb = col.GetComponent<PhysicsGrenade>() as MonoBehaviour
-                        ?? col.GetComponent<HandGrenade>() as MonoBehaviour
-                        ?? col.GetComponent<HandGrenadeTwo>() as MonoBehaviour
-                        ?? col.GetComponent<Obus>() as MonoBehaviour
-                        ?? col.GetComponent<Bubble>() as MonoBehaviour
-                        ?? col.GetComponent<ProximityMine>() as MonoBehaviour
-                        ?? col.GetComponent<Claymore>() as MonoBehaviour;
-                    if (mb == null) continue;
-
-                    bool isMine = mb is ProximityMine || mb is Claymore;
-                    if (!isMine)
-                    {
-                        // Grenades/rockets: skip if we threw it
-                        var rootField = GetCachedField(mb.GetType(), "_rootObject");
-                        if (rootField != null)
-                        {
-                            var root = rootField.GetValue(mb) as GameObject;
-                            if (root == gameObject) continue;
-                        }
-                    }
-                    else
-                    {
-                        // Own mines: 10s grace window after placing. Without this the placer
-                        // steps on its own mine after respawn and freezes trying to flee from
-                        // a mine sitting at the only clear direction.
-                        Vector3 mpos = mb.transform.position;
-                        bool isOwnRecent = false;
-                        for (int pi = 0; pi < _placedClaymorePositions.Count; pi++)
-                        {
-                            var (ppos, ptime) = _placedClaymorePositions[pi];
-                            if (Time.time - ptime < 10f && (ppos - mpos).sqrMagnitude < 1f)
-                            {
-                                isOwnRecent = true;
-                                break;
-                            }
-                        }
-                        if (isOwnRecent) continue;
-                    }
-
-                    float d = Vector3.Distance(transform.position, mb.transform.position);
-                    if (d < nearestDist)
-                    {
-                        nearestDist = d;
-                        nearestExplosive = mb.transform.position;
-                    }
-                }
-
-                if (nearestDist < fleeRadius)
-                {
-                    Vector3 away = (transform.position - nearestExplosive);
-                    away.y = 0; if (away.sqrMagnitude > 0.01f) away.Normalize(); else away = transform.forward;
-
-                    // Skip flee if the escape path is walled within 1.5m. Otherwise the bot
-                    // sprints into a wall forever while the 0.3s retimer re-issues the flee,
-                    // pinning it in place until it dies anyway. Accept the damage and keep
-                    // doing normal AI — at least the bot stays useful.
-                    Vector3 rayOrigin = transform.position + Vector3.up * 0.8f;
-                    bool pathBlocked = Physics.Raycast(rayOrigin, away, 1.5f, WALL_MASK, QueryTriggerInteraction.Ignore);
-                    if (!pathBlocked)
-                    {
-                        MoveToward(transform.position + away * 10f, _sprintSpeed);
-                        _explosiveFleeTimer = 0.5f;
-                    }
-                }
-            }
-
-            if (_explosiveFleeTimer > 0f)
-            {
-                _explosiveFleeTimer -= Time.deltaTime;
-                return; // Skip normal AI while fleeing
-            }
+            // Explosive/mine flee logic intentionally disabled.
+            // Bots now keep normal pathing/combat behavior around mines and grenades.
 
             _logTimer += Time.deltaTime;
             if (_logTimer > 5f)
@@ -1023,7 +969,11 @@ namespace StraftatBots
                 bool graphReady = NavGraph.Instance != null && NavGraph.Instance.HasData;
                 float vel = _cc != null ? Mathf.Sqrt(_cc.velocity.x * _cc.velocity.x + _cc.velocity.z * _cc.velocity.z) : 0f;
                 string nlTag = _nodelessLockTimer > 0f ? $" NL={_nodelessLockTimer:F1}" : "";
-                Plugin.Log.LogInfo($"[{BotName}] State={State} hp={hp} weapon={(_heldWeapon != null ? _heldWeapon.name : "none")} vel={vel:F1} graph={graphReady}({NavGraph.Instance?.Nodes.Count ?? 0}n) grounded={(_cc != null && _cc.isGrounded)} stuck={_stuckTimer:F1}{nlTag} pos={transform.position} path={_graphPath.Count}");
+                Plugin.Log.LogInfo($"[{BotName}] State={State} hp={hp} weapon={(_heldWeapon != null ? _heldWeapon.name : "none")} vel={vel:F1} graph={graphReady}({NavGraph.Instance?.Nodes.Count ?? 0}n) grounded={(_cc != null && _cc.isGrounded)} stuck={_stuckTimer:F1}{nlTag} prog={_progressState} src={_pathSource} pos={transform.position} path={_graphPath.Count}");
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                {
+                    Plugin.Log.LogInfo($"[{BotName}] reliability stuck_events={_stuckEvents} stageA={_recoveryStageA} stageB={_recoveryStageB} stageC={_recoveryStageC} stageD={_recoveryStageD} loop_breaks={_loopBreaks} src_switches={_pathSourceSwitches} hat_failures={_hatAttachFailures}");
+                }
             }
 
             // Mode selection
@@ -1046,7 +996,8 @@ namespace StraftatBots
 
             if (trainingMode)
             {
-                Wander();
+                if (Plugin.IsValidateMode) HandleTrainingValidation();
+                else Wander();
             }
             else
             {
@@ -1229,6 +1180,26 @@ namespace StraftatBots
                 vertical = pitch / 90f; // Positive = looking up, negative = looking down
             }
 
+            // Auto-crouch under low ceilings: if the bot can't fit standing but could crouched,
+            // crouch-walk instead of jamming its head into the roof and getting stuck (especially
+            // after sliding under something). Uses the SAME clearance ray as the un-crouch check
+            // below (up to full stand height) so it can't flip-flop: crouch when blocked, stand
+            // again only when there's clearance to full height.
+            if (grounded && !_isSliding && !_isCrouching && _cc != null)
+            {
+                bool standBlockedNow = Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.up, 1.5f,
+                    WALL_MASK, QueryTriggerInteraction.Ignore);
+                if (standBlockedNow)
+                {
+                    _isCrouching = true;
+                    _crouchTimer = Mathf.Max(_crouchTimer, 0.4f);
+                    _cc.height = 1f;
+                    _cc.center = new Vector3(0, 0.5f, 0);
+                    if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", true);
+                    if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", true);
+                }
+            }
+
             // Safety: force end slide/crouch if stuck
             if (_isSliding)
             {
@@ -1243,11 +1214,20 @@ namespace StraftatBots
                 // Force uncrouch: not sliding, crouch timer expired or CC height wrong
                 if (_crouchTimer <= 0f || (_cc != null && _cc.height < 1.5f && _stuckTimer > 1f))
                 {
-                    _isCrouching = false;
-                    _crouchTimer = 0f;
-                    if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
-                    if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
-                    if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
+                    bool standBlocked = Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.up, 1.5f,
+                        WALL_MASK, QueryTriggerInteraction.Ignore);
+                    if (!standBlocked)
+                    {
+                        _isCrouching = false;
+                        _crouchTimer = 0f;
+                        if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
+                        if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
+                        if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
+                    }
+                    else
+                    {
+                        _crouchTimer = 0.2f;
+                    }
                 }
             }
 
@@ -1372,6 +1352,7 @@ namespace StraftatBots
 
             // Report death to PlayerRecorder for fall-death tracking
             PlayerRecorder.ReportDeath(BotId, transform.position);
+            PlayerRecorder.ClearPlayer(BotId);
 
             // Report environmental death to NavGraph (null killer = environment, self-kill = environment)
             if (NavGraph.Instance != null)
@@ -1475,7 +1456,12 @@ namespace StraftatBots
                 Plugin.Log.LogInfo($"[{BotName}] Calling PlayerDied({PlayerId}), alivePlayers before: [{string.Join(",", GameManager.Instance.alivePlayers)}]");
                 try { GameManager.Instance.PlayerDied(PlayerId); }
                 catch { GameManager.Instance.alivePlayers.Remove(PlayerId); }
+                // Bot IDs (11+) are not always removed by vanilla PlayerDied paths.
+                // Ensure the bot is gone from alivePlayers so round winner resolution can proceed.
+                while (GameManager.Instance.alivePlayers.Contains(PlayerId))
+                    GameManager.Instance.alivePlayers.Remove(PlayerId);
                 Plugin.Log.LogInfo($"[{BotName}] alivePlayers after: [{string.Join(",", GameManager.Instance.alivePlayers)}]");
+
             }
 
             // Sync death to non-host clients via Mycelium — they need to hide the bot model + spawn ragdoll
@@ -1497,16 +1483,19 @@ namespace StraftatBots
                 var nob = GetComponent<FishNet.Object.NetworkObject>();
                 if (nob != null) netId = (int)nob.ObjectId;
                 BotDamageSync.SyncKill(netId, killerName, weaponName, false,
-                    ejectDir, 30f, transform.position, "Torso");
+                    ejectDir, 30f, transform.position, "Torso", VisualSerial);
             }
             catch { }
         }
 
         // Called by BotManager on round reset only
-        public void Respawn(Vector3 position)
+        public void Respawn(Vector3 position, bool reapplyCosmetics = true)
         {
+            RefreshVisualSerial();
+
             // Check if spawn position is inside a wall — nudge out if so
             Vector3 safePos = FindSafeSpawnPosition(position);
+            PlayerRecorder.ClearPlayer(BotId);
             transform.position = safePos;
             IsDead = false;
             _frozen = true;
@@ -1534,6 +1523,11 @@ namespace StraftatBots
             _smoothedApproach = 0.3f;
             _huntSubState = 0f;
             _huntSubStateHold = 0f;
+            _huntNoLosTimer = 0f;
+            _huntHasLastSeenTarget = false;
+            _huntLastSeenTargetPos = Vector3.zero;
+            _huntNoLosSideSwitchTimer = 0f;
+            _huntNoLosSide = Random.value > 0.5f ? 1 : -1;
 
             // Reset movement/pathfinding state from previous life
             _stuckTimer = 0f;
@@ -1546,6 +1540,13 @@ namespace StraftatBots
             _prevReachedNode = null;
             _lastPathTarget = Vector3.zero;
             _repathTimer = 0f;
+            _routeCommitUntil = 0f;
+            _routeCommitTarget = Vector3.zero;
+            _lastAcceptedPathScore = float.MinValue;
+            _validationRouteNodeIds.Clear();
+            _validationRouteTimer = 0f;
+            _validationRouteTarget = Vector3.zero;
+            _validationRouteLabel = null;
             _lastGroundedPos = safePos;
             _lastMoveDir = Vector3.zero;
             _lastAnimPos = safePos;
@@ -1563,6 +1564,7 @@ namespace StraftatBots
             _recentNodeCount = 0;
             _nodelessLockTimer = 0f;
             _nodelessBounceCount = 0;
+            _noPathRecoveryStreak = 0;
             _recentNodeIdx = 0;
             _wallJumpCount = 0;
             _canWallJump = false;
@@ -1578,8 +1580,6 @@ namespace StraftatBots
             _hasWanderTarget = false;
             _wanderTarget = Vector3.zero;
             _wanderChangeTimer = 0f;
-            _explosiveFleeTimer = 0f;
-            _explosiveCheckTimer = 0f;
             _zoneForce = Vector3.zero;
             _zoneForceDuration = 0f;
             _zoneLaunchInAir = false;
@@ -1592,6 +1592,15 @@ namespace StraftatBots
             _wasOnLadder = false;
             _ladderDismountTimer = 0f;
             _ladderStuckTimer = 0f;
+            _ladderClimbTimer = 0f;
+            _lastLadderTouchTime = -999f;
+            _ladderFaceDirPinned = false;
+            _ladderPinnedFaceDir = Vector3.zero;
+            _ladderFaceDir = Vector3.zero;
+            _ladderExitDir = Vector3.zero;
+            _ladderRepathTimer = 2f;
+            _ladderLastYSample = safePos.y;
+            _ladderYSampleTime = Time.time;
             _nearLadder = false;
             _searchTimer = 0f;
             _targetItem = null;
@@ -1639,6 +1648,9 @@ namespace StraftatBots
 
             if (GameManager.Instance != null)
                 GameManager.Instance.alivePlayers.Add(PlayerId);
+
+            if (reapplyCosmetics)
+                BotManager.Instance?.ReapplyCosmeticsForBot(this);
 
             Plugin.Log.LogInfo($"[{BotName}] Respawned at {position}");
         }
@@ -1738,6 +1750,8 @@ namespace StraftatBots
             // Refresh weapon validity cache every 2s
             bool refreshCache = Time.time - _weaponValidCacheTime > 2f;
             if (refreshCache) _weaponValidCacheTime = Time.time;
+            bool refreshReach = Time.time - _weaponReachCacheTime > 2.5f;
+            if (refreshReach) _weaponReachCacheTime = Time.time;
 
             // If the bot already holds a propeller, skip other propellers — we need a
             // REAL combat weapon to replace the propeller, not another one of the same.
@@ -1747,6 +1761,11 @@ namespace StraftatBots
             {
                 if (item == null || item.isTaken) continue;
                 if (item.rootObject != null || item.gameObject.layer != 7) continue;
+                if (_blacklistedWeapons.TryGetValue(item, out float blacklistTime))
+                {
+                    if (Time.time - blacklistTime < 20f) continue;
+                    _blacklistedWeapons.Remove(item);
+                }
 
                 // Skip propellers when we already have one
                 if (haveAnyPropeller && item.GetComponent<Propeller>() != null) continue;
@@ -1779,6 +1798,34 @@ namespace StraftatBots
                     if (!valid) continue;
                 }
 
+                // Reachability gate: avoid tunneling toward weapons with no realistic path.
+                // Keep this cheap by caching + only probing occasionally.
+                if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+                {
+                    bool reachable;
+                    if (!refreshReach && _weaponReachCache.TryGetValue(iid, out bool cachedReach))
+                    {
+                        reachable = cachedReach;
+                    }
+                    else
+                    {
+                        // Close items are always worth trying; far items need at least one route.
+                        reachable = sqrDist < 64f;
+                        if (!reachable)
+                        {
+                            var quick = NavGraph.Instance.GetCachedRoute(myPos, item.transform.position);
+                            if (quick != null && quick.Count > 0) reachable = true;
+                            else
+                            {
+                                var path = NavGraph.Instance.FindPath(myPos, item.transform.position, jitter: 0.05f, searchRadius: 45f, playerOnly: true, preferHeight: true);
+                                reachable = path != null && path.Count > 0;
+                            }
+                        }
+                        _weaponReachCache[iid] = reachable;
+                    }
+                    if (!reachable) continue;
+                }
+
                 closestSqr = sqrDist;
                 closest = item;
             }
@@ -1790,7 +1837,7 @@ namespace StraftatBots
         {
             bool humansAlive = !AllHumansDead();
             Transform closest = null;
-            float closestDist = float.MaxValue;
+            float closestScore = float.MaxValue;
 
             // Search ALL active PlayerHealth in scene — includes host AND non-host spawned characters
             PlayerHealth[] allPlayers = GetCachedPlayers();
@@ -1818,22 +1865,44 @@ namespace StraftatBots
                 if (ph.isKilled || ph.health <= 0f) continue;
 
                 bool isOtherBot = IsBot(ph);
-
-                // Targeting priority: always prioritize humans — only target other bots when all humans dead.
-                // Removed BotsTargetAll toggle; this is the sensible default.
-                if (humansAlive && isOtherBot) continue;
-                if (!humansAlive && !isOtherBot) continue;
                 BotController otherBot = isOtherBot ? ph.GetComponent<BotController>() : null;
                 if (otherBot != null && otherBot.IsDead) continue;
 
                 float dist = HorizontalDist(transform.position, ph.transform.position);
-                if (dist < _detectionRange && dist < closestDist)
+                if (dist >= _detectionRange) continue;
+
+                bool hasWeapon = _heldWeapon != null && _heldWeaponObj != null;
+                bool visible = HasTargetVisibility(ph.transform);
+                if (!humansAlive && !isOtherBot) continue;
+                if (humansAlive && isOtherBot && (!hasWeapon || (!visible && dist > _detectionRange * 0.65f)))
+                    continue;
+
+                float score = dist;
+                if (humansAlive && isOtherBot)
+                    score += visible ? 4f : 14f; // Prefer humans, but take obvious bot fights.
+                if (visible)
+                    score -= 18f;
+                if (hasWeapon && visible && dist < 18f)
+                    score -= 8f;
+
+                if (score < closestScore)
                 {
-                    closestDist = dist;
+                    closestScore = score;
                     closest = ph.transform;
                 }
             }
             return closest;
+        }
+
+        private bool HasTargetVisibility(Transform target)
+        {
+            if (target == null) return false;
+            Vector3 origin = transform.position + Vector3.up * 1.25f;
+            Vector3 dest = target.position + Vector3.up * 1.0f;
+            Vector3 toTarget = dest - origin;
+            float dist = toTarget.magnitude;
+            if (dist < 0.1f) return true;
+            return !Physics.Raycast(origin, toTarget / dist, dist, WALL_MASK, QueryTriggerInteraction.Ignore);
         }
 
         private bool AllHumansDead()
@@ -1923,8 +1992,12 @@ namespace StraftatBots
 
         private void SetVisible(bool visible)
         {
-            // Only toggle SkinnedMeshRenderers (character model), not MeshRenderers (collision shapes)
+            // Toggle both skinned and mesh renderers.
+            // Hats/cigs are regular MeshRenderers; if we only re-enable skinned meshes
+            // after death, cosmetics stay invisible even when reattached successfully.
             foreach (var r in GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                r.enabled = visible;
+            foreach (var r in GetComponentsInChildren<MeshRenderer>(true))
                 r.enabled = visible;
             if (_playerHealth != null && _playerHealth.graphics != null)
                 _playerHealth.graphics.SetActive(visible);
@@ -1938,14 +2011,272 @@ namespace StraftatBots
         // Simple stuck system: detect -> nudge once -> repath -> give up
         private bool _didStuckNudge;             // True after one jump/slide nudge this stuck episode
         private bool _didStuckRepath;            // True after one full repath this stuck episode
+        private bool _didStuckPivot;             // True after one objective pivot this stuck episode
+        private bool _didStuckBreakout;          // True after one deterministic breakout this episode
+
+        // Progress controller
+        private PathSource _pathSource = PathSource.DirectTacticalRoute;
+        private ProgressState _progressState = ProgressState.Progressing;
+        private float _progressTimer;
+        private float _lastObjectiveDist = float.MaxValue;
+        private float _lastObjectiveUpdateTime;
+        private float _nextRepathAllowedAt;
+        private float _nextPathSourceLogAt;
+        private float _lastHuntMoveTime;
+        private float _lastCombatRepositionTime;
+
+        // Diagnostics counters
+        private int _stuckEvents;
+        private int _recoveryStageA;
+        private int _recoveryStageB;
+        private int _recoveryStageC;
+        private int _recoveryStageD;
+        private int _loopBreaks;
+        private int _pathSourceSwitches;
+        private int _hatAttachFailures;
+
+        // Anti-loop memory: node + edge + heading bucket
+        private struct LoopSignature
+        {
+            public int NodeId;
+            public EdgeType EdgeType;
+            public int HeadingBucket;
+        }
+        private readonly LoopSignature[] _loopHistory = new LoopSignature[10];
+        private int _loopHistoryIdx;
+        private int _loopHistoryCount;
+        private float _loopBlacklistUntil;
 
         /// <summary>
-        /// Simple stuck detection: moved < 0.5m in 0.5s while trying to move -> accumulate _stuckTimer.
-        /// Stage 1 (0.8s): one jump/slide nudge to clear small geometry snags.
-        /// Stage 2 (2.0s): full A* repath to current target; fallback to distant spawn if no path.
-        /// Stage 3 (4.0s): give up, swap target entirely.
-        /// Progress (moved >= 0.5m) decays the timer and clears both flags once below 0.1s.
+        /// Stage thresholds scale by configured recovery aggression.
         /// </summary>
+        private (float a, float b, float c, float d) GetRecoveryThresholds()
+        {
+            // Bias toward repeated repath attempts before hard stuck breakout.
+            if (Plugin.IsFastRecovery) return (0.5f, 0.95f, 2.3f, 4.5f);
+            if (Plugin.IsMediumRecovery) return (0.7f, 1.3f, 3.0f, 5.2f);
+            return (0.9f, 1.8f, 3.8f, 6.2f);
+        }
+
+        private Vector3 GetCurrentObjective()
+        {
+            if (_playerTarget != null) return _playerTarget.position;
+            if (_weaponTarget != null) return _weaponTarget.position;
+            if (_hasWanderTarget) return _wanderTarget;
+            return transform.position;
+        }
+
+        private bool IsDegeneratePath(Vector3 objective)
+        {
+            if (_graphPath == null || _graphPath.Count == 0 || _graphPathIndex >= _graphPath.Count) return true;
+            if (_graphPath.Count > 1) return false;
+            float objectiveDist = HorizontalDist(transform.position, objective);
+            float nodeDist = HorizontalDist(transform.position, _graphPath[0].Position);
+            return nodeDist < 2f && objectiveDist > 4f;
+        }
+
+        private void UpdateProgressController(float movedSqr)
+        {
+            Vector3 objective = GetCurrentObjective();
+            float objectiveDist = HorizontalDist(transform.position, objective);
+            bool objectiveValid = objectiveDist > 0.5f;
+            bool madeMoveProgress = movedSqr >= 0.16f;
+            bool madeObjectiveProgress = objectiveValid && _lastObjectiveDist < float.MaxValue && objectiveDist < _lastObjectiveDist - 0.25f;
+
+            if (!objectiveValid)
+            {
+                _progressState = ProgressState.Progressing;
+                _progressTimer = 0f;
+                _lastObjectiveDist = objectiveDist;
+                _lastObjectiveUpdateTime = Time.time;
+                return;
+            }
+
+            if (madeMoveProgress || madeObjectiveProgress)
+            {
+                _progressTimer = Mathf.Max(0f, _progressTimer - _stuckCheckInterval);
+                _progressState = ProgressState.Progressing;
+                _lastObjectiveDist = objectiveDist;
+                _lastObjectiveUpdateTime = Time.time;
+                _stuckTimer = Mathf.Max(0f, _stuckTimer - _stuckCheckInterval);
+                return;
+            }
+
+            _progressTimer += _stuckCheckInterval;
+            _lastObjectiveDist = objectiveDist;
+            if (_progressTimer >= 2.4f) _progressState = ProgressState.HardStuck;
+            else if (_progressTimer >= 0.8f) _progressState = ProgressState.Stalled;
+        }
+
+        private void SwitchPathSource(PathSource src)
+        {
+            if (_pathSource == src) return;
+            _pathSource = src;
+            _pathSourceSwitches++;
+            if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value && Time.time >= _nextPathSourceLogAt)
+            {
+                _nextPathSourceLogAt = Time.time + 1.5f;
+                Plugin.Log.LogInfo($"[{BotName}] PathSource -> {src}");
+            }
+        }
+
+        private void DoRecoveryPivot()
+        {
+            _didStuckPivot = true;
+            _recoveryStageC++;
+            _graphPath.Clear();
+            _graphPathIndex = 0;
+            _repathTimer = 0f;
+            _weaponTarget = null;
+            _targetItem = null;
+            // Prefer player-sourced anchors when available. This helps bots converge on
+            // complex jump/ladder corridors humans have already proven.
+            if (NavGraph.Instance != null)
+            {
+                Vector3 objective = GetCurrentObjective();
+                var playerNode = NavGraph.Instance.FindNearestPlayerNode(objective, 40f)
+                    ?? NavGraph.Instance.FindNearestPlayerNode(transform.position, 40f);
+                if (playerNode != null)
+                {
+                    var path = NavGraph.Instance.FindPath(transform.position, playerNode.Position, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true);
+                    if (path != null && path.Count > 0)
+                    {
+                        _graphPath = path;
+                        _graphPathIndex = 0;
+                        _hasWanderTarget = false;
+                        SwitchPathSource(PathSource.GraphRoute);
+                        return;
+                    }
+                }
+            }
+            if (_playerTarget != null)
+            {
+                Vector3 away = (transform.position - _playerTarget.position);
+                away.y = 0f;
+                if (away.sqrMagnitude < 0.01f) away = transform.right;
+                away.Normalize();
+                _wanderTarget = transform.position + away * 8f;
+            }
+            else
+            {
+                _wanderTarget = PickDistantSpawn();
+            }
+            _hasWanderTarget = true;
+            SwitchPathSource(PathSource.ExploreBuildRoute);
+        }
+
+        private bool TryBuildRecoveryPath(Vector3 target, Vector3 moveDir, out List<NavNode> bestPath)
+        {
+            bestPath = null;
+            if (NavGraph.Instance == null) return false;
+
+            List<NavNode> chosenPath = null;
+            float bestScore = float.MinValue;
+            bool wantsHeight = Mathf.Abs(target.y - transform.position.y) > 2.25f;
+            Vector3 avoidPos = transform.position;
+            if (moveDir.sqrMagnitude > 0.01f)
+            {
+                Vector3 flat = moveDir;
+                flat.y = 0f;
+                if (flat.sqrMagnitude > 0.01f)
+                    avoidPos += flat.normalized * 1.5f;
+            }
+
+            void Consider(List<NavNode> candidate, float bonus = 0f)
+            {
+                if (candidate == null || candidate.Count <= 1) return;
+                if (!IsRouteSafeForPlay(candidate)) return;
+                float score = ScorePathCandidate(candidate, target) + bonus;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    chosenPath = candidate;
+                }
+            }
+
+            Consider(NavGraph.Instance.FindPathAvoiding(transform.position, target, avoidPos, 3.5f, 70f), 3f);
+            Consider(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 70f, preferHeight: wantsHeight), 1f);
+            Consider(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 80f, playerOnly: true, preferHeight: true), 2f);
+
+            var reachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
+            if (reachable != null)
+                Consider(NavGraph.Instance.FindPath(transform.position, reachable.Position, jitter: 0.03f, searchRadius: 70f, preferHeight: wantsHeight), 0.5f);
+
+            var progress = NavGraph.Instance.FindProgressNode(transform.position, target, 70f);
+            if (progress != null)
+                Consider(NavGraph.Instance.FindPath(transform.position, progress.Position, jitter: 0.03f, searchRadius: 70f, preferHeight: wantsHeight), 0.25f);
+
+            bestPath = chosenPath;
+            return bestPath != null;
+        }
+
+        private static int HeadingBucket(Vector3 dir)
+        {
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.001f) return 0;
+            float angle = Mathf.Atan2(dir.x, dir.z) * Mathf.Rad2Deg;
+            if (angle < 0f) angle += 360f;
+            return Mathf.FloorToInt(angle / 45f) % 8;
+        }
+
+        private void PushLoopSignature(int nodeId, EdgeType edgeType, Vector3 headingDir)
+        {
+            _loopHistory[_loopHistoryIdx] = new LoopSignature
+            {
+                NodeId = nodeId,
+                EdgeType = edgeType,
+                HeadingBucket = HeadingBucket(headingDir)
+            };
+            _loopHistoryIdx = (_loopHistoryIdx + 1) % _loopHistory.Length;
+            if (_loopHistoryCount < _loopHistory.Length) _loopHistoryCount++;
+        }
+
+        private bool HasLoopCycle()
+        {
+            if (_loopHistoryCount < 6) return false;
+            int i0 = (_loopHistoryIdx - 1 + _loopHistory.Length) % _loopHistory.Length;
+            int i1 = (_loopHistoryIdx - 2 + _loopHistory.Length) % _loopHistory.Length;
+            int i2 = (_loopHistoryIdx - 3 + _loopHistory.Length) % _loopHistory.Length;
+            int i3 = (_loopHistoryIdx - 4 + _loopHistory.Length) % _loopHistory.Length;
+            int i4 = (_loopHistoryIdx - 5 + _loopHistory.Length) % _loopHistory.Length;
+            int i5 = (_loopHistoryIdx - 6 + _loopHistory.Length) % _loopHistory.Length;
+            var a = _loopHistory[i0];
+            var b = _loopHistory[i1];
+            var c = _loopHistory[i2];
+            var d = _loopHistory[i3];
+            var e = _loopHistory[i4];
+            var f = _loopHistory[i5];
+            return a.NodeId == c.NodeId && c.NodeId == e.NodeId
+                && b.NodeId == d.NodeId && d.NodeId == f.NodeId
+                && a.NodeId != b.NodeId
+                && a.HeadingBucket == c.HeadingBucket
+                && b.HeadingBucket == d.HeadingBucket;
+        }
+
+        private void DoDeterministicBreakout(Vector3 moveDir)
+        {
+            _didStuckBreakout = true;
+            _recoveryStageD++;
+            _stuckEvents++;
+            _loopBlacklistUntil = Time.time + 5f;
+
+            Vector3 side = Vector3.Cross(Vector3.up, moveDir).normalized;
+            if (side.sqrMagnitude < 0.01f) side = transform.right;
+            if ((BotId & 1) == 0) side = -side;
+            _commitDir = side;
+            _commitTimer = 1.0f;
+            if (_cc != null && _cc.isGrounded)
+            {
+                var obs = CheckObstructions(side, 1.2f);
+                if (obs.CrouchClear && obs.WaistBlocked && !_isSliding) InitSlide(side, duration: 1.0f);
+                else TryJump(JumpReason.ExploreStuck, side);
+            }
+            _nodelessLockTimer = Mathf.Max(_nodelessLockTimer, 4.5f);
+            _stuckTimer = 0f;
+            _progressTimer = 0f;
+            SwitchPathSource(PathSource.DirectTacticalRoute);
+        }
+
         private void CheckStuck()
         {
             if (State == BotState.Dead) return;
@@ -1962,96 +2293,99 @@ namespace StraftatBots
             bool tryingToMove = State == BotState.GoToWeapon || State == BotState.Hunt ||
                                 State == BotState.FindWeapon || _hasWanderTarget;
 
+            UpdateProgressController(movedSqr);
+            var (stageA, stageB, stageC, stageD) = GetRecoveryThresholds();
+
             if (movedSqr < 0.25f && tryingToMove) // 0.25 = 0.5^2
             {
                 _stuckTimer += _stuckCheckInterval;
                 Vector3 moveDir = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
 
-                // ---- Stage 1 (0.8s): one jump/slide nudge ----
-                if (_stuckTimer >= 0.8f && !_didStuckNudge && _cc != null && _cc.isGrounded)
+                // ---- Stage A: local steering correction ----
+                if (_stuckTimer >= stageA && !_didStuckNudge && _cc != null && _cc.isGrounded)
                 {
                     _didStuckNudge = true;
+                    _recoveryStageA++;
                     var obs = CheckObstructions(moveDir);
                     if (obs.CrouchClear && (obs.FeetBlocked || obs.HeadBlocked) && !_isSliding)
                         InitSlide(moveDir, duration: 1.0f);
                     else
                         TryJump(JumpReason.StuckRecovery, moveDir);
+                    _commitDir = TryAngledDirections(moveDir, WALL_MASK);
+                    _commitTimer = Mathf.Max(_commitTimer, 0.8f);
                 }
 
-                // ---- Stage 2 (2.0s): full repath ----
-                if (_stuckTimer >= 2f && !_didStuckRepath)
+                // ---- Stage B: tactical repath ----
+                if (_stuckTimer >= stageB && !_didStuckRepath && Time.time >= _nextRepathAllowedAt
+                    && TryConsumeGlobalRepathBudget())
                 {
                     _didStuckRepath = true;
+                    _recoveryStageB++;
+                    _nextRepathAllowedAt = Time.time + 0.7f;
                     if (NavGraph.Instance != null)
                     {
-                        Vector3 target = _wanderTarget;
-                        if (_playerTarget != null) target = _playerTarget.position;
-                        else if (_weaponTarget != null) target = _weaponTarget.position;
+                        Vector3 target = GetCurrentObjective();
+                        if (IsDegeneratePath(target))
+                        {
+                            _graphPath.Clear();
+                            _graphPathIndex = 0;
+                        }
 
-                        var path = NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f);
-                        if (path.Count > 0)
+                        NavGraph.Instance.BlacklistNearby(transform.position + moveDir * 0.8f, 2.4f);
+                        if (TryBuildRecoveryPath(target, moveDir, out var path))
                         {
                             _graphPath = path;
                             _graphPathIndex = 0;
                             _lastReachedNode = null;
                             _prevReachedNode = null;
                             _repathTimer = 0f;
+                            _noPathRecoveryStreak = 0;
+                            SwitchPathSource(PathSource.GraphRoute);
                             Plugin.Log.LogInfo($"[{BotName}] Stuck -> repath ({path.Count} nodes)");
                         }
                         else
                         {
-                            // No path available -> engage nodeless mode and pursue the target directly.
-                            // Previously we headed to a distant spawn via the same (broken) graph,
-                            // which kept the bot bouncing. Now we actually go straight at the target.
+                            SwitchPathSource(PathSource.DirectTacticalRoute);
                             NavGraph.Instance.ReportStuck(transform.position, moveDir);
                             _graphPath.Clear();
                             _graphPathIndex = 0;
                             _repathTimer = 0f;
-                            _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
-                            _lastBounceTime = Time.time;
-                            _nodelessLockTimer = Mathf.Min(14f, 4f + 2f * _nodelessBounceCount);
-                            // If we have an enemy/weapon target, chase it directly. Otherwise pick a
-                            // distant spawn as the nodeless destination.
-                            if (_playerTarget == null && _weaponTarget == null)
+                            _noPathRecoveryStreak++;
+
+                            // First failure: immediately retry repath with a new heading instead
+                            // of entering a long nodeless lock. This keeps bots graph-first.
+                            if (_noPathRecoveryStreak < 2 && _progressState != ProgressState.HardStuck)
                             {
-                                _wanderTarget = PickDistantSpawn();
-                                _hasWanderTarget = true;
+                                _commitDir = TryAngledDirections(moveDir, WALL_MASK);
+                                _commitTimer = Mathf.Max(_commitTimer, 0.75f);
+                                _nextRepathAllowedAt = Time.time + 0.35f;
+                                Plugin.Log.LogInfo($"[{BotName}] Stuck -> no path, retrying repath");
                             }
-                            Plugin.Log.LogInfo($"[{BotName}] Stuck -> no path, nodeless lock {_nodelessLockTimer:F1}s");
+                            else
+                            {
+                                _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
+                                _lastBounceTime = Time.time;
+                                _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
+                                if (_playerTarget == null && _weaponTarget == null)
+                                {
+                                    _wanderTarget = PickDistantSpawn();
+                                    _hasWanderTarget = true;
+                                }
+                                Plugin.Log.LogInfo($"[{BotName}] Stuck -> no path, short nodeless lock {_nodelessLockTimer:F1}s");
+                            }
                         }
                     }
                 }
 
-                // ---- Stage 3 (4.0s): give up, swap target ----
-                if (_stuckTimer >= 4f)
+                // ---- Stage C: objective pivot ----
+                if (_stuckTimer >= stageC && !_didStuckPivot)
                 {
-                    _stuckTimer = 0f;
-                    _didStuckNudge = false;
-                    _didStuckRepath = false;
-
-                    if (NavGraph.Instance != null)
-                        NavGraph.Instance.ReportStuck(transform.position, moveDir);
-
-                    _weaponTarget = null;
-                    _targetItem = null;
-                    _playerTarget = null;
-                    _wanderTarget = PickDistantSpawn();
-                    _hasWanderTarget = true;
-                    _graphPath.Clear();
-                    _graphPathIndex = 0;
-                    _repathTimer = 0f;
-                    _avoidDir = -_avoidDir;
-                    State = _heldWeapon != null ? BotState.Hunt : BotState.FindWeapon;
-
-                    // Force nodeless for the new target — a full-on 4s stuck means the local
-                    // graph is unusable for this bot right now. Give it a clean nodeless window
-                    // to actually escape the tangle before we trust the graph again.
-                    _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
-                    _lastBounceTime = Time.time;
-                    _nodelessLockTimer = Mathf.Max(_nodelessLockTimer, 6f);
-
-                    Plugin.Log.LogInfo($"[{BotName}] Stuck -> giving up, nodeless lock {_nodelessLockTimer:F1}s");
+                    DoRecoveryPivot();
                 }
+
+                // ---- Stage D: deterministic physical breakout ----
+                if (_stuckTimer >= stageD && !_didStuckBreakout)
+                    DoDeterministicBreakout(moveDir);
             }
             else
             {
@@ -2061,8 +2395,25 @@ namespace StraftatBots
                 {
                     _didStuckNudge = false;
                     _didStuckRepath = false;
+                    _didStuckPivot = false;
+                    _didStuckBreakout = false;
+                    _noPathRecoveryStreak = 0;
                 }
             }
+        }
+
+        private bool TryConsumeGlobalRepathBudget()
+        {
+            const float WINDOW = 1.0f;
+            const int MAX_REPATHS = 6; // tuned for 8 bots
+            if (Time.time - _globalRepathWindowStart > WINDOW)
+            {
+                _globalRepathWindowStart = Time.time;
+                _globalRepathCountInWindow = 0;
+            }
+            if (_globalRepathCountInWindow >= MAX_REPATHS) return false;
+            _globalRepathCountInWindow++;
+            return true;
         }
 
         // Old edge/hazard detection methods removed — replaced by NavGraph confidence system
@@ -2305,7 +2656,20 @@ namespace StraftatBots
 
             if (!_cc.isGrounded) _zoneLaunchInAir = true;
 
-            Vector3 zoneMove = _zoneForce;
+            // Air-steer toward the current path target while the pad/zone carries us, so a
+            // vertical jump-pad actually moves the bot toward where it's going instead of
+            // launching straight up and dropping back onto the pad. Pad force still dominates;
+            // this only adds the bot's normal air-control on top.
+            Vector3 steer = Vector3.zero;
+            if (!_cc.isGrounded && _graphPath != null && _graphPath.Count > 0 && _graphPathIndex < _graphPath.Count)
+            {
+                Vector3 toTarget = _graphPath[_graphPathIndex].Position - transform.position;
+                toTarget.y = 0f;
+                if (toTarget.sqrMagnitude > 0.25f)
+                    steer = toTarget.normalized * _airSpeed;
+            }
+
+            Vector3 zoneMove = _zoneForce + steer;
             zoneMove.y = _verticalVelocity;
             _zoneForce *= Mathf.Max(0f, 1f - 2f * Time.deltaTime);
             _zoneForceDuration -= Time.deltaTime;
@@ -2350,6 +2714,13 @@ namespace StraftatBots
                     _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, launchWindow);
                     _coyoteTimer = 0f;
                     _zoneLaunchInAir = true;
+                    // The pad/launch zone is now the sole authority on this arc — cancel any
+                    // in-progress trajectory replay or charged self-jump so they don't fight it.
+                    _trajActive = false;
+                    _currentJumpEdge = null;
+                    _trajIndex = 0;
+                    _jumpChargeTimer = 0f;
+                    _pendingJumpForce = 0f;
                 }
                 else
                 {
@@ -2484,5 +2855,12 @@ namespace StraftatBots
         public JumpReason DbgActiveJumpReason => _activeJumpReason;
         public Vector3 DbgMoveDir => _lastMoveDir;
         public NavNode DbgLastReachedNode => _lastReachedNode;
+        public void ReportHatAttachFailure() { _hatAttachFailures++; }
+        public void ApplyStun(float stunTime)
+        {
+            if (IsDead) return;
+            if (_fpc != null) _fpc.canMove = false;
+            _stunTimer = Mathf.Max(_stunTimer, Mathf.Max(0.25f, stunTime));
+        }
     }
 }

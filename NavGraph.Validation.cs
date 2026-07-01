@@ -191,6 +191,7 @@ namespace StraftatBots
         public void TryShortcut(int grandparentId, int parentId, int currentId)
         {
             if (IsLocked) return;
+            if (Mode == NavMode.Play) return;
             if (grandparentId == parentId || parentId == currentId || grandparentId == currentId) return;
 
             var gp = GetNodeById(grandparentId);

@@ -85,69 +85,15 @@ namespace StraftatBots
         /// </summary>
         public static List<int> PlayerTrail => _playerTrail;
 
-        // --- Watch Me recording ---
-        // A player-driven demo. Every node added while active is boosted to Confidence=1.0
-        // and appended to an ordered sequence; on stop, it's saved as a ProvenRoute.
-        private static bool _watchMeActive;
-        private static List<int> _watchMeIds = new List<int>();
-        private static string _watchMeName;
-        private static float _watchMeStartTime;
-
-        public static bool WatchMeActive => _watchMeActive;
-        public static int WatchMeSampleCount => _watchMeIds.Count;
-        public static string WatchMeName => _watchMeName;
-
-        /// <summary>Begin a Watch Me recording. Player walks the route; bots will prefer it afterward.</summary>
-        public static void StartWatchMe(string name = null)
+        // --- Player paths are always trusted ---
+        // The old "Watch Me" feature (explicitly record a named route, start/stop button) was
+        // removed. Bots now trust the human's paths ALL the time, with no recording ceremony:
+        // every node the player walks through is locked to full confidence as PlayerSourced.
+        private static void TrustPlayerNode(NavNode node)
         {
-            _watchMeActive = true;
-            _watchMeIds.Clear();
-            _watchMeName = string.IsNullOrEmpty(name)
-                ? $"Route_{System.DateTime.Now:yyyyMMdd_HHmmss}"
-                : name;
-            _watchMeStartTime = Time.time;
-            Plugin.Log.LogInfo($"[Recorder] Watch Me START ({_watchMeName})");
-        }
-
-        /// <summary>Stop the active Watch Me recording and commit it as a ProvenRoute.
-        /// Returns true if a route was saved.</summary>
-        public static bool StopWatchMe()
-        {
-            if (!_watchMeActive) return false;
-            _watchMeActive = false;
-            float duration = Mathf.Max(0f, Time.time - _watchMeStartTime);
-            int count = _watchMeIds.Count;
-            if (NavGraph.Instance != null && count >= 2)
-            {
-                NavGraph.Instance.AddProvenRoute(_watchMeName, _watchMeIds, duration);
-                Plugin.Log.LogInfo($"[Recorder] Watch Me STOP — saved {count} nodes as '{_watchMeName}'");
-                _watchMeIds.Clear();
-                return true;
-            }
-            Plugin.Log.LogWarning($"[Recorder] Watch Me STOP — too short ({count} nodes), discarded");
-            _watchMeIds.Clear();
-            return false;
-        }
-
-        /// <summary>Cancel without saving.</summary>
-        public static void CancelWatchMe()
-        {
-            if (!_watchMeActive) return;
-            _watchMeActive = false;
-            Plugin.Log.LogInfo($"[Recorder] Watch Me CANCELLED ({_watchMeIds.Count} nodes discarded)");
-            _watchMeIds.Clear();
-        }
-
-        /// <summary>Called from inside RecordPlayer whenever a fresh node ID enters the player trail.
-        /// Boosts the node to max confidence and appends it to the current demo.</summary>
-        private static void WatchMeOnNode(NavNode node)
-        {
-            if (!_watchMeActive || node == null) return;
-            // Lock the node in as fully trusted player data.
+            if (node == null) return;
             node.Confidence = 1f;
             node.PlayerSourced = true;
-            if (_watchMeIds.Count == 0 || _watchMeIds[_watchMeIds.Count - 1] != node.Id)
-                _watchMeIds.Add(node.Id);
         }
 
         public static void Enable()
@@ -171,6 +117,8 @@ namespace StraftatBots
         {
             if (!_enabled || NavGraph.Instance == null || fpc == null) return;
             if (!FishNet.InstanceFinder.IsServer) return;
+            // Play also records now (LearnInPlay) so the map keeps improving during matches.
+            if (NavGraph.Instance.Mode == NavMode.Play && !NavGraph.LearnInPlay) return;
 
             // Feed coverage heatmap from player movement too — player paths compound with bot ones.
             if (fpc.isGrounded) NavGraph.Instance.TouchCoverage(fpc.transform.position);
@@ -247,8 +195,8 @@ namespace StraftatBots
                         if (_playerTrail.Count > MAX_TRAIL)
                             _playerTrail.RemoveAt(0);
 
-                        // Watch Me demo in progress — capture this node into the named route
-                        WatchMeOnNode(node);
+                        // Player paths are always trusted — lock this node to full confidence.
+                        TrustPlayerNode(node);
                     }
                 }
             }
@@ -431,6 +379,7 @@ namespace StraftatBots
             bool jumped, Vector3 lastGroundedPos, bool isSliding = false)
         {
             if (!_enabled || NavGraph.Instance == null) return;
+            if (NavGraph.Instance.Mode == NavMode.Play && !NavGraph.LearnInPlay) return;
 
             // Feed the coverage heatmap every bot sample. Cheap — one dict lookup.
             // Powers GetLowestVisitReachableCell so Explore can push into under-visited areas.
@@ -444,6 +393,13 @@ namespace StraftatBots
                 track.LastSampleTime = Time.time;
                 track.WasGrounded = true;
                 _tracks[botId] = track;
+            }
+            else if (Vector3.Distance(pos, track.LastRecordedPos) > 8f)
+            {
+                // Respawns, teleporters, and hard physics snaps are not traversals.
+                // Reset the recorder so it cannot create a giant walk edge over empty space.
+                ResetTrack(track, pos, grounded, onLadder, isSliding);
+                return;
             }
 
             // Position sampling — training mode uses aggressive intervals
@@ -693,6 +649,31 @@ namespace StraftatBots
             track.WasSliding = isSliding;
         }
 
+        private static void ResetTrack(PlayerTrack track, Vector3 pos, bool grounded, bool onLadder, bool isSliding)
+        {
+            if (track == null) return;
+            track.LastRecordedPos = pos;
+            track.LastGroundedPos = pos;
+            track.LastSampleTime = Time.time;
+            track.WasGrounded = grounded;
+            track.WasOnLadder = onLadder;
+            track.WasSliding = isSliding;
+            track.IsJumping = false;
+            track.LastNodeId = -1;
+            track.LastNodeCheckTime = Time.time;
+            track.LastSurroundScan = Time.time;
+            track.JumpTakeoffPos = pos;
+            track.JumpAirPositions = null;
+            track.JumpAirTimestamps = null;
+            track.JumpAirSampleCount = 0;
+            track.SlideEntryPos = pos;
+            track.SlideStartPos = Vector3.zero;
+            track.SlideEndTime = 0f;
+            track.LadderEntryPos = pos;
+            track.WasVaulting = false;
+            track.VaultStartPos = pos;
+        }
+
         /// <summary>
         /// Scan surroundings with raycasts to find nearby walkable terrain and add to graph.
         /// Called periodically for both players and bots.
@@ -700,9 +681,8 @@ namespace StraftatBots
         private static void ScanSurroundings(Vector3 pos, PlayerTrack track, bool isPlayer)
         {
             if (NavGraph.Instance == null) return;
-            // Scan is on whenever we're actively training the graph. Play mode = read-only.
-            bool isPlay = NavGraph.Instance.Mode == NavMode.Play;
-            if (isPlay) return;
+            // Scan runs whenever we're learning the graph — Training, or Play with LearnInPlay.
+            if (NavGraph.Instance.Mode == NavMode.Play && !NavGraph.LearnInPlay) return;
             if (Time.time - track.LastSurroundScan < SURROUND_SCAN_INTERVAL) return;
             track.LastSurroundScan = Time.time;
 
@@ -767,16 +747,15 @@ namespace StraftatBots
         /// </summary>
         public static void ReportDeath(int trackId, Vector3 deathPos)
         {
-            if (NavGraph.Instance == null) return;
             if (!_tracks.TryGetValue(trackId, out var track)) return;
 
             // If they were mid-fall (IsJumping=true, death below takeoff), this drop-off is lethal
-            if (track.IsJumping && track.JumpTakeoffPos.y - deathPos.y > 2f)
+            if (NavGraph.Instance != null && track.IsJumping && track.JumpTakeoffPos.y - deathPos.y > 2f)
             {
                 NavGraph.Instance.ReportFallDeath(track.JumpTakeoffPos, deathPos);
             }
 
-            track.IsJumping = false;
+            _tracks.Remove(trackId);
         }
 
         /// <summary>

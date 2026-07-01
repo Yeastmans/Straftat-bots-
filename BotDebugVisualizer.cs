@@ -178,8 +178,10 @@ namespace StraftatBots
                 bool isMapLocation = false;
                 bool isPatrolPoint = false;
                 bool isTeleporter = false;
+                bool isBadNode = false;
                 if (NavGraph.Instance != null)
                 {
+                    isBadNode = NavGraph.Instance.IsBadNode(node.Id);
                     var edgesFrom = NavGraph.Instance.GetEdgesFrom(node.Id);
                     foreach (var e in edgesFrom)
                     {
@@ -204,7 +206,13 @@ namespace StraftatBots
                 // Color by node type — most specific wins
                 Color col;
                 float s;
-                if (isTeleporter)
+                if (isBadNode)
+                {
+                    float pulse = 0.65f + 0.35f * Mathf.Sin(Time.time * 5f);
+                    col = new Color(1f, 0.05f, 0.02f, Mathf.Min(alpha * 2f * pulse, 1f));
+                    s = 0.55f;
+                }
+                else if (isTeleporter)
                 {
                     col = new Color(1f, 0.4f, 0.9f, Mathf.Min(alpha * 1.8f, 1f)); // PINK = teleporter
                     s = 0.5f;
@@ -264,7 +272,14 @@ namespace StraftatBots
                 Vector3 p = node.Position + Vector3.up * 0.1f;
 
                 // Special nodes: 3D shapes to stand out from walk nodes
-                if (isTeleporter)
+                if (isBadNode)
+                {
+                    GL.Vertex3(p.x - s, p.y, p.z - s); GL.Vertex3(p.x + s, p.y, p.z + s);
+                    GL.Vertex3(p.x + s, p.y, p.z - s); GL.Vertex3(p.x - s, p.y, p.z + s);
+                    GL.Vertex3(p.x, p.y, p.z); GL.Vertex3(p.x, p.y + 1.4f, p.z);
+                    GL.Vertex3(p.x - s * 0.6f, p.y + 1.1f, p.z); GL.Vertex3(p.x + s * 0.6f, p.y + 1.1f, p.z);
+                }
+                else if (isTeleporter)
                 {
                     // Pink circle at ground level + vertical ring
                     float r = 0.6f;

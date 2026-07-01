@@ -6,6 +6,37 @@ namespace StraftatBots
 {
     public partial class BotController
     {
+        private const float WEAPON_BLACKLIST_COOLDOWN = 20f;
+
+        private bool IsWeaponBlacklisted(ItemBehaviour item)
+        {
+            if (item == null) return true;
+            if (_blacklistedWeapons.TryGetValue(item, out float t))
+            {
+                if (Time.time - t < WEAPON_BLACKLIST_COOLDOWN) return true;
+                _blacklistedWeapons.Remove(item);
+            }
+            return false;
+        }
+
+        private void BlacklistCurrentWeaponTarget(string reason)
+        {
+            if (_targetItem != null)
+            {
+                _blacklistedWeapons[_targetItem] = Time.time;
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                    Plugin.Log.LogInfo($"[{BotName}] Blacklisted weapon {_targetItem.name} ({reason})");
+            }
+            _targetItem = null;
+            _weaponTarget = null;
+            _graphPath.Clear();
+            _graphPathIndex = 0;
+            _weaponPursuitTimer = 0f;
+            _weaponLastDist = float.MaxValue;
+            _weaponNoProgressTimer = 0f;
+            State = BotState.FindWeapon;
+        }
+
         // ===================== FIND WEAPON =====================
 
         private void HandleFindWeapon()
@@ -15,15 +46,28 @@ namespace StraftatBots
             // If we already have a weapon target, keep going toward it
             if (_weaponTarget != null && _targetItem != null && !_targetItem.isTaken)
             {
+                if (IsWeaponBlacklisted(_targetItem))
+                {
+                    BlacklistCurrentWeaponTarget("pre-blacklisted");
+                    return;
+                }
                 MoveToward(_weaponTarget.position, _sprintSpeed);
                 if (HorizontalDist(transform.position, _weaponTarget.position) <= _pickupRange)
                 {
                     State = BotState.PickUpWeapon;
                     return;
                 }
-                // Only re-check for better weapons every 5s
+
+                // If we are stalled on this target, stop tunneling and pick a new weapon.
+                if (_stuckTimer > 1.6f || (_progressState == ProgressState.HardStuck && _weaponPursuitTimer > 1.2f))
+                {
+                    BlacklistCurrentWeaponTarget("unreachable/stalled");
+                    return;
+                }
+
+                // Only re-check for better weapons after a real commitment window.
                 _searchTimer += Time.deltaTime;
-                if (_searchTimer < 5f) return;
+                if (_searchTimer < 8f) return;
                 _searchTimer = 0f;
                 // Check if a much closer weapon appeared
                 var closer = FindNearestWeapon();
@@ -31,7 +75,7 @@ namespace StraftatBots
                 {
                     float curDist = Vector3.Distance(transform.position, _targetItem.transform.position);
                     float newDist = Vector3.Distance(transform.position, closer.transform.position);
-                    if (newDist < curDist * 0.4f)
+                    if (newDist < curDist * 0.3f)
                     {
                         _targetItem = closer;
                         _weaponTarget = closer.transform;
@@ -64,10 +108,14 @@ namespace StraftatBots
                     ItemBehaviour[] allItems = GetCachedItems();
                     foreach (var item in allItems)
                     {
-                        if (item != null && !item.isTaken && Vector3.Distance(item.transform.position, locPos) < 3f)
+                        if (item != null && !item.isTaken && !IsWeaponBlacklisted(item)
+                            && Vector3.Distance(item.transform.position, locPos) < 3f)
                         {
                             _targetItem = item;
                             _weaponTarget = item.transform;
+                            _weaponPursuitTimer = 0f;
+                            _weaponLastDist = float.MaxValue;
+                            _weaponNoProgressTimer = 0f;
                             State = BotState.GoToWeapon;
                             return;
                         }
@@ -81,6 +129,9 @@ namespace StraftatBots
             {
                 _targetItem = closest;
                 _weaponTarget = closest.transform;
+                _weaponPursuitTimer = 0f;
+                _weaponLastDist = float.MaxValue;
+                _weaponNoProgressTimer = 0f;
                 State = BotState.GoToWeapon;
             }
         }
@@ -94,28 +145,101 @@ namespace StraftatBots
                 _weaponTarget = null;
                 _targetItem = null;
                 _weaponPursuitTimer = 0f;
+                _weaponLastDist = float.MaxValue;
+                _weaponNoProgressTimer = 0f;
                 return;
+            }
+            if (_weaponTarget == null)
+                _weaponTarget = _targetItem.transform;
+            if (IsWeaponBlacklisted(_targetItem))
+            {
+                BlacklistCurrentWeaponTarget("already-blacklisted");
+                return;
+            }
+
+            if (_exploreState == ExploreState.None && _graphPath.Count == 0 && _weaponPursuitTimer > 2f
+                && NavGraph.Instance != null && NavGraph.Instance.HasData)
+            {
+                var path = NavGraph.Instance.FindPath(transform.position, _weaponTarget.position,
+                    jitter: 0.02f, searchRadius: 70f, playerOnly: true, preferHeight: true);
+                if (path == null || path.Count <= 1)
+                    path = NavGraph.Instance.FindPath(transform.position, _weaponTarget.position,
+                        jitter: 0.02f, searchRadius: 70f, preferHeight: true);
+                if (path != null && path.Count > 1)
+                {
+                    _graphPath = path;
+                    _graphPathIndex = 0;
+                    _lastReachedNode = null;
+                    _prevReachedNode = null;
+                    _repathTimer = 1.25f;
+                    _noPathRecoveryStreak = 0;
+                    SwitchPathSource(PathSource.GraphRoute);
+                }
             }
 
             // No timeout — bot keeps trying via graph pathfinding
             // Stuck detection + blacklisting handles unreachable targets instead
             _weaponPursuitTimer += Time.deltaTime;
+            float weaponDist = HorizontalDist(transform.position, _weaponTarget.position);
+            if (_weaponLastDist >= float.MaxValue * 0.5f) _weaponLastDist = weaponDist;
+
+            // Progress-based pursuit: only abandon if we fail to close distance for long enough.
+            // Small epsilon avoids reset from float jitter.
+            if (weaponDist < _weaponLastDist - 0.12f)
+            {
+                _weaponNoProgressTimer = 0f;
+                _weaponLastDist = weaponDist;
+            }
+            else
+            {
+                _weaponNoProgressTimer += Time.deltaTime;
+            }
+
+            // Only rotate away when we are genuinely failing to make progress toward THIS weapon.
+            if (_weaponPursuitTimer > 10f && _weaponNoProgressTimer > 9f && _stuckTimer > 1.8f)
+            {
+                if (_exploreState == ExploreState.None && _weaponTarget != null)
+                {
+                    BeginSmartExplore(_weaponTarget.position);
+                    _stuckTimer = 0f;
+                    _weaponNoProgressTimer = 0f; // Give explore route a fair retry window.
+                    return;
+                }
+                // While smart-explore is active, don't immediately give up; let it work first.
+                if (_exploreState != ExploreState.None && _weaponPursuitTimer < 24f)
+                    return;
+
+                BlacklistCurrentWeaponTarget("go-to-weapon-no-progress");
+                return;
+            }
 
             // Only switch targets if stuck recovery already redirected us
-            if (_weaponPursuitTimer > 60f && _targetItem != null)
+            if (_weaponPursuitTimer > 24f && _targetItem != null)
             {
-                // After 60s, check if a closer weapon appeared
+                // Periodically check if a meaningfully better weapon target appeared.
                 var closer = FindNearestWeapon();
                 if (closer != null && closer != _targetItem)
                 {
                     float curDist = Vector3.Distance(transform.position, _targetItem.transform.position);
                     float newDist = Vector3.Distance(transform.position, closer.transform.position);
-                    if (newDist < curDist * 0.5f) // Only switch if significantly closer
+                    if (newDist < curDist * 0.35f) // Only switch if dramatically closer
                     {
                         _targetItem = closer;
                         _weaponTarget = closer.transform;
                         _weaponPursuitTimer = 0f;
+                        _weaponLastDist = float.MaxValue;
+                        _weaponNoProgressTimer = 0f;
                         _graphPath.Clear();
+                    }
+                }
+                else
+                {
+                    // Keep trying current target if we're still making distance progress.
+                    // Only abandon timeout-only when there has been no real progress.
+                    if (_weaponPursuitTimer > 42f && _weaponNoProgressTimer > 26f)
+                    {
+                        BlacklistCurrentWeaponTarget("timeout-no-progress-no-alternative");
+                        return;
                     }
                 }
                 _weaponPursuitTimer = 0f; // Reset check timer
@@ -126,6 +250,8 @@ namespace StraftatBots
             if (HorizontalDist(transform.position, _weaponTarget.position) <= _pickupRange)
             {
                 _weaponPursuitTimer = 0f;
+                _weaponLastDist = float.MaxValue;
+                _weaponNoProgressTimer = 0f;
                 State = BotState.PickUpWeapon;
             }
         }
@@ -188,7 +314,7 @@ namespace StraftatBots
             if (_heldWeaponObj.GetComponent<Taser>() != null ||
                 _heldWeaponObj.GetComponent<FlashLight>() != null ||
                 wname.Contains("taser") ||
-                wname.Contains("stunmine") || wname.Contains("stun mine") ||
+                wname.Contains("coochin") ||
                 wname.Contains("flashlight") || wname.Contains("flash light"))
             {
                 _heldWeaponObj = null;

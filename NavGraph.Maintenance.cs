@@ -47,7 +47,10 @@ namespace StraftatBots
         public void ReportEnvironmentalDeath(Vector3 deathPos, Vector3 lastSafePos)
         {
             if (IsLocked) return;
-            var nearDeath = FindNodesInRadius(deathPos, 3f);
+            // Tight radius: only the death spot itself. The caller already penalizes the
+            // SPECIFIC traversed edge via ReportFallOnEdge, so a wide 3m sweep here just
+            // poisoned unrelated bridge edges that happened to terminate near a hazard.
+            var nearDeath = FindNodesInRadius(deathPos, 1.5f);
 
             int edgeCount = Edges.Count;
             foreach (var node in nearDeath)
@@ -145,7 +148,10 @@ namespace StraftatBots
                     {
                         edge.Confidence -= CONFIDENCE_DEATH_PENALTY * 1.5f;
                         if (edge.Confidence <= CONFIDENCE_DELETE_THRESHOLD)
+                        {
                             edge.Confidence = -1f; // Mark for deletion
+                            edge.TrustState = EdgeTrustState.Blocked;
+                        }
                     }
                     penalized = true;
                 }
@@ -186,6 +192,7 @@ namespace StraftatBots
 
                 // Confirmed wall — heavy penalty
                 edge.FailCount += 5;
+                ReportEdgeValidation(edge, success: false);
                 bool playerEdge = fromNode.PlayerSourced && toNode.PlayerSourced;
 
                 if (playerEdge)
@@ -197,9 +204,11 @@ namespace StraftatBots
                 {
                     // Bot edge through wall — delete it
                     edge.Confidence = -1f;
+                    edge.TrustState = EdgeTrustState.Blocked;
                 }
 
                 Plugin.Log.LogInfo($"[NavGraph] Wall edge: {fromId}->{toId} (player={playerEdge}, conf={edge.Confidence:F2})");
+                ReportBadNode(toId, "wall-blocked waypoint", 1, silent: true);
                 _dirty = true;
                 break;
             }
@@ -215,10 +224,15 @@ namespace StraftatBots
 
                     bool playerEdge = fromNode.PlayerSourced && toNode.PlayerSourced;
                     edge.FailCount += 5;
+                    ReportEdgeValidation(edge, success: false);
                     if (playerEdge)
                         edge.Confidence = Mathf.Max(0.05f, edge.Confidence - 0.3f);
                     else
+                    {
                         edge.Confidence = -1f;
+                        edge.TrustState = EdgeTrustState.Blocked;
+                    }
+                    ReportBadNode(fromId, "wall-blocked waypoint", 1, silent: true);
                     break;
                 }
             }
@@ -232,6 +246,7 @@ namespace StraftatBots
             if (IsLocked) return;
             var nearNode = FindNearestNode(pos, 2f);
             if (nearNode == null) return;
+            ReportBadNode(nearNode.Id, "bot got stuck here", 1, silent: true);
 
             if (_edgesByFrom.TryGetValue(nearNode.Id, out var edgeIndices))
             {
@@ -279,7 +294,7 @@ namespace StraftatBots
         }
 
         /// <summary>
-        /// Bot/player successfully traversed this edge. Works in both modes.
+        /// Bot/player successfully traversed this edge during training.
         /// Rehabilitates low-confidence nodes/edges — successful traversal proves
         /// the path is viable, so boost confidence and clear blacklist.
         /// isPlayer gives stronger boost.
@@ -287,6 +302,7 @@ namespace StraftatBots
         public void ReportSuccess(int fromNodeId, int toNodeId, bool isPlayer = false)
         {
             if (IsLocked) return;
+            if (Mode == NavMode.Play && !LearnInPlay) return;
             float boost = isPlayer ? CONFIDENCE_PLAYER_BOOST : CONFIDENCE_SUCCESS_BOOST;
 
             if (_edgesByFrom.TryGetValue(fromNodeId, out var edgeIndices))
@@ -297,6 +313,15 @@ namespace StraftatBots
                     if (ei < Edges.Count && Edges[ei].To == toNodeId)
                     {
                         Edges[ei].SuccessCount++;
+                        if (isPlayer)
+                        {
+                            Edges[ei].TrustState = EdgeTrustState.PlayerProven;
+                            Edges[ei].BotValidationFailures = 0;
+                        }
+                        else if (Edges[ei].TrustState == EdgeTrustState.Candidate)
+                        {
+                            Edges[ei].TrustState = EdgeTrustState.BotTesting;
+                        }
 
                         // Jump/Slide edges get massive boost on success — proven traversable
                         float edgeBoost = boost;
@@ -309,6 +334,12 @@ namespace StraftatBots
                         if (Edges[ei].SuccessCount > Edges[ei].FailCount)
                             Edges[ei].FailCount = 0;
 
+                        if (!isPlayer && Edges[ei].Type == EdgeType.Walk
+                            && Edges[ei].SuccessCount >= 8 && Edges[ei].FailCount == 0)
+                        {
+                            Edges[ei].TrustState = EdgeTrustState.BotValidated;
+                        }
+
                         // Clear the variant-tried mask on success — next fail round starts fresh
                         // with all 4 approach variants available again. This keeps the retry
                         // system from permanently locking out an edge that's only flaky.
@@ -319,14 +350,11 @@ namespace StraftatBots
                         Edges[ei].FailedBotMask = 0u;
                         _demoNeededEdges.Remove(((long)fromNodeId << 32) | (uint)toNodeId);
 
-                        // Downgrade Jump back to Walk after 5 walk successes with no falls
-                        // The jump was a false positive — walking works fine here
-                        if (Edges[ei].Type == EdgeType.Jump && Edges[ei].SuccessCount >= 5
-                            && Edges[ei].FailCount == 0)
-                        {
-                            Edges[ei].Type = EdgeType.Walk;
-                            Plugin.Log.LogInfo($"[NavGraph] Jump edge {fromNodeId}->{toNodeId} downgraded to Walk (5 walk successes)");
-                        }
+                        // NOTE: previously a Jump edge with >=5 successes was auto-downgraded to
+                        // Walk, assuming it was a false-positive jump. That discarded the recorded
+                        // trajectory and could demote a real jump that only "succeeded" BECAUSE it
+                        // was jumped. Jumps now stay jumps; a parallel Walk edge is added at
+                        // execution time only when the ground is genuinely walkable.
 
                         break;
                     }
@@ -342,6 +370,7 @@ namespace StraftatBots
                 if (isPlayer) toNode.PlayerSourced = true;
                 _tempBlacklist.Remove(toNodeId);
                 _blacklistStrikes.Remove(toNodeId);
+                _badNodeReasons.Remove(toNodeId);
             }
 
             var fromNode = GetNodeById(fromNodeId);
@@ -350,6 +379,9 @@ namespace StraftatBots
                 fromNode.Confidence = Mathf.Min(1f, fromNode.Confidence + boost * 0.5f);
                 fromNode.LastVisitTime = Time.time;
                 if (isPlayer) fromNode.PlayerSourced = true;
+                _tempBlacklist.Remove(fromNodeId);
+                _blacklistStrikes.Remove(fromNodeId);
+                _badNodeReasons.Remove(fromNodeId);
             }
 
             _dirty = true;
@@ -395,6 +427,8 @@ namespace StraftatBots
         /// </summary>
         public void EnsurePlayerEdge(int fromId, int toId)
         {
+            if (Mode == NavMode.Play && !LearnInPlay) return;
+
             // Check if edge already exists
             if (_edgesByFrom.TryGetValue(fromId, out var edgeIndices))
             {
@@ -413,6 +447,11 @@ namespace StraftatBots
             if (fromNode == null || toNode == null) return;
 
             float dist = Vector3.Distance(fromNode.Position, toNode.Position);
+            if (dist > 4.5f)
+            {
+                Plugin.Log.LogInfo($"[NavGraph] Rejected grounded edge {fromId}->{toId}: {dist:F1}m is too long for a walk sample");
+                return;
+            }
             float heightDiff = toNode.Position.y - fromNode.Position.y;
 
             // Horizontal run (ignores vertical)
@@ -436,7 +475,7 @@ namespace StraftatBots
                 type = EdgeType.Jump;
             }
 
-            // Bidirectional — player/bot traversed both ways implicitly. Force = bypass Play mode block.
+            // Bidirectional — player/bot traversed both ways implicitly during training.
             var fwd = AddEdge(fromId, toId, type, dist, force: true);
             var rev = AddEdge(toId, fromId, type, dist, force: true);
 
@@ -628,6 +667,7 @@ namespace StraftatBots
                     if (edge.To != toNodeId) continue;
 
                     edge.FailCount++;
+                    ReportEdgeValidation(edge, success: false);
                     if (botId >= 0 && botId < 32) edge.FailedBotMask |= (1u << botId);
 
                     // Demo-needed marker: at 3 fails, flag this edge for a player demonstration.
@@ -639,6 +679,9 @@ namespace StraftatBots
                             Plugin.Log.LogInfo($"[NavGraph] Demo needed: edge {fromNodeId}->{toNodeId} ({edge.FailCount} fails across {PopCount(edge.FailedBotMask)} bots)");
                     }
 
+                    if (edge.FailCount >= DEMO_NEEDED_FAIL_THRESHOLD && edge.SuccessCount == 0)
+                        ReportBadNode(toNodeId, "failed landing/route point", 1, silent: true);
+
                     // Check if this edge goes through a wall — if so, delete it immediately
                     var fromNode = GetNodeById(fromNodeId);
                     var toNode = GetNodeById(toNodeId);
@@ -646,6 +689,7 @@ namespace StraftatBots
                         !ValidateLineOfSight(fromNode.Position, toNode.Position))
                     {
                         edge.Confidence = -1f;
+                        edge.TrustState = EdgeTrustState.Blocked;
                         Plugin.Log.LogInfo($"[NavGraph] Removed edge {fromNodeId}->{toNodeId} (through wall)");
                         _dirty = true;
                         break;
@@ -661,6 +705,7 @@ namespace StraftatBots
                         if (edge.FailCount >= 5 && walkConsensus)
                         {
                             edge.Confidence = -1f;
+                            edge.TrustState = EdgeTrustState.Blocked;
                             Plugin.Log.LogInfo($"[NavGraph] Removed walk edge {fromNodeId}->{toNodeId} ({edge.FailCount} falls, {walkDistinctBots} distinct bots)");
                         }
                         else if (edge.FailCount >= 2
@@ -709,6 +754,7 @@ namespace StraftatBots
                             if (!foundBetter && edge.FailCount >= 5 && edge.SuccessCount == 0 && jumpConsensus)
                             {
                                 edge.Confidence = -1f;
+                                edge.TrustState = EdgeTrustState.Blocked;
                                 Plugin.Log.LogInfo($"[NavGraph] Removed impossible jump {fromNodeId}->{toNodeId} ({edge.FailCount} fails, {jumpDistinctBots} distinct bots)");
                             }
                         }
@@ -815,6 +861,7 @@ namespace StraftatBots
         /// </summary>
         public void BlacklistNearby(Vector3 pos, float radius = 3f)
         {
+            if (IsLocked) return;
             var nearby = FindNodesInRadius(pos, radius);
             float expiry = Time.time + BlacklistDuration;
 
@@ -822,25 +869,105 @@ namespace StraftatBots
             {
                 // Temporarily blacklist for pathfinding (even player nodes — bot needs alternate route)
                 _tempBlacklist[node.Id] = expiry;
-
-                // But never permanently penalize or delete player-sourced nodes
-                if (node.PlayerSourced) continue;
-
-                if (!_blacklistStrikes.ContainsKey(node.Id))
-                    _blacklistStrikes[node.Id] = 0;
-                _blacklistStrikes[node.Id]++;
-
-                if (_blacklistStrikes[node.Id] >= BLACKLIST_STRIKES_TO_DELETE)
-                {
-                    node.Confidence = -1f;
-                    Plugin.Log.LogInfo($"[NavGraph] Permanently deleted bot node {node.Id} at {node.Position} ({_blacklistStrikes[node.Id]} strikes)");
-                    _dirty = true;
-                }
-                else
-                {
-                    node.Confidence = Mathf.Max(0.1f, node.Confidence - 0.1f);
-                }
+                ReportBadNode(node.Id, "blacklisted recovery area", 1, silent: true);
             }
+        }
+
+        public void ReportBadNode(int nodeId, string reason, int strikes = 1, bool silent = false)
+        {
+            if (IsLocked) return;
+            var node = GetNodeById(nodeId);
+            if (node == null || node.Confidence <= 0f) return;
+
+            _tempBlacklist[node.Id] = Time.time + BlacklistDuration;
+            _badNodeReasons[node.Id] = string.IsNullOrWhiteSpace(reason) ? "bad route point" : reason;
+
+            bool protectedNode = node.PlayerSourced || IsMapLocation(node.Id) || IsPatrolProtected(node.Id);
+            if (protectedNode)
+            {
+                if (!silent)
+                    SetTrainingHint("BAD ROUTE AREA MARKED: protected player/map node will be avoided, not deleted.", 8f);
+                return;
+            }
+
+            if (!_blacklistStrikes.ContainsKey(node.Id))
+                _blacklistStrikes[node.Id] = 0;
+            _blacklistStrikes[node.Id] += Mathf.Max(1, strikes);
+
+            int strikeCount = _blacklistStrikes[node.Id];
+            node.Confidence = Mathf.Max(0.03f, node.Confidence - 0.12f * Mathf.Max(1, strikes));
+
+            if (strikeCount >= BLACKLIST_STRIKES_TO_DELETE)
+            {
+                node.Confidence = -1f;
+                _dirty = true;
+                if (!silent)
+                    SetTrainingHint($"BAD NODE REMOVED: {reason}. Bots will rebuild a cleaner route.", 10f);
+                Plugin.Log.LogInfo($"[NavGraph] Permanently deleted bad bot node {node.Id} ({reason}, {strikeCount} strikes)");
+            }
+            else
+            {
+                _dirty = true;
+                if (!silent && strikeCount >= 2)
+                    SetTrainingHint($"BAD NODE MARKED: {reason}. One more failure deletes it.", 10f);
+            }
+        }
+
+        public bool IsBadNode(int nodeId)
+        {
+            var node = GetNodeById(nodeId);
+            return node != null && node.Confidence > 0f
+                && _blacklistStrikes.TryGetValue(nodeId, out int strikes)
+                && strikes > 0;
+        }
+
+        public int GetBadNodeStrikes(int nodeId)
+            => _blacklistStrikes.TryGetValue(nodeId, out int strikes) ? strikes : 0;
+
+        public string GetBadNodeReason(int nodeId)
+            => _badNodeReasons.TryGetValue(nodeId, out string reason) ? reason : "bad route point";
+
+        public IEnumerable<(Vector3 pos, int nodeId, int strikes, string reason)> BadNodePositions()
+        {
+            foreach (var kv in _blacklistStrikes)
+            {
+                var node = GetNodeById(kv.Key);
+                if (node == null || node.Confidence <= 0f) continue;
+                yield return (node.Position, node.Id, kv.Value, GetBadNodeReason(node.Id));
+            }
+        }
+
+        public int PruneBadNodes(int maxToRemove = 25)
+        {
+            if (IsLocked) return 0;
+            var candidates = new List<(int id, int strikes)>();
+            foreach (var kv in _blacklistStrikes)
+            {
+                var node = GetNodeById(kv.Key);
+                if (node == null || node.Confidence <= 0f) continue;
+                if (node.PlayerSourced || IsMapLocation(node.Id) || IsPatrolProtected(node.Id)) continue;
+                candidates.Add((node.Id, kv.Value));
+            }
+            candidates.Sort((a, b) => b.strikes.CompareTo(a.strikes));
+
+            int removed = 0;
+            foreach (var candidate in candidates)
+            {
+                if (removed >= maxToRemove) break;
+                var node = GetNodeById(candidate.id);
+                if (node == null || node.Confidence <= 0f) continue;
+                node.Confidence = -1f;
+                removed++;
+            }
+
+            if (removed > 0)
+            {
+                Compact();
+                _dirty = true;
+                SetTrainingHint($"CLEANUP: removed {removed} bad bot route point(s).", 8f);
+                Plugin.Log.LogInfo($"[NavGraph] Pruned {removed} marked bad nodes");
+            }
+            return removed;
         }
 
         /// <summary>
@@ -848,6 +975,8 @@ namespace StraftatBots
         /// </summary>
         public bool IsBlacklisted(int nodeId)
         {
+            if (_blacklistStrikes.TryGetValue(nodeId, out int strikes) && strikes >= 2)
+                return true;
             if (!_tempBlacklist.TryGetValue(nodeId, out float expiry)) return false;
             if (Time.time > expiry)
             {
@@ -869,8 +998,9 @@ namespace StraftatBots
             }
             foreach (int id in expired)
             {
+                if (_blacklistStrikes.TryGetValue(id, out int strikes) && strikes >= 2)
+                    ReportBadNode(id, "bad route point timed out", 1, silent: true);
                 _tempBlacklist.Remove(id);
-                _blacklistStrikes.Remove(id); // Clean up strikes for expired entries
             }
         }
 
@@ -1452,6 +1582,17 @@ namespace StraftatBots
                 var cellNodes = kv.Value;
                 if (cellNodes.Count < minNodesInCell) continue;
 
+                // Don't bulldoze a cell that contains jump/ladder/fall/slide/teleporter endpoints,
+                // map locations, or patrol nodes. Flattening it into a 4-corner rectangle would
+                // relocate the takeoff/landing and desync recorded trajectories, or drop anchors.
+                bool cellHasProtected = false;
+                foreach (var n in cellNodes)
+                {
+                    if (HasSpecialEdge(n.Id) || IsMapLocation(n.Id) || IsPatrolProtected(n.Id))
+                    { cellHasProtected = true; break; }
+                }
+                if (cellHasProtected) continue;
+
                 // Check flatness — all nodes must be within 0.5m height
                 float minY = float.MaxValue, maxY = float.MinValue;
                 float minX = float.MaxValue, maxX = float.MinValue;
@@ -1614,6 +1755,8 @@ namespace StraftatBots
             if (Time.time - _lastDeclutterTime < 15f) return;
             _lastDeclutterTime = Time.time;
             if (Nodes.Count < 20) return;
+
+            CleanupBlacklist();
 
             // Revalidate walk edges (wall check) — always safe
             RevalidateWalkEdges(50);

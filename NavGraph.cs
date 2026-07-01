@@ -22,6 +22,16 @@ namespace StraftatBots
         Play = 1        // No new nodes, uses existing graph, still does confidence feedback
     }
 
+    public enum EdgeTrustState : byte
+    {
+        Candidate = 0,     // Raw discovered data; useful in training, not trusted for hard Play routes.
+        PlayerProven = 1,  // Captured from player traversal or Watch Me data.
+        BotTesting = 2,    // Bots are validating this edge.
+        BotValidated = 3,  // Bots completed it enough times to trust in Play.
+        NeedsDemo = 4,     // Bots repeatedly failed; needs a better player demonstration.
+        Blocked = 5        // Known bad/dead route.
+    }
+
     public class NavNode
     {
         public int Id;
@@ -78,6 +88,10 @@ namespace StraftatBots
         // bot stuck in a loop can't murder an otherwise-good edge. Fallback path keeps
         // single-bot testing viable (10-fail override kicks in regardless).
         public uint FailedBotMask;
+        public EdgeTrustState TrustState;
+        public int BotValidationSuccesses;
+        public int BotValidationFailures;
+        public float LastValidationTime;
 
         public NavEdge(int from, int to, EdgeType type, float dist)
         {
@@ -91,6 +105,10 @@ namespace StraftatBots
             TriedVariants = 0;
             CurrentVariant = 0;
             FailedBotMask = 0u;
+            TrustState = EdgeTrustState.Candidate;
+            BotValidationSuccesses = 0;
+            BotValidationFailures = 0;
+            LastValidationTime = 0f;
         }
     }
 
@@ -118,8 +136,8 @@ namespace StraftatBots
     {
         public static NavGraph Instance { get; private set; }
 
-        // v4: adds ProvenRoutes section at end of file (after patrol IDs).
-        private const int FILE_VERSION = 4;
+        // v5: adds persistent edge trust / bot validation fields.
+        private const int FILE_VERSION = 5;
         private const float BASE_MERGE_RADIUS = 1.0f;         // Min spacing between nodes (scaled by density)
         private const float BASE_CLUSTER_MERGE = 1.5f;      // Cluster merge radius (scaled by density)
         private const float BASE_NeighborRadius = 2.0f;    // Connection range (scaled by density)
@@ -171,12 +189,19 @@ namespace StraftatBots
         private static float BlacklistDuration => BL_DURATION_NORMAL;
         private const int BLACKLIST_STRIKES_TO_DELETE = 3;     // 3 blacklists = permanent delete
         private Dictionary<int, int> _blacklistStrikes = new Dictionary<int, int>();
+        private Dictionary<int, string> _badNodeReasons = new Dictionary<int, string>();
 
         public NavMode Mode { get; set; } = NavMode.Training;
         public string CurrentMap => _currentMap;
         public bool HasData => Nodes.Count > 0;
         /// <summary>When true, no nodes/edges are created, deleted, modified, or pruned.</summary>
         public static bool IsLocked => Plugin.LockGraph?.Value ?? false;
+        /// <summary>When true, the ADDITIVE graph ops (add node/edge, success, surround scan)
+        /// also run in Play mode, so bots keep learning the map slowly during normal matches.
+        /// Destructive bulk maintenance (prune/declutter/zones/validation-deletion) stays
+        /// Training-only. Still fully blocked by IsLocked (Freeze Map Data). Flip to false to
+        /// restore the old read-only-Play behavior.</summary>
+        public static bool LearnInPlay => true;
         public int NodeCount => Nodes.Count;
         public int EdgeCount => Edges.Count;
 
@@ -229,6 +254,14 @@ namespace StraftatBots
             var route = new ProvenRoute(name ?? $"Route_{ProvenRoutes.Count + 1}", cleaned.ToArray(), totalTime);
             ProvenRoutes.Add(route);
             RebuildProvenEdgeSet();
+            for (int i = 0; i + 1 < route.NodeIds.Length; i++)
+            {
+                var edge = GetEdgeBetween(route.NodeIds[i], route.NodeIds[i + 1]);
+                if (edge == null) continue;
+                edge.TrustState = EdgeTrustState.PlayerProven;
+                edge.BotValidationFailures = 0;
+                edge.Confidence = Mathf.Max(edge.Confidence, 0.85f);
+            }
             _dirty = true;
             Plugin.Log.LogInfo($"[NavGraph] Added ProvenRoute '{route.Name}' ({route.NodeIds.Length} nodes, {totalTime:F1}s)");
         }
@@ -277,6 +310,7 @@ namespace StraftatBots
             _botNodeCount = 0;
             _tempBlacklist.Clear();
             _blacklistStrikes.Clear();
+            _badNodeReasons.Clear();
             _routeCache.Clear();
             MapLocations.Clear();
             ProvenRoutes.Clear();
@@ -412,6 +446,12 @@ namespace StraftatBots
             if (IsLocked && !force)
                 return FindNearestNode(pos, 5f);
 
+            // Play now also learns slowly (LearnInPlay) so bots improve maps during normal
+            // matches. New Play data lands as low-trust candidates; pathing in Play still only
+            // uses trusted edges, so this is additive and safe. Freeze (IsLocked) overrides.
+            if (Mode == NavMode.Play && !force && !LearnInPlay)
+                return FindNearestNode(pos, NeighborRadius * 2);
+
             // Bots use wider merge radius — consolidate bot data, don't create redundant nodes
             float mergeRadius = isPlayer ? BASE_MERGE_RADIUS : (BASE_MERGE_RADIUS * 1.5f);
 
@@ -429,10 +469,6 @@ namespace StraftatBots
                 _dirty = true;
                 return existing;
             }
-
-            // Play mode: read-only. force=true bypasses this (used by RegisterMapLocations for weapon nodes)
-            if (Mode == NavMode.Play && !force)
-                return FindNearestNode(pos, NeighborRadius * 2);
 
             // Bot node creation: only if no player path nearby
             // Bots should follow player paths first, only create nodes far from player data
@@ -458,8 +494,13 @@ namespace StraftatBots
             {
                 if (isPlayer && _playerNodeCount >= MaxPlayerNodes)
                 {
+                    // Player data is precious — don't silently drop it at the 60% soft cap.
+                    // Prune (which evicts bot nodes first; player nodes are never deleted) to free
+                    // room, and only refuse the node if the WHOLE graph is full. This lets a
+                    // thorough human demo borrow the bot budget on large maps.
                     if (Time.time - _lastPruneTime > PRUNE_CHECK_INTERVAL) Prune();
-                    if (_playerNodeCount >= MaxPlayerNodes) return FindNearestNode(pos, NeighborRadius * 2);
+                    if (_playerNodeCount + _botNodeCount >= Plugin.MAX_NODES)
+                        return FindNearestNode(pos, NeighborRadius * 2);
                 }
                 else if (!isPlayer && _botNodeCount >= MaxBotNodesCap)
                 {
@@ -858,6 +899,14 @@ namespace StraftatBots
         public NavEdge AddSpecialEdge(Vector3 fromPos, Vector3 toPos, EdgeType type, bool isPlayer = false)
         {
             if (IsLocked) return null;
+            if (Mode == NavMode.Play && !LearnInPlay)
+            {
+                var fromExisting = FindNearestNode(fromPos, NeighborRadius * 2);
+                var toExisting = FindNearestNode(toPos, NeighborRadius * 2);
+                return fromExisting != null && toExisting != null
+                    ? GetEdgeBetween(fromExisting.Id, toExisting.Id)
+                    : null;
+            }
 
             // WALKABILITY GATE: if both points are connected by walkable ground,
             // don't create any special edge — walk edges handle it
@@ -902,6 +951,12 @@ namespace StraftatBots
             if (fromNode == null || toNode == null) return null;
             // Force=true for player special edges — these are always critical
             var edge = AddEdge(fromNode.Id, toNode.Id, type, Vector3.Distance(fromPos, toPos), force: isPlayer);
+            if (edge != null && isPlayer)
+            {
+                edge.TrustState = EdgeTrustState.PlayerProven;
+                edge.BotValidationFailures = 0;
+                edge.Confidence = Mathf.Max(edge.Confidence, 0.85f);
+            }
 
             // Clear NearEdge on takeoff node — proven jump origin should be accessible
             if (edge != null && fromNode.NearEdge &&
@@ -1017,6 +1072,17 @@ namespace StraftatBots
         public NavEdge AddEdge(int from, int to, EdgeType type, float dist, bool force = false)
         {
             if (IsLocked && !force) return null;
+
+            // In Play we now allow additive learning (LearnInPlay); without it, existing edges
+            // are read-only unless registering fixed map infrastructure with force=true.
+            if (Mode == NavMode.Play && !force && !LearnInPlay)
+            {
+                var existingReadOnly = GetEdgeBetween(from, to);
+                return existingReadOnly != null && existingReadOnly.Type == type
+                    ? existingReadOnly
+                    : null;
+            }
+
             // Check for existing edge
             if (_edgesByFrom.TryGetValue(from, out var fromEdges))
             {
@@ -1032,8 +1098,8 @@ namespace StraftatBots
                 }
             }
 
-            // Play mode: read-only (unless forced by RegisterMapLocations etc.)
-            if (Mode == NavMode.Play && !force) return null;
+            // Play mode: read-only unless additive learning is on (or forced infrastructure).
+            if (Mode == NavMode.Play && !force && !LearnInPlay) return null;
 
             // Reject jump edges that reverse a fall edge — the fall is one-way down,
             // jumping back up from the landing is usually impossible
@@ -1749,6 +1815,10 @@ namespace StraftatBots
             foreach (var anchor in sorted)
             {
                 if (anchor.Confidence <= 0 || merged.Contains(anchor.Id)) continue;
+                // Don't let a jump/ladder/fall/slide endpoint absorb neighbors — moving its
+                // position would desync the recorded trajectory (AirPositions are absolute world
+                // coords). The other mergers already honor this; Prune must too.
+                if (HasSpecialEdge(anchor.Id)) continue;
 
                 var cluster = FindNodesInRadius(anchor.Position, ClusterMergeRadius);
                 foreach (var neighbor in cluster)
@@ -1756,6 +1826,7 @@ namespace StraftatBots
                     if (neighbor.Id == anchor.Id || merged.Contains(neighbor.Id)) continue;
                     if (neighbor.Confidence <= 0) continue;
                     if (protectedIds.Contains(neighbor.Id)) continue; // Never merge patrol/map nodes
+                    if (HasSpecialEdge(neighbor.Id)) continue;        // Never merge special-edge endpoints
 
                     // Check xyz proximity — merge if close on ALL axes
                     // Different floors (>1.5m vertical) should NOT merge
@@ -1913,6 +1984,8 @@ namespace StraftatBots
                 liveEdges.Add(edge);
             }
 
+            RemapNodeMetadata(idMap);
+
             // Deduplicate edges — O(E) with Dictionary lookup instead of O(E^2) nested loop
             var edgeMap = new Dictionary<(int, int, EdgeType), NavEdge>();
             var dedupedEdges = new List<NavEdge>();
@@ -1924,6 +1997,20 @@ namespace StraftatBots
                     existing.Confidence = Mathf.Max(existing.Confidence, edge.Confidence);
                     existing.SuccessCount += edge.SuccessCount;
                     existing.FailCount += edge.FailCount;
+                    // Preserve recorded jump trajectory: if the surviving edge has no (or a poorer)
+                    // trajectory than the one being merged in, copy it over instead of silently
+                    // discarding it. Losing AirPositions here was corrupting jump replay on save.
+                    if (edge.AirSampleCount > existing.AirSampleCount)
+                    {
+                        existing.AirPositions = edge.AirPositions;
+                        existing.AirTimestamps = edge.AirTimestamps;
+                        existing.AirSampleCount = edge.AirSampleCount;
+                        existing.TakeoffDir = edge.TakeoffDir;
+                        existing.TakeoffSpeed = edge.TakeoffSpeed;
+                        existing.LockedSpeed = edge.LockedSpeed;
+                        existing.LockedAirTime = edge.LockedAirTime;
+                    }
+                    if (edge.TrustState > existing.TrustState) existing.TrustState = edge.TrustState;
                 }
                 else
                 {
@@ -1964,6 +2051,89 @@ namespace StraftatBots
                     _edgesByTo[to] = new List<int>();
                 _edgesByTo[to].Add(i);
             }
+        }
+
+        private void RemapNodeMetadata(Dictionary<int, int> idMap)
+        {
+            _tempBlacklist = RemapFloatDictionary(_tempBlacklist, idMap);
+            _blacklistStrikes = RemapIntDictionary(_blacklistStrikes, idMap);
+            _badNodeReasons = RemapStringDictionary(_badNodeReasons, idMap);
+
+            for (int i = 0; i < MapLocations.Count; i++)
+            {
+                var loc = MapLocations[i];
+                if (idMap.TryGetValue(loc.nodeId, out int newId))
+                    MapLocations[i] = (loc.pos, loc.label, newId);
+            }
+
+            var remappedPatrol = new HashSet<int>();
+            foreach (int id in _patrolVisitedNodes)
+                if (idMap.TryGetValue(id, out int newId))
+                    remappedPatrol.Add(newId);
+            _patrolVisitedNodes = remappedPatrol;
+
+            var remappedDemo = new HashSet<long>();
+            foreach (long packed in _demoNeededEdges)
+            {
+                int from = (int)(packed >> 32);
+                int to = (int)(packed & 0xFFFFFFFF);
+                if (idMap.TryGetValue(from, out int newFrom) && idMap.TryGetValue(to, out int newTo))
+                    remappedDemo.Add(((long)newFrom << 32) | (uint)newTo);
+            }
+            _demoNeededEdges.Clear();
+            foreach (long packed in remappedDemo)
+                _demoNeededEdges.Add(packed);
+
+            if (ProvenRoutes.Count > 0)
+            {
+                var remappedRoutes = new List<ProvenRoute>(ProvenRoutes.Count);
+                foreach (var route in ProvenRoutes)
+                {
+                    if (route?.NodeIds == null || route.NodeIds.Length < 2) continue;
+                    var ids = new List<int>(route.NodeIds.Length);
+                    int previous = -1;
+                    for (int i = 0; i < route.NodeIds.Length; i++)
+                    {
+                        if (!idMap.TryGetValue(route.NodeIds[i], out int newId)) continue;
+                        if (newId == previous) continue;
+                        ids.Add(newId);
+                        previous = newId;
+                    }
+                    if (ids.Count < 2) continue;
+                    var remapped = new ProvenRoute(route.Name, ids.ToArray(), route.TotalTime);
+                    remapped.UseCount = route.UseCount;
+                    remappedRoutes.Add(remapped);
+                }
+                ProvenRoutes = remappedRoutes;
+                RebuildProvenEdgeSet();
+            }
+        }
+
+        private static Dictionary<int, float> RemapFloatDictionary(Dictionary<int, float> source, Dictionary<int, int> idMap)
+        {
+            var remapped = new Dictionary<int, float>();
+            foreach (var kv in source)
+                if (idMap.TryGetValue(kv.Key, out int newId))
+                    remapped[newId] = kv.Value;
+            return remapped;
+        }
+
+        private static Dictionary<int, int> RemapIntDictionary(Dictionary<int, int> source, Dictionary<int, int> idMap)
+        {
+            var remapped = new Dictionary<int, int>();
+            foreach (var kv in source)
+                if (idMap.TryGetValue(kv.Key, out int newId))
+                    remapped[newId] = kv.Value;
+            return remapped;
+        }
+
+        private static Dictionary<int, string> RemapStringDictionary(Dictionary<int, string> source, Dictionary<int, int> idMap)
+        {
+            var remapped = new Dictionary<int, string>();
+            foreach (var kv in source)
+                if (idMap.TryGetValue(kv.Key, out int newId))
+                    remapped[newId] = kv.Value;
+            return remapped;
         }
 
         // >>> A* pathfinding methods moved to NavGraph.Pathfinding.cs

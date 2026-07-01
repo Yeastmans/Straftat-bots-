@@ -23,12 +23,14 @@ namespace StraftatBots
 
         // ===== Gameplay =====
         public static ConfigEntry<bool> LockGraph;
+        public static ConfigEntry<string> RecoveryAggression;
 
         // ===== Training =====
         public static ConfigEntry<string> TrainingBehavior;
 
         // Helper properties
         public static bool IsExploreMode => TrainingBehavior?.Value == "Explore";
+        public static bool IsValidateMode => TrainingBehavior?.Value == "Validate";
         public static bool IsTrainingNone => TrainingBehavior?.Value == "None";
 
         // ===== Customise =====
@@ -43,6 +45,8 @@ namespace StraftatBots
         // ===== Debug =====
         // Single overlay toggle — covers nodes, edges, bot paths, markers, and info text.
         public static ConfigEntry<bool> ShowOverlay;
+        // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
+        public static ConfigEntry<bool> EnableReliabilityLogs;
 
         // ===== Hardcoded defaults (formerly user-facing) =====
         // The old sliders/toggles were removed in favor of "works all the time" defaults.
@@ -73,7 +77,15 @@ namespace StraftatBots
                     new AcceptableValueList<string>("Training", "Play")));
             NavGraphMode.SettingChanged += (s, e) =>
             {
-                if (NavGraphMode.Value == "Play") DisableTrainingSettings();
+                if (NavGraphMode.Value == "Play")
+                {
+                    // Play is a warning, not a block. Let the user enter Play even on an
+                    // undertrained map; bots keep learning as they go (LearnInPlay).
+                    string warning = NavGraph.Instance?.GetPlayModeWarning();
+                    if (!string.IsNullOrWhiteSpace(warning))
+                        Log.LogWarning($"[Certification] {warning} (Play allowed — bots will keep learning the map as they go.)");
+                    DisableTrainingSettings();
+                }
             };
 
             Config.Bind("Bots", "--- Spawn Bots Now ---", false,
@@ -108,15 +120,19 @@ namespace StraftatBots
             LockGraph = Config.Bind("Gameplay", "Freeze Map Data", false,
                 "Freeze the navigation graph. Nothing is created, deleted, or modified. " +
                 "Use when you're happy with the trained data and want to preserve it exactly.");
-
+            RecoveryAggression = Config.Bind("Gameplay", "Recovery Aggression", "Fast",
+                new ConfigDescription(
+                    "How quickly bots escalate through unstuck stages: Slow, Medium, Fast.",
+                    new AcceptableValueList<string>("Slow", "Medium", "Fast")));
             // ================================================================
             //  TRAINING — Only active in Training mode. Locked in Play mode.
             // ================================================================
             TrainingBehavior = Config.Bind("Training", "Bot Behavior", "Explore",
                 new ConfigDescription(
                     "NONE: Bots freeze in place. Train the map yourself.\n" +
-                    "EXPLORE: Bots autonomously explore the map, discover routes.",
-                    new AcceptableValueList<string>("None", "Explore")));
+                    "EXPLORE: Bots autonomously explore the map, discover routes.\n" +
+                    "VALIDATE: Bots run route-certification trials and promote reliable paths.",
+                    new AcceptableValueList<string>("None", "Explore", "Validate")));
             TrainingBehavior.SettingChanged += (s, e) =>
             {
                 if (NavGraphMode?.Value == "Play" && TrainingBehavior.Value != "None")
@@ -178,7 +194,8 @@ namespace StraftatBots
         public static float GetScanRadius() => SCAN_RADIUS;
         public static float GetMaxJumpDist() => MAX_JUMP_DIST;
         public static float GetAutoSaveInterval() => AUTO_SAVE_SEC;
-
+        public static bool IsFastRecovery => RecoveryAggression?.Value == "Fast";
+        public static bool IsMediumRecovery => RecoveryAggression?.Value == "Medium";
         private static void DisableTrainingSettings()
         {
             if (TrainingBehavior != null) TrainingBehavior.Value = "None";

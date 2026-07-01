@@ -60,6 +60,7 @@ namespace StraftatBots
                     if (ei >= Edges.Count) continue;
                     var edge = Edges[ei];
                     if (edge.Confidence <= 0) continue;
+                    if (Mode == NavMode.Play && IsBadForPlay(edge)) continue;
 
                     // Skip blacklisted destination nodes
                     if (IsBlacklisted(edge.To)) continue;
@@ -72,6 +73,21 @@ namespace StraftatBots
 
                     // Base cost = distance / confidence
                     float edgeCost = edge.Cost / Mathf.Max(0.1f, edge.Confidence);
+                    switch (edge.TrustState)
+                    {
+                        case EdgeTrustState.BotValidated:
+                            edgeCost *= 0.45f;
+                            break;
+                        case EdgeTrustState.PlayerProven:
+                            edgeCost *= 0.60f;
+                            break;
+                        case EdgeTrustState.BotTesting:
+                            edgeCost *= Mode == NavMode.Training ? 0.9f : 1.35f;
+                            break;
+                        case EdgeTrustState.Candidate:
+                            edgeCost *= Mode == NavMode.Training ? 1.05f : 1.75f;
+                            break;
+                    }
 
                     // Prefer player-sourced paths
                     var fromN = GetNodeById(edge.From);
@@ -81,6 +97,21 @@ namespace StraftatBots
                             edgeCost *= 0.5f;  // 50% cheaper to follow player paths
                         else if (fromN.PlayerSourced || toN.PlayerSourced)
                             edgeCost *= 0.7f;  // 30% cheaper if at least one end is player-sourced
+                    }
+
+                    if (Mode == NavMode.Play && fromN != null && toN != null)
+                    {
+                        if ((edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump)
+                            && !IsTrustedForPlay(edge)
+                            && (!fromN.PlayerSourced || !toN.PlayerSourced))
+                            continue;
+
+                        if (edge.Type == EdgeType.Fall)
+                        {
+                            float drop = fromN.Position.y - toN.Position.y;
+                            if (!IsTrustedForPlay(edge) || drop > 2.75f || toN.NearEdge)
+                                continue;
+                        }
                     }
 
                     // Edge type cost modifiers:
@@ -165,8 +196,17 @@ namespace StraftatBots
                         }
                     }
 
-                    if (jitter > 0)
-                        edgeCost *= (1f + UnityEngine.Random.Range(-jitter, jitter));
+                    // DETERMINISTIC tie-break instead of per-call randomness. A stable per-edge
+                    // hash means the SAME start/target returns the SAME path every recompute, so
+                    // bots stop flip-flopping between near-equal routes — the biggest source of the
+                    // constant direction changes / jitter. (Was UnityEngine.Random, which re-rolled
+                    // a different path on every repath.)
+                    if (jitter > 0f)
+                    {
+                        int hsh = (edge.From * 73856093) ^ (edge.To * 19349663);
+                        float stable = ((hsh & 0x7fffffff) / (float)int.MaxValue) * 2f - 1f; // stable [-1,1]
+                        edgeCost *= (1f + stable * jitter);
+                    }
 
                     float tentativeG = currentG + edgeCost;
                     float neighborG = gScore.ContainsKey(edge.To) ? gScore[edge.To] : float.MaxValue;

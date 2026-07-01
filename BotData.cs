@@ -32,8 +32,7 @@ namespace StraftatBots
             {
                 if (CosmeticsManager.Instance.mats != null)
                     maxSuits = CosmeticsManager.Instance.mats.Length;
-                if (CosmeticsManager.Instance.hats != null)
-                    maxHats = CosmeticsManager.Instance.hats.Length;
+                maxHats = BotManager.GetAvailableHatCount();
                 if (CosmeticsManager.Instance.cigs != null)
                     maxCigs = CosmeticsManager.Instance.cigs.Length;
             }
@@ -67,7 +66,7 @@ namespace StraftatBots
             if (CosmeticsManager.Instance != null)
             {
                 if (CosmeticsManager.Instance.mats != null) maxSuits = CosmeticsManager.Instance.mats.Length;
-                if (CosmeticsManager.Instance.hats != null) maxHats = CosmeticsManager.Instance.hats.Length;
+                maxHats = BotManager.GetAvailableHatCount();
                 if (CosmeticsManager.Instance.cigs != null) maxCigs = CosmeticsManager.Instance.cigs.Length;
             }
             SuitIndex = Random.Range(0, maxSuits);
@@ -81,7 +80,7 @@ namespace StraftatBots
             if (CosmeticsManager.Instance != null)
             {
                 if (CosmeticsManager.Instance.mats != null) maxSuits = CosmeticsManager.Instance.mats.Length;
-                if (CosmeticsManager.Instance.hats != null) maxHats = CosmeticsManager.Instance.hats.Length;
+                maxHats = BotManager.GetAvailableHatCount();
                 if (CosmeticsManager.Instance.cigs != null) maxCigs = CosmeticsManager.Instance.cigs.Length;
             }
 

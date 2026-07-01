@@ -134,7 +134,7 @@ namespace StraftatBots
             }
 
             _searchTimer += Time.deltaTime;
-            float searchRate = _playerTarget == null ? 0f : 2f;
+            float searchRate = _playerTarget == null ? 0.35f : 0.6f;
             if (_searchTimer >= searchRate)
             {
                 _searchTimer = 0f;
@@ -155,15 +155,22 @@ namespace StraftatBots
                     {
                         float curDist = Vector3.Distance(transform.position, _playerTarget.position);
                         float newDist = Vector3.Distance(transform.position, nearest.position);
+                        bool curLos = HasLineOfSight();
+                        Vector3 toNew = nearest.position - transform.position;
+                        bool newLos = !Physics.Raycast(transform.position + Vector3.up,
+                            toNew.normalized, toNew.magnitude, WALL_MASK, QueryTriggerInteraction.Ignore);
 
-                        // Switch if closer AND has line of sight
-                        if (newDist < curDist * 0.6f)
+                        // Switch immediately when current target lost LOS but a visible target exists.
+                        if (!curLos && newLos && newDist < curDist * 1.2f)
                         {
-                            Vector3 toNew = nearest.position - transform.position;
-                            bool canSee = !Physics.Raycast(transform.position + Vector3.up,
-                                toNew.normalized, toNew.magnitude, WALL_MASK, QueryTriggerInteraction.Ignore);
-                            if (canSee)
-                                _playerTarget = nearest;
+                            _playerTarget = nearest;
+                            _combatStaleTimer = 0f;
+                        }
+                        // Otherwise switch only if significantly closer AND visible.
+                        else if (newLos && newDist < curDist * 0.72f)
+                        {
+                            _playerTarget = nearest;
+                            _combatStaleTimer = 0f;
                         }
                     }
                 }
@@ -174,6 +181,8 @@ namespace StraftatBots
                 _isShooting = false;
                 StopLean();
                 StopCrouch();
+                _huntNoLosTimer = 0f;
+                _huntHasLastSeenTarget = false;
                 Wander();
                 return;
             }
@@ -181,11 +190,50 @@ namespace StraftatBots
             float dist = HorizontalDist(transform.position, _playerTarget.position);
             float heightDiff = Mathf.Abs(transform.position.y - _playerTarget.position.y);
             bool onDifferentLevel = heightDiff > 3f;
-            bool targetAbove = _playerTarget.position.y > transform.position.y + 3f;
-            bool targetBelow = _playerTarget.position.y < transform.position.y - 3f;
+            bool hasLosNow = HasLineOfSight();
+            if (hasLosNow)
+            {
+                _huntNoLosTimer = 0f;
+                _huntHasLastSeenTarget = true;
+                _huntLastSeenTargetPos = _playerTarget.position;
+            }
+            else
+            {
+                _huntNoLosTimer += Time.deltaTime;
+                if (!_huntHasLastSeenTarget || Vector3.Distance(_huntLastSeenTargetPos, _playerTarget.position) > 1.25f)
+                {
+                    _huntHasLastSeenTarget = true;
+                    _huntLastSeenTargetPos = _playerTarget.position;
+                }
+            }
+            float horizVel = _cc != null ? new Vector3(_cc.velocity.x, 0f, _cc.velocity.z).magnitude : 0f;
+            if (horizVel > 0.35f) _lastHuntMoveTime = Time.time;
+
+            // Hunt mobility contract: if stalled while target is valid, force movement.
+            bool stalledHunt = Time.time - _lastHuntMoveTime > 1.2f;
+            if (stalledHunt && Time.time - _lastCombatRepositionTime > 0.6f)
+            {
+                _lastCombatRepositionTime = Time.time;
+                if (hasLosNow)
+                {
+                    // LOS + stalled: side-step corridor to break dead-zones.
+                    Vector3 toTargetFlat = _playerTarget.position - transform.position;
+                    toTargetFlat.y = 0f;
+                    if (toTargetFlat.sqrMagnitude < 0.05f) toTargetFlat = transform.forward;
+                    Vector3 side = Vector3.Cross(Vector3.up, toTargetFlat.normalized);
+                    if ((BotId & 1) == 0) side = -side;
+                    MoveToward(transform.position + side * 5f + toTargetFlat.normalized * 2f, _sprintSpeed);
+                }
+                else
+                {
+                    // No LOS + stalled: hard chase corridor.
+                    HandleNoLosChase(dist);
+                }
+                return;
+            }
 
             // ---- Cross-level shooting: always shoot if we have line of sight ----
-            if (onDifferentLevel && HasLineOfSight())
+            if (onDifferentLevel && hasLosNow)
             {
                 LookAtTarget(_playerTarget.position);
                 AimCamAtTarget();
@@ -195,7 +243,15 @@ namespace StraftatBots
             // Multi-level: graph handles this via jump/ladder edges — just MoveToward target
             if (onDifferentLevel)
             {
-                MoveToward(_playerTarget.position, _sprintSpeed);
+                if (hasLosNow) MoveToward(_playerTarget.position, _sprintSpeed);
+                else HandleNoLosChase(dist);
+                return;
+            }
+
+            // Same-level but no LOS: chase path forward/flank to reacquire instead of hard locking aim through walls.
+            if (!hasLosNow)
+            {
+                HandleNoLosChase(dist);
                 return;
             }
 
@@ -236,17 +292,19 @@ namespace StraftatBots
                 int envMask = GROUND_MASK;
                 string wn = _heldWeaponObj != null ? _heldWeaponObj.name.ToLower() : "";
                 bool isAPMine = wn.Contains("apmine") || wn.Contains("ap mine");
+                bool isStunMine = wn.Contains("stunmine") || wn.Contains("stun mine");
                 bool isProxMine = !isAPMine && (wn.Contains("proximit") || wn.Contains("proxy"));
-                bool isClaymore = wn.Contains("claymore");
+                bool isClaymore = !isStunMine && wn.Contains("claymore");
                 // Fallback: check spawner flags if name didn't match
-                if (!isAPMine && !isProxMine && !isClaymore && _heldWeaponObj != null)
+                if (!isAPMine && !isStunMine && !isProxMine && !isClaymore && _heldWeaponObj != null)
                 {
                     var sp = _heldWeaponObj.GetComponent<WeaponHandSpawner>();
                     if (sp != null)
                     {
                         isAPMine = ReadBoolField(sp, "apmine");
+                        isStunMine = !isAPMine && (ReadBoolField(sp, "stunMine") || ReadBoolField(sp, "isStunMine"));
                         isProxMine = !isAPMine && ReadBoolField(sp, "proximityMine");
-                        isClaymore = !isAPMine && !isProxMine && ReadBoolField(sp, "claymore");
+                        isClaymore = !isAPMine && !isStunMine && !isProxMine && ReadBoolField(sp, "claymore");
                     }
                 }
 
@@ -302,6 +360,23 @@ namespace StraftatBots
                     if (placed) State = BotState.FindWeapon;
                     return;
                 }
+                else if (isStunMine)
+                {
+                    // STUN MINE: ground placement near likely enemy route.
+                    Vector3 groundPos = transform.position + transform.forward * 1.3f;
+                    if (Physics.Raycast(groundPos + Vector3.up, Vector3.down, out RaycastHit groundHit, 5f, envMask, QueryTriggerInteraction.Ignore))
+                    {
+                        PlaceArmedItemAt(groundHit.point + Vector3.up * 0.02f, Quaternion.FromToRotation(Vector3.up, groundHit.normal));
+                        if (_heldWeapon != null && _heldWeapon.currentAmmo > 0)
+                        {
+                            _wanderChangeTimer = 0f;
+                            _hasWanderTarget = false;
+                            return;
+                        }
+                        State = BotState.FindWeapon;
+                    }
+                    return;
+                }
                 else if (isProxMine)
                 {
                     // PROXIMITY MINE: ground only, 1 ammo — place and drop
@@ -353,6 +428,16 @@ namespace StraftatBots
             {
                 SetShooting(false);
                 StopLean();
+                // Avoid point-blank grenade throws that look broken and self-sabotage.
+                if (dist < 8f)
+                {
+                    Vector3 away = transform.position - _playerTarget.position;
+                    away.y = 0f;
+                    if (away.sqrMagnitude < 0.01f) away = -transform.forward;
+                    away.Normalize();
+                    MoveToward(transform.position + away * 6f, _sprintSpeed);
+                    return;
+                }
                 if (dist > 25f)
                     MoveToward(_playerTarget.position, _sprintSpeed);
                 else
@@ -469,12 +554,12 @@ namespace StraftatBots
                     if (_cachedIsExplosiveWeapon && !_cachedIsBubbleLauncher)
                     {
                         SetShooting(false);
-                        MoveToward(transform.position + away * 10f, _sprintSpeed);
+                        MoveToward(transform.position + away * 6f, _walkSpeed * 1.15f);
                     }
                     else
                     {
                         SetShooting(true);
-                        MoveToward(transform.position + away * 3f, _walkSpeed);
+                        MoveToward(transform.position + away * 1.1f, _walkSpeed * 0.78f);
                         TryShoot();
                     }
                 }
@@ -509,6 +594,104 @@ namespace StraftatBots
                     TryShoot();
                 }
             }
+        }
+
+        private void HandleNoLosChase(float dist)
+        {
+            if (_playerTarget == null) return;
+
+            SetShooting(false);
+            StopLean();
+
+            // Bias hunt state toward forward pressure while LOS is broken.
+            _huntSubState = 1f;
+            _huntSubStateHold = Mathf.Max(_huntSubStateHold, 0.2f);
+
+            // Dynamic chase line: push toward last seen with small side changes so bots
+            // don't lock into a single wall-facing vector.
+            if (Time.time >= _huntNoLosSideSwitchTimer)
+            {
+                _huntNoLosSideSwitchTimer = Time.time + Random.Range(0.45f, 0.9f);
+                _huntNoLosSide = Random.value > 0.5f ? 1 : -1;
+            }
+
+            Vector3 anchor = _huntHasLastSeenTarget ? _huntLastSeenTargetPos : _playerTarget.position;
+            Vector3 toAnchor = anchor - transform.position;
+            toAnchor.y = 0f;
+
+            if (toAnchor.sqrMagnitude < 0.25f)
+            {
+                Vector3 toLiveTarget = _playerTarget.position - transform.position;
+                toLiveTarget.y = 0f;
+                if (toLiveTarget.sqrMagnitude > 0.01f)
+                    toAnchor = toLiveTarget;
+            }
+
+            if (toAnchor.sqrMagnitude < 0.01f)
+                toAnchor = transform.forward;
+
+            Vector3 forward = toAnchor.normalized;
+            Vector3 side = Vector3.Cross(Vector3.up, forward) * _huntNoLosSide;
+            float flank = dist > 18f ? 1.1f : 2.2f;
+            Vector3 chasePoint = anchor + side * flank;
+
+            // Keep hunt graph pressure even when LOS is broken so bots continue traversing
+            // navmesh corridors (jump/ladder routes) instead of repeatedly stalling nodeless.
+            TryBuildHuntGraphRoute(anchor);
+            MoveToward(chasePoint, _sprintSpeed);
+            LookAtDirection(forward);
+
+            if (_huntNoLosTimer > 1.0f)
+            {
+                // Encourage quick route refresh while LOS is broken.
+                _repathTimer = 0f;
+            }
+        }
+
+        private void TryBuildHuntGraphRoute(Vector3 anchor)
+        {
+            if (NavGraph.Instance == null || !NavGraph.Instance.HasData) return;
+            if (_onLadder || _ladderDismountTimer > 0f) return;
+            if (_nodelessLockTimer > 0.15f) return;
+
+            bool hasWorkingPath = _graphPath != null && _graphPath.Count > 1 && _graphPathIndex < _graphPath.Count;
+            if (hasWorkingPath && _repathTimer > 0.2f) return;
+
+            _repathTimer = 0.55f;
+            List<NavNode> path = null;
+
+            try
+            {
+                var playerNode = NavGraph.Instance.FindNearestPlayerNode(anchor, 55f)
+                    ?? NavGraph.Instance.FindNearestPlayerNode(transform.position, 45f);
+                if (playerNode != null)
+                {
+                    path = NavGraph.Instance.FindPath(transform.position, playerNode.Position,
+                        jitter: 0.05f, searchRadius: 60f, playerOnly: true, preferHeight: true);
+                    if (path == null || path.Count <= 1)
+                    {
+                        path = NavGraph.Instance.FindPath(transform.position, playerNode.Position,
+                            searchRadius: 60f, preferHeight: true);
+                    }
+                }
+
+                if ((path == null || path.Count <= 1) && _playerTarget != null)
+                {
+                    path = NavGraph.Instance.FindPath(transform.position, _playerTarget.position,
+                        searchRadius: 55f, preferHeight: true);
+                }
+
+                if (path != null && path.Count > 1)
+                {
+                    _graphPath = path;
+                    _graphPathIndex = 0;
+                    _noPathRecoveryStreak = 0;
+                    _lastReachedNode = null;
+                    _prevReachedNode = null;
+                    SwitchPathSource(PathSource.GraphRoute);
+                }
+            }
+            catch { }
         }
 
         /// <summary>
@@ -570,7 +753,7 @@ namespace StraftatBots
                     // Edge check on dodge direction
                     if (_cc.isGrounded && IsEdgeAhead(dodgeMove, 1.5f))
                         dodgeMove = -dodgeMove;
-                    DoMove((dodgeMove * _sprintSpeed * 1.5f + Vector3.up * _verticalVelocity) * Time.deltaTime);
+                    DoMove((dodgeMove * _sprintSpeed * 1.15f + Vector3.up * _verticalVelocity) * Time.deltaTime);
                     return;
                 }
             }
@@ -580,21 +763,21 @@ namespace StraftatBots
             if (_strafeSwitchTimer <= 0f)
             {
                 _strafeDir = -_strafeDir;
-                _strafeSwitchTimer = Random.Range(3.5f, 6.5f);
+                _strafeSwitchTimer = Random.Range(4.8f, 7.5f);
             }
 
             // Smooth approach factor: continuous function of distance instead of 3 discrete steps.
             // Pushes back when too close, holds ground around ~10m, leans in when far.
-            // dist<=6 -> -0.3, dist==10 -> +0.15, dist>=18 -> +0.7 (monotonic, smooth).
+            // dist<=6 -> -0.04, dist==10 -> +0.16, dist>=18 -> +0.52 (monotonic, smooth).
             float approachTarget;
-            if (dist <= 6f) approachTarget = -0.3f;
-            else if (dist >= 18f) approachTarget = 0.7f;
-            else if (dist < 10f) approachTarget = Mathf.Lerp(-0.3f, 0.15f, (dist - 6f) / 4f);
-            else approachTarget = Mathf.Lerp(0.15f, 0.7f, (dist - 10f) / 8f);
+            if (dist <= 6f) approachTarget = -0.04f;
+            else if (dist >= 18f) approachTarget = 0.52f;
+            else if (dist < 10f) approachTarget = Mathf.Lerp(-0.04f, 0.16f, (dist - 6f) / 4f);
+            else approachTarget = Mathf.Lerp(0.16f, 0.52f, (dist - 10f) / 8f);
             // Low-pass the approach factor so tiny distance wobble can't flip the sign between frames
-            _smoothedApproach = Mathf.Lerp(_smoothedApproach, approachTarget, 1f - Mathf.Exp(-7.5f * Time.deltaTime));
+            _smoothedApproach = Mathf.Lerp(_smoothedApproach, approachTarget, 1f - Mathf.Exp(-5.5f * Time.deltaTime));
 
-            Vector3 strafeDir = (right * _strafeDir * 0.3f + toTarget * _smoothedApproach).normalized;
+            Vector3 strafeDir = (right * _strafeDir * 0.14f + toTarget * _smoothedApproach).normalized;
 
             // Wall slide via collision feedback
             _collisionTimer -= Time.deltaTime;
@@ -641,7 +824,7 @@ namespace StraftatBots
             }
 
             // Jump/slide when stuck against wall during combat
-            if (_cc.isGrounded && !_isSliding && _stuckTimer > 0.5f && strafeDir.sqrMagnitude > 0.01f)
+            if (_cc.isGrounded && !_isSliding && _stuckTimer > 1.0f && strafeDir.sqrMagnitude > 0.01f)
             {
                 var cObs = CheckObstructions(strafeDir, 1.2f);
 
@@ -665,7 +848,8 @@ namespace StraftatBots
             UpdateLean(toTarget, right);
             UpdateCombatCrouch();
 
-            float speed = _isCrouching ? _walkSpeed : _walkSpeed * 1.2f;
+            // Lower strafe speed for more human-looking combat movement.
+            float speed = _isCrouching ? _walkSpeed * 0.72f : _walkSpeed * 0.82f;
 
             // Smooth the final move vector between frames. Time-constant ~0.1s — fast enough
             // to stay responsive to dodges/edge checks but enough to kill single-frame direction
@@ -1773,6 +1957,9 @@ namespace StraftatBots
                 Vector3 targetPos = _playerTarget.position + Vector3.up * 1f;
                 Vector3 dir = (targetPos - origin).normalized;
                 float throwForce = 12f;
+                string heldWeaponName = _heldBehaviour != null ? _heldBehaviour.weaponName : (_heldWeaponObj != null ? _heldWeaponObj.name : "");
+                bool isGlandGrenade = !string.IsNullOrWhiteSpace(heldWeaponName)
+                    && heldWeaponName.IndexOf("gland", System.StringComparison.OrdinalIgnoreCase) >= 0;
 
                 // Try to find projectile prefab from DualLauncher or weapon fields
                 GameObject prefab = null;
@@ -1829,11 +2016,17 @@ namespace StraftatBots
                     int envCheck = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 8) | (1 << 9);
                     if (Physics.Raycast(origin, dir, 6f, envCheck, QueryTriggerInteraction.Ignore))
                     {
-                        Plugin.Log.LogInfo($"[{BotName}] Cancelled grenade throw — wall within 6m");
-                        DropWeapon();
+                        // Do not drop the grenade when close to a wall; back off and retry next tick.
+                        Plugin.Log.LogInfo($"[{BotName}] Delayed grenade throw — wall within 6m");
+                        Vector3 away = transform.position - _playerTarget.position;
+                        away.y = 0f;
+                        if (away.sqrMagnitude < 0.01f) away = -transform.forward;
+                        away.Normalize();
+                        MoveToward(transform.position + away * 4f, _sprintSpeed);
                         return;
                     }
-                    origin = origin + dir * 5f;
+                    // Keep projectile in front of bot, but don't overshoot spawn into geometry.
+                    origin = origin + dir * 1.25f + Vector3.up * 0.2f;
                 }
 
                 // Instantiate grenade
@@ -1931,7 +2124,16 @@ namespace StraftatBots
                 // Add launch force
                 var rb = grenadeObj.GetComponent<Rigidbody>();
                 if (rb != null)
-                    rb.AddForce(dir * throwForce, ForceMode.Impulse);
+                {
+                    Vector3 launchDir = dir;
+                    if (isGlandGrenade)
+                    {
+                        // Gland was dropping short; bias upward and increase impulse a bit.
+                        launchDir = (dir + Vector3.up * 0.28f).normalized;
+                        throwForce *= 1.12f;
+                    }
+                    rb.AddForce(launchDir * throwForce, ForceMode.Impulse);
+                }
 
                 string grenadeWeaponName = _heldBehaviour != null ? _heldBehaviour.weaponName : prefab.name;
                 foreach (var comp in grenadeObj.GetComponents<MonoBehaviour>())
@@ -2236,6 +2438,23 @@ namespace StraftatBots
             }
             catch { }
 
+            bool isGlandGrenade = !string.IsNullOrWhiteSpace(weaponName)
+                && weaponName.IndexOf("gland", System.StringComparison.OrdinalIgnoreCase) >= 0;
+
+            // Safety bounds: reflected values can be garbage when prefab fields differ.
+            // Keep fallback explosion in sane gameplay range.
+            explosionRadius = Mathf.Clamp(explosionRadius, 0.5f, 8f);
+            damage = Mathf.Clamp(damage, 1f, 200f);
+            ragdollForce = Mathf.Clamp(ragdollForce, 1f, 120f);
+            if (isGlandGrenade)
+            {
+                // Gland grenade fallback was over-reaching in bot-thrown edge cases.
+                // Keep it tighter than generic grenade fallback.
+                explosionRadius = Mathf.Min(explosionRadius, 3.25f);
+                damage = Mathf.Min(damage, 65f);
+                ragdollForce = Mathf.Min(ragdollForce, 55f);
+            }
+
             Plugin.Log.LogInfo($"[{BotName}] ForceGrenadeExplosion at {pos}, radius={explosionRadius}");
 
             int bodyLayer = (1 << 11);
@@ -2247,16 +2466,38 @@ namespace StraftatBots
                 if (ph == null || ph.isKilled || handled.Contains(ph)) continue;
                 handled.Add(ph);
 
+                // Strict per-target radius check from body center.
+                Vector3 targetPoint = ph.transform.position + Vector3.up * 0.8f;
+                Vector3 blastOrigin = pos + Vector3.up * 0.1f;
+                float dist = Vector3.Distance(blastOrigin, targetPoint);
+                if (dist > explosionRadius) continue;
+
+                // Explosion occlusion: if wall blocks line to target, skip damage/stun.
+                Vector3 toTarget = targetPoint - blastOrigin;
+                if (toTarget.sqrMagnitude > 0.0001f)
+                {
+                    if (Physics.Raycast(blastOrigin, toTarget.normalized, out RaycastHit blockHit, dist, WALL_MASK, QueryTriggerInteraction.Ignore))
+                    {
+                        var blockedPh = blockHit.collider != null ? blockHit.collider.GetComponentInParent<PlayerHealth>() : null;
+                        if (blockedPh != ph) continue;
+                    }
+                }
+
                 if (isStunGrenade)
                 {
                     try { ph.TaserEnemy(ph, stunTime); } catch { }
                     continue;
                 }
 
+                // Linear falloff by distance so outer-edge hits aren't full lethal.
+                float falloff = 1f - Mathf.Clamp01(dist / explosionRadius);
+                float minEdgeDamageScale = isGlandGrenade ? 0.15f : 0.35f;
+                float appliedDamage = Mathf.Max(1f, damage * Mathf.Lerp(minEdgeDamageScale, 1f, falloff));
+
                 try { ph.SetKiller(transform); } catch { ph.killer = transform; }
                 float previousHealth = ph.health;
-                try { ph.RemoveHealth(damage); } catch { ph.health -= damage; }
-                if (previousHealth - damage > 0f && ph.health > 0f) continue;
+                try { ph.RemoveHealth(appliedDamage); } catch { ph.health -= appliedDamage; }
+                if (previousHealth - appliedDamage > 0f && ph.health > 0f) continue;
 
                 ph.isKilled = true;
                 ph.isShot = true;
@@ -2278,8 +2519,7 @@ namespace StraftatBots
                 {
                     try
                     {
-                        int pid = ph.playerValues.playerClient.PlayerId;
-                        BotDamageSync.SyncKill(pid, BotName, weaponName, false,
+                        BotDamageSync.SyncKill(ph, BotName, weaponName, false,
                             killDir, ragdollForce, pos, ph.gameObject.name);
                     }
                     catch { }
@@ -2554,9 +2794,8 @@ namespace StraftatBots
                         {
                             try
                             {
-                                int pid = ph.playerValues.playerClient.PlayerId;
                                 string wpn = _heldBehaviour != null ? _heldBehaviour.weaponName : "weapon";
-                                BotDamageSync.SyncKill(pid, BotName, wpn, headshot,
+                                BotDamageSync.SyncKill(ph, BotName, wpn, headshot,
                                     boxDir, _heldWeapon.ragdollEjectForce, bh.transform.position, bh.gameObject.name);
                             }
                             catch { }
@@ -2671,9 +2910,8 @@ namespace StraftatBots
                                     // Sync to non-host clients via Mycelium.
                                     try
                                     {
-                                        int pid = ph.playerValues.playerClient.PlayerId;
                                         string wpn = _heldBehaviour != null ? _heldBehaviour.weaponName : "weapon";
-                                        BotDamageSync.SyncKill(pid, BotName, wpn, headshot,
+                                        BotDamageSync.SyncKill(ph, BotName, wpn, headshot,
                                             dir, _heldWeapon.ragdollEjectForce, hit.point, hit.collider.gameObject.name);
                                     }
                                     catch { }
@@ -2909,10 +3147,9 @@ namespace StraftatBots
                         // Human victim — sync to non-host clients via Mycelium
                         try
                         {
-                            int pid = ph.playerValues.playerClient.PlayerId;
                             Vector3 meleeDir = (ph.transform.position - transform.position).normalized;
                             string wpn = _heldBehaviour != null ? _heldBehaviour.weaponName : "melee";
-                            BotDamageSync.SyncKill(pid, BotName, wpn, false,
+                            BotDamageSync.SyncKill(ph, BotName, wpn, false,
                                 meleeDir, 30f, ph.transform.position, "Torso");
                         }
                         catch { }

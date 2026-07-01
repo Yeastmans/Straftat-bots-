@@ -28,7 +28,7 @@ namespace StraftatBots
 
             // Short session — bots retry from a fresh angle instead of brute-forcing
             // the same approach for minutes at a time.
-            _exploreTotalTimer = 12f;
+            _exploreTotalTimer = 20f;
 
             // Seed a node at the explore start point — marks this as reachable
             // so future pathfinding has a proven anchor even on sparse maps.
@@ -44,13 +44,17 @@ namespace StraftatBots
         private void SeedExploreNode(Vector3 pos, bool highConfidence = false)
         {
             if (NavGraph.Instance == null) return;
-            // force:true so Play-mode bots can still seed during Explore
+            // Only seed from a stable grounded stance — a bot mid-air, mid-slide, or
+            // falling is NOT proof the spot is a usable standing position. This stops
+            // SmartExplore's "got closer" heuristic from planting phantom anchors.
+            if (_cc == null || !_cc.isGrounded || _isSliding) return;
+            // force:true so Play-mode bots can still seed (we now learn during Play too).
             var node = NavGraph.Instance.AddPosition(pos, isPlayer: false, force: true);
-            if (node != null && highConfidence)
-            {
-                node.Confidence = Mathf.Max(node.Confidence, 0.7f);
-                node.VisitCount = Mathf.Max(node.VisitCount, 3);
-            }
+            // Bot-discovered nodes stay low-trust CANDIDATES — they must be validated like
+            // any other bot data before bots rely on them. We no longer force high
+            // confidence from a distance heuristic. (highConfidence kept for signature
+            // compatibility; intentionally a no-op now.)
+            if (node != null && node.VisitCount < 1) node.VisitCount = 1;
         }
 
         private void PickNextExploreState(Vector3 target)
@@ -122,6 +126,85 @@ namespace StraftatBots
                 case ExploreState.EdgeWalk:      ExploreEdgeWalk(target); break;
                 case ExploreState.FrontierWalk:  ExploreFrontierWalk(target); break;
             }
+        }
+
+        private bool TryCommitExploreRoute(Vector3 target, out Vector3 routeEnd)
+        {
+            routeEnd = target;
+            if (NavGraph.Instance == null || !NavGraph.Instance.HasData) return false;
+
+            List<NavNode> bestPath = null;
+            float bestScore = float.MinValue;
+            Vector3 bestEnd = target;
+
+            void Consider(List<NavNode> path, Vector3 scoreTarget)
+            {
+                if (path == null || path.Count <= 1) return;
+                float score = ScorePathCandidate(path, scoreTarget);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestPath = path;
+                    bestEnd = scoreTarget;
+                }
+            }
+
+            bool wantsHeight = Mathf.Abs(target.y - transform.position.y) > 2.25f;
+            Consider(NavGraph.Instance.FindPath(transform.position, target,
+                jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight), target);
+            Consider(NavGraph.Instance.FindPath(transform.position, target,
+                jitter: 0.04f, searchRadius: 90f, playerOnly: true, preferHeight: wantsHeight), target);
+
+            // If the exact target is not connected, route to the closest reachable
+            // staging node near it instead of walking directly into geometry.
+            if (bestPath == null)
+            {
+                NavNode staging = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
+                if (staging != null && HorizontalDist(transform.position, staging.Position) > 2f)
+                {
+                    Consider(NavGraph.Instance.FindPath(transform.position, staging.Position,
+                        jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight), staging.Position);
+                }
+            }
+
+            if (bestPath == null) return false;
+
+            routeEnd = bestEnd;
+            AcceptGraphRoute(bestPath, PathSource.ExploreBuildRoute, routeEnd, bestScore);
+            _lastPathTarget = routeEnd;
+            _repathTimer = Mathf.Max(_repathTimer, 1.75f);
+            _lastReachedNode = null;
+            _prevReachedNode = null;
+            return true;
+        }
+
+        private bool TryAssignExploreTarget(Vector3 target, float commitment, bool requireRoute)
+        {
+            if (target == Vector3.zero) return false;
+
+            if (TryCommitExploreRoute(target, out Vector3 routeEnd))
+            {
+                _wanderTarget = routeEnd;
+                _hasWanderTarget = true;
+                _wanderChangeTimer = commitment;
+                return true;
+            }
+
+            bool graphReady = NavGraph.Instance != null && NavGraph.Instance.HasData;
+            float flatDist = HorizontalDist(transform.position, target);
+            float heightDist = Mathf.Abs(target.y - transform.position.y);
+
+            // With graph data present, far/high targets should never be assigned as
+            // raw direct movement. Those are exactly the cases that need complex
+            // jump/ladder routes, so skip them if no corridor is found.
+            if (requireRoute || (graphReady && (flatDist > 18f || heightDist > 3.5f)))
+                return false;
+
+            _wanderTarget = target;
+            _hasWanderTarget = true;
+            _wanderChangeTimer = commitment;
+            SwitchPathSource(PathSource.ExploreBuildRoute);
+            return true;
         }
 
         // ---- HeightSeek: find ladders, ramps, ledges, or controlled drops ----
@@ -339,8 +422,8 @@ namespace StraftatBots
             if (_probeTarget == Vector3.zero && !_probeJumpAttempted)
             {
                 float bestScore = float.MaxValue;
-                float[] angles = { 0f, 15f, -15f, 30f, -30f };
-                float[] distances = { 3f, 5f, 7f, 9f };
+                float[] angles = { 0f, 12f, -12f, 25f, -25f, 40f, -40f, 55f, -55f };
+                float[] distances = { 3f, 5f, 7f, 9f, 11f, 13f };
 
                 foreach (float angle in angles)
                 {
@@ -354,7 +437,7 @@ namespace StraftatBots
                             float horizDist = new Vector3(hit.point.x - pos.x, 0, hit.point.z - pos.z).magnitude;
 
                             // Check within jump envelope
-                            bool jumpable = horizDist < 12f && heightGain < 1.8f && heightGain > -8f;
+                            bool jumpable = horizDist < 14f && heightGain < 2.3f && heightGain > -9f;
                             if (!jumpable) continue;
 
                             // Score: prefer closer to target
@@ -397,6 +480,9 @@ namespace StraftatBots
                 // At edge — jump toward platform
                 _probeJumpAttempted = true;
                 TryJump(JumpReason.EdgeAhead, jumpDir, intentionalTime: 1.5f);
+                // Do NOT pre-create a Jump edge here — the bot has not landed yet.
+                // If the jump actually succeeds, RecordBot's landing logic creates the
+                // edge from a real takeoff->landing. Pre-seeding made jump edges into the void.
             }
             else
             {
@@ -526,6 +612,95 @@ namespace StraftatBots
 
         // ===================== WANDER =====================
 
+        private void HandleTrainingValidation()
+        {
+            if (NavGraph.Instance == null || !NavGraph.Instance.HasData)
+            {
+                Wander();
+                return;
+            }
+
+            bool routeActive = _validationRouteNodeIds.Count > 1
+                && _graphPath.Count > 0
+                && _graphPathIndex < _graphPath.Count;
+
+            if (routeActive)
+            {
+                _validationRouteTimer += Time.deltaTime;
+                float distToTarget = HorizontalDist(transform.position, _validationRouteTarget);
+
+                // Only CONFIRM a route the bot actually walked to the end while grounded —
+                // not one it drifted toward or fell near. And credit ONLY the edges it
+                // genuinely traversed (the reached prefix), never edges it skipped/fell past.
+                bool standing = _cc.isGrounded && !_isSliding && _intentionalJumpTimer <= 0f && _verticalVelocity > -2f;
+                bool reachedEnd = _graphPathIndex >= _graphPath.Count - 1;
+                if (standing && (reachedEnd || distToTarget < 1.5f))
+                {
+                    int reached = Mathf.Clamp(_graphPathIndex + 1, 0, _validationRouteNodeIds.Count);
+                    if (reached >= 2)
+                        NavGraph.Instance.ReportRouteValidation(
+                            _validationRouteNodeIds.GetRange(0, reached), success: true, _validationRouteLabel);
+                    _validationRouteNodeIds.Clear();
+                    _validationRouteTimer = 0f;
+                    _hasWanderTarget = false;
+                    _graphPath.Clear();
+                    _graphPathIndex = 0;
+                    return;
+                }
+
+                if (_validationRouteTimer > 24f || _progressState == ProgressState.HardStuck || _stuckTimer > 2.4f)
+                {
+                    string routeLabel = string.IsNullOrWhiteSpace(_validationRouteLabel) ? "route" : _validationRouteLabel;
+                    NavGraph.Instance.ReportRouteValidation(_validationRouteNodeIds, success: false,
+                        $"{BotName} stuck validating {routeLabel}");
+                    NavGraph.Instance.SuppressValidationLabel(routeLabel, 18f,
+                        $"PATH FOLLOWER FAILED: {routeLabel}. Bots are trying alternate validation routes.");
+                    if (_graphPathIndex > 0 && _graphPathIndex < _graphPath.Count)
+                    {
+                        int fromId = _graphPath[Mathf.Max(0, _graphPathIndex - 1)].Id;
+                        int toId = _graphPath[_graphPathIndex].Id;
+                        var edge = NavGraph.Instance.GetEdgeBetween(fromId, toId);
+                        if (edge != null) NavGraph.Instance.ReportEdgeValidation(edge, success: false);
+                    }
+                    _validationRouteNodeIds.Clear();
+                    _validationRouteTimer = 0f;
+                    _hasWanderTarget = false;
+                    _graphPath.Clear();
+                    _graphPathIndex = 0;
+                    _stuckTimer = 0f;
+                    return;
+                }
+
+                MoveToward(_validationRouteTarget, _sprintSpeed);
+                return;
+            }
+
+            if (NavGraph.Instance.TryGetValidationRoute(transform.position, BotId,
+                out Vector3 target, out List<NavNode> route, out string label))
+            {
+                _graphPath = route;
+                _graphPathIndex = 0;
+                _lastReachedNode = null;
+                _prevReachedNode = null;
+                _validationRouteNodeIds.Clear();
+                for (int i = 0; i < route.Count; i++)
+                    _validationRouteNodeIds.Add(route[i].Id);
+                _validationRouteTarget = target;
+                _validationRouteLabel = label ?? "Route";
+                _validationRouteTimer = 0f;
+                _wanderTarget = target;
+                _hasWanderTarget = true;
+                _wanderChangeTimer = 18f;
+                SwitchPathSource(PathSource.GraphRoute);
+                MoveToward(_validationRouteTarget, _sprintSpeed);
+                return;
+            }
+
+            // No certifiable route exists yet. Fall back to route-first exploration to
+            // gather more candidate data, but do not mark random movement validated.
+            Wander();
+        }
+
         private void Wander()
         {
             _wanderChangeTimer -= Time.deltaTime;
@@ -547,7 +722,7 @@ namespace StraftatBots
             if (_exploreState != ExploreState.None)
             {
                 _exploreTotalTimer -= Time.deltaTime;
-                if (_exploreTotalTimer <= 0f || _exploreStateAttempts >= 4)
+                if (_exploreTotalTimer <= 0f || _exploreStateAttempts >= 7)
                 {
                     _exploreState = ExploreState.None;
                     _stuckTimer = 0f;
@@ -639,11 +814,11 @@ namespace StraftatBots
                                 targetPos = gh.point;
                             }
                         }
-                        _wanderTarget = targetPos;
-                        _hasWanderTarget = true;
-                        _wanderChangeTimer = Random.Range(12f, 20f) * commitmentMultiplier;
-                        Plugin.Log.LogInfo($"[{BotName}] Popped frontier cell (avoid dir={avoidDir})");
-                        goto doneWanderPick;
+                        if (TryAssignExploreTarget(targetPos, Random.Range(12f, 20f) * commitmentMultiplier, requireRoute: false))
+                        {
+                            Plugin.Log.LogInfo($"[{BotName}] Popped frontier cell (avoid dir={avoidDir})");
+                            goto doneWanderPick;
+                        }
                     }
 
                     float roll = stale ? 0.85f : Random.value; // Stale = skip to distant spawns
@@ -655,10 +830,8 @@ namespace StraftatBots
                         var cov = NavGraph.Instance.GetLowestVisitReachableCell(transform.position, 60f);
                         if (cov.HasValue)
                         {
-                            _wanderTarget = cov.Value;
-                            _hasWanderTarget = true;
-                            _wanderChangeTimer = Random.Range(10f, 18f) * commitmentMultiplier;
-                            goto doneWanderPick;
+                            if (TryAssignExploreTarget(cov.Value, Random.Range(10f, 18f) * commitmentMultiplier, requireRoute: true))
+                                goto doneWanderPick;
                         }
                         roll = 0.4f; // fall through to map locations
                     }
@@ -669,9 +842,8 @@ namespace StraftatBots
                         var (unreachPos, unreachLabel) = NavGraph.Instance.FindUnreachableMapLocation(transform.position);
                         if (unreachPos != Vector3.zero)
                         {
-                            _wanderTarget = unreachPos;
-                            _hasWanderTarget = true;
-                            _wanderChangeTimer = Random.Range(15f, 25f) * commitmentMultiplier; // Very long commitment
+                            if (!TryAssignExploreTarget(unreachPos, Random.Range(15f, 25f) * commitmentMultiplier, requireRoute: false))
+                                roll = 0.55f;
                         }
                         else roll = 0.55f;
                     }
@@ -683,9 +855,8 @@ namespace StraftatBots
                             avoidPos: otherBotsAvg, exploredCells: _exploredCells);
                         if (frontier != null)
                         {
-                            _wanderTarget = frontier.Position;
-                            _hasWanderTarget = true;
-                            _wanderChangeTimer = Random.Range(10f, 18f) * commitmentMultiplier;
+                            if (!TryAssignExploreTarget(frontier.Position, Random.Range(10f, 18f) * commitmentMultiplier, requireRoute: true))
+                                roll = 0.85f;
                         }
                         else roll = 0.85f;
                     }
@@ -708,26 +879,35 @@ namespace StraftatBots
                                 float score = selfDist + otherDist * 0.5f; // Prefer far from everyone
                                 if (score > bestScore) { bestScore = score; best = sp; }
                             }
-                            _wanderTarget = best != null ? best.transform.position :
+                            Vector3 spawnTarget = best != null ? best.transform.position :
                                 spawns[Random.Range(0, spawns.Length)].transform.position;
+                            if (!TryAssignExploreTarget(spawnTarget, Random.Range(12f, 20f) * commitmentMultiplier, requireRoute: false))
+                                _hasWanderTarget = false;
                         }
                         else
                         {
                             Vector3 randomDir = new Vector3(Random.Range(-1f, 1f), 0, Random.Range(-1f, 1f)).normalized;
-                            _wanderTarget = transform.position + randomDir * Random.Range(15f, 40f);
+                            TryAssignExploreTarget(transform.position + randomDir * Random.Range(15f, 40f),
+                                Random.Range(12f, 20f) * commitmentMultiplier, requireRoute: false);
                         }
-                        _hasWanderTarget = true;
-                        _wanderChangeTimer = Random.Range(12f, 20f); // Long commitment
+                    }
+                    if (!_hasWanderTarget)
+                    {
+                        Vector3 localDir = new Vector3(Random.Range(-1f, 1f), 0, Random.Range(-1f, 1f)).normalized;
+                        if (localDir.sqrMagnitude < 0.01f) localDir = transform.forward;
+                        TryAssignExploreTarget(transform.position + localDir * Random.Range(8f, 14f),
+                            Random.Range(8f, 12f) * commitmentMultiplier, requireRoute: false);
                     }
                     doneWanderPick: ;
                 }
                 else
                 {
-                    // Play mode: use reachable map locations with unbroken paths first
+                    // Play mode: still learn aggressively; prefer reachable routes but keep
+                    // frontier/coverage pressure so bots continue discovering complex traversals.
                     float roll2 = Random.value;
 
-                    // 60% — follow unbroken path to a reachable map location (weapon/spawn)
-                    if (roll2 < 0.6f && NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    // 45% — follow unbroken path to a reachable map location (weapon/spawn)
+                    if (roll2 < 0.45f && NavGraph.Instance != null && NavGraph.Instance.HasData)
                     {
                         var (locPos, locLabel, locPath) = NavGraph.Instance.FindReachableMapLocation(transform.position);
                         if (locPath.Count > 0)
@@ -742,8 +922,21 @@ namespace StraftatBots
                         else roll2 = 0.7f;
                     }
 
+                    // 25% — push frontier in play mode too (continuous learning)
+                    if (roll2 >= 0.45f && roll2 < 0.7f && NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    {
+                        var frontier = NavGraph.Instance.FindFrontierNode(transform.position, 5f, avoidPos: otherBotsAvg, exploredCells: _exploredCells);
+                        if (frontier != null)
+                        {
+                            _wanderTarget = frontier.Position;
+                            _hasWanderTarget = true;
+                            _wanderChangeTimer = Random.Range(9f, 16f) * commitmentMultiplier;
+                        }
+                        else roll2 = 0.78f;
+                    }
+
                     // 20% — go to nearest weapon (direct)
-                    if (roll2 >= 0.6f && roll2 < 0.8f)
+                    if (roll2 >= 0.7f && roll2 < 0.9f)
                     {
                         ItemBehaviour nearestWeapon = FindNearestWeapon();
                         if (nearestWeapon != null)
@@ -754,8 +947,8 @@ namespace StraftatBots
                         else roll2 = 0.9f;
                     }
 
-                    // 20% — explore spawn points
-                    if (roll2 >= 0.8f || !_hasWanderTarget)
+                    // 10% — explore spawn points
+                    if (roll2 >= 0.9f || !_hasWanderTarget)
                     {
                         SpawnPoint[] spawns = GetCachedSpawns();
                         if (spawns.Length > 0)

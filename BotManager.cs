@@ -16,6 +16,9 @@ namespace StraftatBots
         private GameObject _cachedPrefab;
         private float _onlyBotsAliveTimer;
         private float _stuckRoundTimer;
+        private float _botWinConfirmTimer;
+        private bool _takeAdvancePending;
+        private float _takeAdvancePendingTimer;
 
         // Cached reflection
         private static FieldInfo _wfdFieldCache;
@@ -47,6 +50,13 @@ namespace StraftatBots
         {
             if (!FishNet.InstanceFinder.IsServer) return;
             if (_activeBots.Count == 0 || GameManager.Instance == null) return;
+
+            if (_takeAdvancePending)
+            {
+                _takeAdvancePendingTimer -= Time.deltaTime;
+                if (_takeAdvancePendingTimer <= 0f)
+                    _takeAdvancePending = false;
+            }
 
             // NavGraph periodic validation — self-throttled (2s interval, 40-node batch).
             // Safe to call every frame; also runs in training mode since we want the
@@ -107,10 +117,16 @@ namespace StraftatBots
             // Draw timer: if only bots are alive (all humans dead), force a draw after 25 seconds
             bool anyHumanAlive = false;
             bool anyBotAlive = false;
+            int aliveBotCount = 0;
+            BotController lastAliveBot = null;
             foreach (var bot in _activeBots)
             {
                 if (bot != null && !bot.IsDead)
+                {
                     anyBotAlive = true;
+                    aliveBotCount++;
+                    lastAliveBot = bot;
+                }
             }
             // Check alive players via GameManager instead of FindObjectsOfType
             if (GameManager.Instance.alivePlayers.Count > 0)
@@ -125,10 +141,29 @@ namespace StraftatBots
                     if (!isBot) { anyHumanAlive = true; break; }
                 }
             }
+            if (anyHumanAlive && !HasLivingHumanPlayerHealth())
+                anyHumanAlive = false;
 
             // Training mode: never end the round — bots need uninterrupted time
             bool trainingMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
             if (trainingMode) return;
+
+            if (!anyHumanAlive && aliveBotCount == 1)
+            {
+                _onlyBotsAliveTimer = 0f;
+                _stuckRoundTimer = 0f;
+                _botWinConfirmTimer += 0.5f;
+                // Let the normal round-end flow run first; only force progression
+                // if the game stalls with one surviving bot for several seconds.
+                if (_botWinConfirmTimer >= 5f)
+                {
+                    _botWinConfirmTimer = 0f;
+                    ProgressTakeForBotWinner(lastAliveBot);
+                }
+                return;
+            }
+
+            _botWinConfirmTimer = 0f;
 
             // Nobody alive at all — round is stuck, force progression
             if (!anyHumanAlive && !anyBotAlive)
@@ -137,38 +172,16 @@ namespace StraftatBots
                 if (_stuckRoundTimer >= 5f)
                 {
                     _stuckRoundTimer = 0f;
-                    Plugin.Log.LogInfo("[BOT] No one alive for 5s, forcing round end");
+                    Plugin.Log.LogInfo("[BOT] No one alive for 5s, forcing draw resolution");
                     try
                     {
-                        // Credit score to host team
-                        int hostTeamId = ScoreManager.Instance.GetTeamId(0);
-                        ScoreManager.Instance.AddRoundScore(hostTeamId);
-
-                        // Clear stuck waitForDrawCoroutine
-                        if (_wfdFieldCache == null) _wfdFieldCache = typeof(GameManager).GetField("waitForDrawCoroutine",
-                            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                        if (_wfdFieldCache != null) _wfdFieldCache.SetValue(GameManager.Instance, null);
-
-                        // Repopulate alivePlayers
+                        // True draw behavior: no score award, let WaitForDraw decide.
                         GameManager.Instance.alivePlayers.Clear();
-                        foreach (var ci in ClientInstance.playerInstances.Values)
-                            GameManager.Instance.alivePlayers.Add(ci.PlayerId);
-
-                        bool isRoundWon = ScoreManager.Instance.CheckForRoundWin(out int winningTeamId);
-                        if (isRoundWon)
-                        {
-                            ScoreManager.Instance.ResetRound();
-                            ScoreManager.Instance.AddPoints(winningTeamId);
-                            SceneMotor.Instance.ChangeNetworkScene();
-                        }
-                        else
-                        {
-                            GameManager.Instance.ProgressToNextTake();
-                        }
+                        StartFreshWaitForDraw();
                     }
                     catch (System.Exception e)
                     {
-                        Plugin.Log.LogWarning($"[BOT] Force round end error: {e.Message}");
+                        Plugin.Log.LogWarning($"[BOT] Force draw resolve error: {e.Message}");
                         try { GameManager.Instance.ProgressToNextTake(); } catch { }
                     }
                 }
@@ -372,6 +385,15 @@ namespace StraftatBots
             {
                 ci.PlayerId = botData.PlayerId;
                 ci.PlayerName = botData.Name;
+                try
+                {
+                    // Several vanilla UI paths use PlayerNameTag (not PlayerName).
+                    // If this is empty, round/take winner text can show blank for bots.
+                    var tagField = typeof(ClientInstance).GetField("PlayerNameTag",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+                    if (tagField != null) tagField.SetValue(ci, botData.Name);
+                }
+                catch { }
                 ci.ConnectionID = -1 - botData.BotId; // Fake negative connection IDs
 
                 // Add to the global player registry
@@ -504,6 +526,14 @@ namespace StraftatBots
                 // Activate
                 botObj.SetActive(true);
 
+                var controller = botObj.GetComponent<BotController>();
+                if (controller == null)
+                    controller = botObj.AddComponent<BotController>();
+                controller.BotId = botData.BotId;
+                controller.BotName = botData.Name;
+                controller.PlayerId = botData.PlayerId;
+                controller.RefreshVisualSerial();
+
                 // Disable components that need a real player client
                 DisableBotComponents(botObj);
 
@@ -522,15 +552,15 @@ namespace StraftatBots
                 foreach (Transform child in botObj.transform)
                     SetLayerRecursive(child.gameObject, 11);
 
-                // Apply all cosmetics (suit + hat + cig) directly — no RPC needed on host
+                // Apply cosmetics (suit + cig) directly — no RPC needed on host
                 ApplyAllCosmetics(botObj, botData);
 
                 // Set name tag
                 SetNameTag(botObj, botData.Name);
 
-                // Sync skin + hat + cig to non-host clients via Mycelium
+                // Sync skin + cig to non-host clients via Mycelium (hats disabled).
                 if (nob != null)
-                    StartCoroutine(DelaySkinSync((int)nob.ObjectId, botData.SuitIndex, botData.HatIndex, botData.CigIndex));
+                    StartCoroutine(DelaySkinSync((int)nob.ObjectId, controller.VisualSerial, botData.SuitIndex, -1, botData.CigIndex));
 
                 // Ensure graphics are enabled
                 var ph = botObj.GetComponent<PlayerHealth>();
@@ -595,13 +625,147 @@ namespace StraftatBots
             foreach (var kc in botObj.GetComponentsInChildren<KillCam>(true)) kc.enabled = false;
         }
 
-        private System.Collections.IEnumerator DelaySkinSync(int netId, int suitIndex, int hatIndex = -1, int cigIndex = 0)
+        private System.Collections.IEnumerator DelaySkinSync(int netId, int visualSerial, int suitIndex, int hatIndex = -1, int cigIndex = 0)
         {
             // Wait for bot to exist on non-host clients, then send + retry
             yield return new WaitForSeconds(1.5f);
-            BotDamageSync.SyncSkin(netId, suitIndex, hatIndex, cigIndex);
+            BotDamageSync.SyncSkin(netId, suitIndex, hatIndex, cigIndex, visualSerial);
             yield return new WaitForSeconds(3f);
-            BotDamageSync.SyncSkin(netId, suitIndex, hatIndex, cigIndex); // Retry in case first was too early
+            BotDamageSync.SyncSkin(netId, suitIndex, hatIndex, cigIndex, visualSerial); // Retry in case first was too early
+        }
+
+        private System.Collections.IEnumerator RetryApplyCosmetics(BotData botData, GameObject botObj)
+        {
+            if (botObj == null || botData == null) yield break;
+            float[] delays = { 0.35f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f };
+            for (int i = 0; i < delays.Length; i++)
+            {
+                yield return new WaitForSeconds(delays[i]);
+                if (botObj == null) yield break;
+                if (HasVisibleHat(botObj)) yield break;
+                ApplyAllCosmetics(botObj, botData);
+                if (HasVisibleHat(botObj)) yield break;
+            }
+        }
+
+        private bool HasLivingHumanPlayerHealth()
+        {
+            try
+            {
+                var players = Object.FindObjectsOfType<PlayerHealth>();
+                foreach (var ph in players)
+                {
+                    if (ph == null || ph.isKilled) continue;
+                    if (ph.GetComponent<BotController>() == null)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void ProgressTakeForBotWinner(BotController winner)
+        {
+            if (_takeAdvancePending) return;
+            if (winner == null || winner.IsDead) return;
+            if (ScoreManager.Instance == null || GameManager.Instance == null) return;
+
+            _takeAdvancePending = true;
+            _takeAdvancePendingTimer = 4f;
+
+            try
+            {
+                int teamId = ScoreManager.Instance.GetTeamId(winner.PlayerId);
+                if (teamId < 0) teamId = winner.PlayerId;
+
+                Plugin.Log.LogInfo($"[BOT] Take stalled with winner={winner.BotName} team={teamId} -> advancing");
+
+                if (_wfdFieldCache == null)
+                {
+                    _wfdFieldCache = typeof(GameManager).GetField("waitForDrawCoroutine",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                }
+                if (_wfdFieldCache != null)
+                {
+                    var existing = _wfdFieldCache.GetValue(GameManager.Instance) as Coroutine;
+                    if (existing != null) GameManager.Instance.StopCoroutine(existing);
+                    _wfdFieldCache.SetValue(GameManager.Instance, null);
+                }
+
+                ScoreManager.Instance.AddRoundScore(teamId);
+
+                bool isRoundWon = ScoreManager.Instance.CheckForRoundWin(out int winningTeamId);
+                if (isRoundWon)
+                {
+                    if (winningTeamId < 0) winningTeamId = teamId;
+                    try { PauseManager.Instance?.WriteLog($"{FormatBotWinnerLabel(winner.BotName)} won the round"); } catch { }
+                    try
+                    {
+                        RoundManager.Instance?.CmdEndRound(winningTeamId);
+                    }
+                    catch (System.Exception endEx)
+                    {
+                        Plugin.Log.LogWarning($"[BOT] CmdEndRound failed for team {winningTeamId}: {endEx.Message}");
+                    }
+                    // If vanilla end-round flow did not attach, force the same draw-resolution
+                    // coroutine path so scene progression still occurs.
+                    try
+                    {
+                        var rm = RoundManager.Instance;
+                        if (rm == null || rm.InterfaceSetupCoroutine == null)
+                            StartFreshWaitForDraw();
+                    }
+                    catch { StartFreshWaitForDraw(); }
+                }
+                else
+                {
+                    try { PauseManager.Instance?.WriteLog($"{FormatBotWinnerLabel(winner.BotName)} won the take"); } catch { }
+                    GameManager.Instance.ProgressToNextTake();
+                }
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[BOT] Bot winner progression failed: {e.Message}");
+                _takeAdvancePending = false;
+                try { GameManager.Instance.ProgressToNextTake(); } catch { }
+            }
+        }
+
+        private string FormatBotWinnerLabel(string botName)
+        {
+            if (string.IsNullOrWhiteSpace(botName)) botName = "Bot";
+            return $"<b><color=#6CD4FF>{botName}</color></b>";
+        }
+
+        private void StartFreshWaitForDraw()
+        {
+            if (GameManager.Instance == null) return;
+            try
+            {
+                if (_wfdFieldCache == null)
+                {
+                    _wfdFieldCache = typeof(GameManager).GetField("waitForDrawCoroutine",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                }
+                if (_wfdFieldCache != null)
+                {
+                    var existing = _wfdFieldCache.GetValue(GameManager.Instance) as Coroutine;
+                    if (existing != null) GameManager.Instance.StopCoroutine(existing);
+                    _wfdFieldCache.SetValue(GameManager.Instance, null);
+                }
+
+                var waitMethod = typeof(GameManager).GetMethod("WaitForDraw",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (waitMethod == null) return;
+                var coroutine = GameManager.Instance.StartCoroutine(
+                    (System.Collections.IEnumerator)waitMethod.Invoke(GameManager.Instance, null));
+                if (_wfdFieldCache != null)
+                    _wfdFieldCache.SetValue(GameManager.Instance, coroutine);
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[BOT] StartFreshWaitForDraw failed: {e.Message}");
+            }
         }
 
         private void SetNameTag(GameObject botObj, string botName)
@@ -634,8 +798,20 @@ namespace StraftatBots
 
             // Sync to non-host via Mycelium
             var nob = botObj.GetComponent<FishNet.Object.NetworkObject>();
+            var controller = botObj.GetComponent<BotController>();
             if (nob != null)
-                StartCoroutine(DelaySkinSync((int)nob.ObjectId, botData.SuitIndex, botData.HatIndex, botData.CigIndex));
+                StartCoroutine(DelaySkinSync((int)nob.ObjectId, controller != null ? controller.VisualSerial : 0,
+                    botData.SuitIndex, -1, botData.CigIndex));
+        }
+
+        public void ReapplyCosmeticsForBot(BotController controller)
+        {
+            if (controller == null || controller.gameObject == null) return;
+            var botData = LobbyBots.Find(b => b.Controller == controller
+                || b.PlayerObject == controller.gameObject
+                || b.BotId == controller.BotId);
+            if (botData == null) return;
+            ReapplyCosmetics(botData, controller.gameObject);
         }
 
         /// <summary>
@@ -648,6 +824,15 @@ namespace StraftatBots
             try
             {
                 var setup = botObj.GetComponent<PlayerSetup>();
+                if (botData != null)
+                {
+                    botData.HatIndex = -1; // Disable hats entirely.
+                    // Disable cigs too: the instantiated cig prefab rendered as a white untextured
+                    // slab on bots (especially after a training respawn). Bots wear suit-only now.
+                    // The cig block below is gated on CigIndex >= 0, so this skips creation; the
+                    // CleanupOldCosmetics call still removes any cig left over from a prior life.
+                    botData.CigIndex = -1;
+                }
 
                 // Suit material
                 if (CosmeticsManager.Instance?.mats != null &&
@@ -681,49 +866,104 @@ namespace StraftatBots
                     }
                 }
 
-                if (setup == null || setup.hatToWearPosition == null) return;
-                Transform hatPos = setup.hatToWearPosition;
-                hatPos.gameObject.SetActive(true);
-                hatPos.gameObject.layer = 0; // Ensure hat position is on default layer
-                setup.cig = botData.CigIndex;
+                Transform hatPos = ResolveHatAnchor(botObj, setup, true);
+                if (hatPos == null) return;
+                // Bots wear suit-only. Keep the cosmetic mount DEACTIVATED so any hat/cig the
+                // game's ChangeDress creates underneath it stays hidden (they render as white
+                // untextured slabs on bots). A ChangeDress postfix also strips them at the source.
+                hatPos.gameObject.SetActive(false);
+                Transform hatMount = hatPos;
+                if (setup != null) setup.cig = botData.CigIndex;
 
                 // Destroy old hat/cig instances before creating new ones
-                CleanupOldCosmetics(hatPos);
-                setup.hat = null;
+                CleanupOldCosmetics(hatMount);
+                if (setup != null) setup.hat = null;
 
-                GameObject hatPrefab = ResolveHatPrefab(botData);
+                // Hats removed: keep suit + cig only.
+                CleanupOrphanedCosmetics();
+                bool usedNativeDress = false;
 
-                // Hat — direct local cosmetic only. Do not call PlayerSetup.ChangeDress for bots:
-                // that path is an ObserversRpc and can leave detached world cosmetics behind.
-                if (hatPrefab != null)
-                {
-                    var hatInst = Object.Instantiate(hatPrefab, hatPos.position, Quaternion.identity, hatPos);
-                    hatInst.AddComponent<HatPosition>().reference = hatPos;
-                    hatInst.tag = "Hat";
-                    PrepareCosmeticInstance(hatInst, hatPos, true);
-                    hatInst.transform.forward = botObj.transform.forward;
-                    hatInst.SetActive(true);
-                    setup.hat = hatInst;
-                }
+                int visualLayer = GetBotVisualLayer(botObj);
 
                 // Cig/pipe/cigar — same as ChangeDress
-                if (CosmeticsManager.Instance?.cigs != null
+                if (!usedNativeDress && CosmeticsManager.Instance?.cigs != null
                     && botData.CigIndex >= 0 && botData.CigIndex < CosmeticsManager.Instance.cigs.Length)
                 {
                     GameObject cigPrefab = CosmeticsManager.Instance.cigs[botData.CigIndex];
                     if (cigPrefab != null)
                     {
-                        var cigInst = Object.Instantiate(cigPrefab, hatPos.position, Quaternion.identity, hatPos);
-                        cigInst.AddComponent<HatPosition>().reference = hatPos;
-                        PrepareCosmeticInstance(cigInst, hatPos, false);
+                        var cigInst = Object.Instantiate(cigPrefab, hatMount.position, Quaternion.identity, hatMount);
+                        cigInst.AddComponent<HatPosition>().reference = hatMount;
+                        PrepareCosmeticInstance(cigInst, hatMount, false, visualLayer);
                         cigInst.SetActive(true);
                     }
                 }
 
-                FixCosmeticVisibility(hatPos);
-                Plugin.Log.LogInfo($"Cosmetics applied: suit={botData.SuitIndex} hat={botData.HatIndex} ({(hatPrefab != null ? hatPrefab.name : "none")}) cig={botData.CigIndex}");
+                FixCosmeticVisibility(hatMount, visualLayer);
             }
             catch (System.Exception e) { Plugin.Log.LogWarning($"ApplyAllCosmetics: {e.Message}"); }
+        }
+
+        private static int GetBotVisualLayer(GameObject botObj)
+        {
+            if (botObj == null) return 0;
+            // Bot root can be a networking/weapon helper layer; prefer actual rendered body layer.
+            var smr = botObj.GetComponentInChildren<SkinnedMeshRenderer>(true);
+            if (smr != null) return smr.gameObject.layer;
+            var mr = botObj.GetComponentInChildren<MeshRenderer>(true);
+            if (mr != null) return mr.gameObject.layer;
+            if (botObj.layer >= 0) return botObj.layer;
+            return 0;
+        }
+
+        private static bool ValidateHatAttachment(GameObject botObj, Transform hatPos, out int renderersFound, out int activeRenderers, out int hatLayer)
+        {
+            renderersFound = 0;
+            activeRenderers = 0;
+            hatLayer = -1;
+            if (botObj == null || hatPos == null) return false;
+            var hats = hatPos.GetComponentsInChildren<HatPosition>(true);
+            if (hats == null || hats.Length == 0) return false;
+            var setup = botObj.GetComponent<PlayerSetup>();
+            bool anyVisible = false;
+            for (int i = 0; i < hats.Length; i++)
+            {
+                var hp = hats[i];
+                if (hp == null || hp.gameObject == null) continue;
+                bool isHatObject = (setup != null && setup.hat == hp.gameObject)
+                    || hp.gameObject.name.StartsWith("BOT_HAT_", System.StringComparison.OrdinalIgnoreCase);
+                if (!isHatObject) continue;
+                hatLayer = hp.gameObject.layer;
+                if (hp.reference != hatPos) hp.reference = hatPos;
+                foreach (var r in hp.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r == null) continue;
+                    renderersFound++;
+                    if (!r.enabled) r.enabled = true;
+                    if (r.gameObject.layer != 18) r.gameObject.layer = 18;
+                    if (r is SkinnedMeshRenderer smr) smr.updateWhenOffscreen = true;
+                    r.forceRenderingOff = false;
+                    if (r.enabled && r.gameObject.activeInHierarchy) { activeRenderers++; anyVisible = true; }
+                }
+            }
+            return anyVisible;
+        }
+
+        private static bool HasVisibleHat(GameObject botObj)
+        {
+            if (botObj == null) return false;
+            var setup = botObj.GetComponent<PlayerSetup>();
+            Transform anchor = ResolveHatAnchor(botObj, setup, true);
+            if (anchor == null) return false;
+            bool visible = ValidateHatAttachment(botObj, anchor, out _, out _, out _);
+            if (!visible && setup != null && setup.hat != null)
+            {
+                foreach (var r in setup.hat.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r != null && r.enabled && r.gameObject.activeInHierarchy) return true;
+                }
+            }
+            return visible;
         }
 
         private static void InvokeSyncSetter(PlayerSetup setup, string methodName, int value)
@@ -747,6 +987,10 @@ namespace StraftatBots
                 if (cosmetics == null) return null;
 
                 GameObject[] hats = GetHatPrefabs(cosmetics);
+                // Brute-force reliability mode: pick a clearly visible hat prefab first.
+                // This guarantees "hat visible" over per-bot cosmetic variety.
+                GameObject forcedVisible = FindUsableHatPrefab(hats, botData);
+                if (forcedVisible != null) return forcedVisible;
 
                 if (botData != null && hats != null
                     && botData.HatIndex >= 0 && botData.HatIndex < hats.Length)
@@ -775,6 +1019,101 @@ namespace StraftatBots
             catch { return null; }
             return null;
         }
+
+        private static Transform ResolveHatAnchor(GameObject botObj, PlayerSetup setup, bool preferHeadAnchor)
+        {
+            if (setup != null && setup.hatToWearPosition != null && setup.hatToWearPosition.gameObject.activeInHierarchy)
+                return setup.hatToWearPosition;
+
+            if (botObj != null && preferHeadAnchor)
+            {
+                Transform headAnchor = GetOrCreateHeadHatAnchor(botObj);
+                if (headAnchor != null)
+                    return headAnchor;
+            }
+
+            if (botObj != null && !preferHeadAnchor)
+            {
+                Transform headAnchor = GetOrCreateHeadHatAnchor(botObj);
+                if (headAnchor != null)
+                    return headAnchor;
+            }
+
+            if (botObj == null) return null;
+            foreach (var t in botObj.GetComponentsInChildren<Transform>(true))
+            {
+                if (t == null) continue;
+                string n = t.name != null ? t.name.ToLowerInvariant() : "";
+                if (n.Contains("hattowear") || n.Contains("hat_to_wear") || n == "hat" || n.Contains("headhat"))
+                    return t;
+            }
+            return null;
+        }
+
+        private static Transform GetOrCreateHeadHatAnchor(GameObject botObj)
+        {
+            if (botObj == null) return null;
+            var animator = botObj.GetComponentInChildren<Animator>(true);
+            if (animator != null && animator.isHuman)
+            {
+                var head = animator.GetBoneTransform(HumanBodyBones.Head);
+                if (head != null)
+                {
+                    var anchor = head.Find("BotHatAnchor");
+                    if (anchor == null)
+                    {
+                        var go = new GameObject("BotHatAnchor");
+                        anchor = go.transform;
+                        anchor.SetParent(head, false);
+                        anchor.localPosition = new Vector3(0f, 0.06f, 0f);
+                        anchor.localRotation = Quaternion.identity;
+                    }
+                    return anchor;
+                }
+            }
+
+            // Non-humanoid rigs: find a likely head transform by name and attach there.
+            Transform namedHead = FindNamedHeadTransform(botObj);
+            if (namedHead != null)
+            {
+                var anchor = namedHead.Find("BotHatAnchor");
+                if (anchor == null)
+                {
+                    var go = new GameObject("BotHatAnchor");
+                    anchor = go.transform;
+                    anchor.SetParent(namedHead, false);
+                    anchor.localPosition = new Vector3(0f, 0.05f, 0f);
+                    anchor.localRotation = Quaternion.identity;
+                }
+                return anchor;
+            }
+            return null;
+        }
+
+        private static Transform FindNamedHeadTransform(GameObject botObj)
+        {
+            if (botObj == null) return null;
+            Transform best = null;
+            float bestScore = float.MinValue;
+            Vector3 rootPos = botObj.transform.position;
+            foreach (var t in botObj.GetComponentsInChildren<Transform>(true))
+            {
+                if (t == null) continue;
+                string n = t.name != null ? t.name.ToLowerInvariant() : "";
+                if (!n.Contains("head")) continue;
+                if (n.Contains("camera")) continue;
+                float upScore = t.position.y - rootPos.y;
+                float forwardScore = Vector3.Dot(botObj.transform.forward, (t.position - rootPos).normalized) * 0.1f;
+                float score = upScore + forwardScore;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = t;
+                }
+            }
+            return best;
+        }
+
 
         private static GameObject[] GetHatPrefabs(CosmeticsManager cosmetics)
         {
@@ -821,11 +1160,48 @@ namespace StraftatBots
             }
         }
 
+        /// <summary>
+        /// Return the number of usable hat prefabs currently discoverable.
+        /// Uses the same discovery path as ApplyAllCosmetics so randomization
+        /// doesn't end up with HatIndex = -1 on maps/lobbies where hats are
+        /// only available via children/reflection.
+        /// </summary>
+        public static int GetAvailableHatCount()
+        {
+            try
+            {
+                var cosmetics = CosmeticsManager.Instance;
+                if (cosmetics == null) return 0;
+                var hats = GetHatPrefabs(cosmetics);
+                if (hats == null || hats.Length == 0) return 0;
+
+                int count = 0;
+                for (int i = 0; i < hats.Length; i++)
+                {
+                    if (IsUsableHatPrefab(hats[i])) count++;
+                }
+                return count;
+            }
+            catch { return 0; }
+        }
+
         private static GameObject FindUsableHatPrefab(GameObject[] hats, BotData botData)
         {
             if (hats == null || hats.Length == 0) return null;
 
             int start = botData != null && botData.HatIndex >= 0 ? botData.HatIndex + 1 : 0;
+            // Pass 1: strongly prefer obvious hat/cap style prefabs (avoid subtle head replacements).
+            for (int offset = 0; offset < hats.Length; offset++)
+            {
+                int index = (start + offset) % hats.Length;
+                GameObject candidate = hats[index];
+                if (!IsUsableHatPrefab(candidate)) continue;
+                if (!IsPreferredVisibleHat(candidate)) continue;
+                if (botData != null) botData.HatIndex = index;
+                return candidate;
+            }
+
+            // Pass 2: fallback to any usable prefab.
             for (int offset = 0; offset < hats.Length; offset++)
             {
                 int index = (start + offset) % hats.Length;
@@ -842,6 +1218,7 @@ namespace StraftatBots
             if (prefab == null) return false;
             string name = prefab.name != null ? prefab.name.ToLowerInvariant() : "";
             if (name.Contains("nothing")) return false;
+            if (name.Contains("_head") || name.EndsWith("head")) return false;
 
             foreach (var renderer in prefab.GetComponentsInChildren<Renderer>(true))
             {
@@ -850,27 +1227,46 @@ namespace StraftatBots
             return false;
         }
 
-        private static void PrepareCosmeticInstance(GameObject obj, Transform hatPos, bool isHat)
+        private static bool IsPreferredVisibleHat(GameObject prefab)
+        {
+            if (prefab == null) return false;
+            string n = prefab.name != null ? prefab.name.ToLowerInvariant() : "";
+            if (n.Contains("_head") || n.EndsWith("head")) return false;
+            return n.Contains("hat")
+                || n.Contains("cap")
+                || n.Contains("helmet")
+                || n.Contains("crown")
+                || n.Contains("band")
+                || n.Contains("docker")
+                || n.Contains("spike")
+                || n.Contains("cow")
+                || n.Contains("bunny");
+        }
+
+        private static void PrepareCosmeticInstance(GameObject obj, Transform hatPos, bool isHat, int visualLayer)
         {
             if (obj == null || hatPos == null) return;
-            obj.transform.SetParent(hatPos, false);
-            obj.transform.localPosition = Vector3.zero;
-            obj.transform.localRotation = Quaternion.identity;
+            if (obj.transform.parent != hatPos)
+                obj.transform.SetParent(hatPos, false);
+            // Keep authored prefab local offsets/rotation/scale — many hats rely on these.
+            if (isHat && obj.transform.localPosition.sqrMagnitude < 0.0004f)
+            {
+                // Some hat prefabs instantiate at origin and clip into the head on bot rigs.
+                // Nudge upward so hats are visibly above the scalp.
+                obj.transform.localPosition = new Vector3(0f, 0.11f, 0f);
+            }
 
+            int layerToUse = isHat ? 18 : visualLayer;
+            foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
+                child.gameObject.layer = layerToUse;
             if (isHat)
-            {
-                // Bot cosmetics render with the bot body. Layer 18 hides some hat roots
-                // from the spectator/freecam path, especially when the renderer is on root.
-                foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
-                    child.gameObject.layer = 11;
-            }
-            else
-            {
-                foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
-                    child.gameObject.layer = 6;
-            }
+                obj.tag = "Hat";
             foreach (var renderer in obj.GetComponentsInChildren<Renderer>(true))
+            {
                 renderer.enabled = true;
+                renderer.forceRenderingOff = false;
+                if (renderer is SkinnedMeshRenderer smr) smr.updateWhenOffscreen = true;
+            }
             foreach (var col in obj.GetComponentsInChildren<Collider>(true))
                 col.enabled = false;
             foreach (var rb in obj.GetComponentsInChildren<Rigidbody>(true))
@@ -882,7 +1278,7 @@ namespace StraftatBots
             }
         }
 
-        private static void FixCosmeticVisibility(Transform hatPos)
+        private static void FixCosmeticVisibility(Transform hatPos, int visualLayer)
         {
             if (hatPos == null) return;
             foreach (var hp in hatPos.GetComponentsInChildren<HatPosition>(true))
@@ -891,14 +1287,17 @@ namespace StraftatBots
                 hp.reference = hatPos;
                 GameObject obj = hp.gameObject;
                 obj.SetActive(true);
-                bool isHat = obj.CompareTag("Hat");
-                if (isHat)
-                {
-                    foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
-                        child.gameObject.layer = 11;
-                }
+                bool isHatObject = obj.name.StartsWith("BOT_HAT_", System.StringComparison.OrdinalIgnoreCase);
+                int layerToUse = isHatObject ? 18 : visualLayer;
+                if (isHatObject) obj.tag = "Hat";
+                foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
+                    child.gameObject.layer = layerToUse;
                 foreach (var renderer in obj.GetComponentsInChildren<Renderer>(true))
+                {
                     renderer.enabled = true;
+                    renderer.forceRenderingOff = false;
+                    if (renderer is SkinnedMeshRenderer smr) smr.updateWhenOffscreen = true;
+                }
                 foreach (var col in obj.GetComponentsInChildren<Collider>(true))
                     col.enabled = false;
             }
@@ -907,7 +1306,6 @@ namespace StraftatBots
         /// <summary>Destroy old hat/cig children on hatToWearPosition before applying new ones.</summary>
         private static void CleanupOldCosmetics(Transform hatPos)
         {
-            CleanupOrphanedCosmetics();
             for (int i = hatPos.childCount - 1; i >= 0; i--)
             {
                 var child = hatPos.GetChild(i);
@@ -930,6 +1328,89 @@ namespace StraftatBots
             catch { }
         }
 
+        private static void TryApplyHatViaPlayerSetup(PlayerSetup setup, int hatIndex)
+        {
+            if (setup == null || hatIndex < 0) return;
+            try
+            {
+                var t = typeof(PlayerSetup);
+                MethodInfo setHat = t.GetMethod("SetHat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int), typeof(bool) }, null);
+                if (setHat != null)
+                {
+                    setHat.Invoke(setup, new object[] { hatIndex, true });
+                    if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                        Plugin.Log.LogInfo($"[HAT] Native SetHat(int,bool) invoked hatIndex={hatIndex}");
+                    return;
+                }
+                MethodInfo setHatOneArg = t.GetMethod("SetHat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int) }, null);
+                if (setHatOneArg != null)
+                {
+                    setHatOneArg.Invoke(setup, new object[] { hatIndex });
+                    if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                        Plugin.Log.LogInfo($"[HAT] Native SetHat(int) invoked hatIndex={hatIndex}");
+                    return;
+                }
+
+                MethodInfo changeHat = t.GetMethod("ChangeHat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int), typeof(bool) }, null);
+                if (changeHat != null)
+                {
+                    changeHat.Invoke(setup, new object[] { hatIndex, true });
+                    if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                        Plugin.Log.LogInfo($"[HAT] Native ChangeHat(int,bool) invoked hatIndex={hatIndex}");
+                    return;
+                }
+                MethodInfo changeHatOneArg = t.GetMethod("ChangeHat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int) }, null);
+                if (changeHatOneArg != null)
+                {
+                    changeHatOneArg.Invoke(setup, new object[] { hatIndex });
+                    if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                        Plugin.Log.LogInfo($"[HAT] Native ChangeHat(int) invoked hatIndex={hatIndex}");
+                    return;
+                }
+
+                MethodInfo changeDress = t.GetMethod("ChangeDress", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (changeDress != null && changeDress.GetParameters().Length == 0)
+                {
+                    changeDress.Invoke(setup, null);
+                    if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                        Plugin.Log.LogInfo("[HAT] Native ChangeDress() invoked");
+                    return;
+                }
+
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                    Plugin.Log.LogWarning("[HAT] No native PlayerSetup hat method found");
+            }
+            catch (System.Exception e)
+            {
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                    Plugin.Log.LogWarning($"[HAT] Native hat apply exception: {e.Message}");
+            }
+        }
+
+        private static bool TryApplyChangeDressDirect(PlayerSetup setup, GameObject playerObj, GameObject hatPrefab)
+        {
+            if (setup == null || playerObj == null) return false;
+            try
+            {
+                MethodInfo m = typeof(PlayerSetup).GetMethod("ChangeDress",
+                    BindingFlags.Instance | BindingFlags.NonPublic,
+                    null,
+                    new[] { typeof(GameObject), typeof(GameObject), typeof(Vector3) },
+                    null);
+                if (m == null) return false;
+                m.Invoke(setup, new object[] { playerObj, hatPrefab, playerObj.transform.forward });
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                    Plugin.Log.LogInfo("[HAT] Native ChangeDress(player,hat,direction) invoked");
+                return true;
+            }
+            catch (System.Exception e)
+            {
+                if (Plugin.EnableReliabilityLogs != null && Plugin.EnableReliabilityLogs.Value)
+                    Plugin.Log.LogWarning($"[HAT] Native ChangeDress(player,hat,direction) failed: {e.Message}");
+                return false;
+            }
+        }
+
         private static Material GetSuitMaterial(int suitIndex)
         {
             if (CosmeticsManager.Instance == null) return null;
@@ -947,7 +1428,7 @@ namespace StraftatBots
             foreach (var bot in _activeBots)
             {
                 if (bot == null) continue;
-                bot.Respawn(GetDistributedSpawnPosition(spawns, idx));
+                bot.Respawn(GetDistributedSpawnPosition(spawns, idx), reapplyCosmetics: false);
                 var botData = LobbyBots.Find(b => b.Controller == bot);
                 if (botData != null) ReapplyCosmetics(botData, bot.gameObject);
                 idx++;
@@ -988,7 +1469,14 @@ namespace StraftatBots
                 bot.PlayerId = -1;
         }
 
-        public void ResetDrawTimer() => _onlyBotsAliveTimer = 0f;
+        public void ResetDrawTimer()
+        {
+            _onlyBotsAliveTimer = 0f;
+            _stuckRoundTimer = 0f;
+            _botWinConfirmTimer = 0f;
+            _takeAdvancePending = false;
+            _takeAdvancePendingTimer = 0f;
+        }
 
         public List<BotController> GetActiveBots() => _activeBots;
         public static List<BotController> ActiveBots => Instance?._activeBots;

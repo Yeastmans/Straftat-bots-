@@ -11,32 +11,33 @@ namespace StraftatBots
             string weaponName, string action = "killed", bool dedupe = true)
         {
             if (victim == null || PauseManager.Instance == null) return false;
-            if (dedupe && !TryMark(victim)) return false;
-
             BotController victimBot = victim.GetComponent<BotController>() ?? victim.GetComponentInParent<BotController>();
             BotController killerBot = killerRoot != null
                 ? (killerRoot.GetComponent<BotController>() ?? killerRoot.GetComponentInParent<BotController>())
                 : null;
 
             string victimName = ResolveVictimName(victim, victimBot);
+            if (dedupe && !TryMark(victim, victimName)) return false;
             string killerName = ResolveKillerName(killerRoot, killerBot, killerNameFallback);
             string cleanWeaponName = CleanWeaponName(weaponName);
             string cleanAction = string.IsNullOrWhiteSpace(action) ? "killed" : action;
             string article = StartsWithVowel(cleanWeaponName) ? "an" : "a";
 
+            BotPatches.AllowNextKillFeedLine();
             PauseManager.Instance.WriteLog(
                 $"<b><color={VictimColor(victimBot != null)}>{victimName}</color></b> was {cleanAction} with {article} <b><color=white>{cleanWeaponName}</color></b> by <b><color={KillerColor(killerBot != null)}>{killerName}</color></b>");
             return true;
         }
 
-        private static bool TryMark(PlayerHealth victim)
+        private static bool TryMark(PlayerHealth victim, string victimName)
         {
             int key = victim.GetInstanceID();
             int frame = Time.frameCount;
-            if (RecentVictimFrames.TryGetValue(key, out int lastFrame) && frame - lastFrame < 10)
+            if (RecentVictimFrames.TryGetValue(key, out int lastFrame) && frame - lastFrame < 90)
                 return false;
 
             RecentVictimFrames[key] = frame;
+            BotPatches.MarkKillFeedVictim(victimName);
             if (RecentVictimFrames.Count > 128)
             {
                 var stale = new List<int>();
@@ -84,7 +85,22 @@ namespace StraftatBots
         private static string CleanWeaponName(string weaponName)
         {
             if (string.IsNullOrWhiteSpace(weaponName)) return "weapon";
-            return weaponName.Replace("(Clone)", "").Trim();
+            string clean = weaponName.Replace("(Clone)", "").Trim();
+            string lower = clean.ToLowerInvariant();
+            if (lower == "ap mine") return "AP Mine";
+            if (lower == "bublee") return "Bublee";
+            if (lower == "serac") return "Serac";
+            if (lower == "claymore") return "Claymore";
+            if (lower == "proximity mine") return "Proximity Mine";
+            if (lower == "gland grenade") return "Gland Grenade";
+
+            var words = lower.Split(' ');
+            for (int i = 0; i < words.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(words[i])) continue;
+                words[i] = char.ToUpperInvariant(words[i][0]) + (words[i].Length > 1 ? words[i].Substring(1) : "");
+            }
+            return string.Join(" ", words).Trim();
         }
 
         private static bool StartsWithVowel(string value)
