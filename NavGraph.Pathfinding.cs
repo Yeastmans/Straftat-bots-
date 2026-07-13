@@ -51,9 +51,27 @@ namespace StraftatBots
                     return StraightenPath(path);
                 }
 
+                var fromN = GetNodeById(currentId); // every edge below starts at the popped node
+                if (fromN == null) continue;
+
+                if (!gScore.TryGetValue(currentId, out float currentG)) currentG = float.MaxValue;
+
+                // Stale-entry guard: gScore improvements re-add nodes to the open set
+                // without removing the old entry (no decrease-key). When the old entry
+                // finally pops, its f is worse than the node's current best — skip it
+                // instead of re-expanding every edge. On dense explore graphs a node's g
+                // improves many times, so this cuts expansions to ~one per node and is
+                // exact: only entries superseded by a strictly better one are skipped.
+                if (current.f > currentG + Vector3.Distance(fromN.Position, endNode.Position) + 0.001f)
+                    continue;
+
                 if (!_edgesByFrom.TryGetValue(currentId, out var edges)) continue;
 
-                float currentG = gScore.ContainsKey(currentId) ? gScore[currentId] : float.MaxValue;
+                // Previous node on the best-known path to fromN — constant per pop,
+                // used by the sharp-turn penalty for every edge.
+                NavNode prevNode = null;
+                if (cameFrom.TryGetValue(currentId, out int prevId))
+                    prevNode = GetNodeById(prevId);
 
                 foreach (int ei in edges)
                 {
@@ -89,8 +107,7 @@ namespace StraftatBots
                             break;
                     }
 
-                    // Prefer player-sourced paths
-                    var fromN = GetNodeById(edge.From);
+                    // Prefer player-sourced paths (fromN hoisted — edge.From == currentId)
                     if (fromN != null && toN != null)
                     {
                         if (fromN.PlayerSourced && toN.PlayerSourced)
@@ -175,24 +192,20 @@ namespace StraftatBots
                         edgeCost *= 0.5f; // 50% cheaper — player demonstrated this sequence
 
                     // Penalize sharp turns — prefer straighter paths
-                    if (cameFrom.ContainsKey(currentId) && fromN != null && toN != null)
+                    if (prevNode != null && fromN != null && toN != null)
                     {
-                        var prevNode = GetNodeById(cameFrom[currentId]);
-                        if (prevNode != null)
+                        Vector3 prevDir = fromN.Position - prevNode.Position;
+                        Vector3 nextDir = toN.Position - fromN.Position;
+                        prevDir.y = 0; nextDir.y = 0;
+                        if (prevDir.sqrMagnitude > 0.01f && nextDir.sqrMagnitude > 0.01f)
                         {
-                            Vector3 prevDir = fromN.Position - prevNode.Position;
-                            Vector3 nextDir = toN.Position - fromN.Position;
-                            prevDir.y = 0; nextDir.y = 0;
-                            if (prevDir.sqrMagnitude > 0.01f && nextDir.sqrMagnitude > 0.01f)
-                            {
-                                float dot = Vector3.Dot(prevDir.normalized, nextDir.normalized);
-                                // dot=1 straight, dot=0 right angle, dot=-1 reverse
-                                if (dot < 0.3f) // Sharp turn (>72°)
-                                    edgeCost *= 1.3f;
-                                else if (dot < 0.7f) // Moderate turn (45-72°)
-                                    edgeCost *= 1.1f;
-                                // Straight ahead (>45°) = no penalty
-                            }
+                            float dot = Vector3.Dot(prevDir.normalized, nextDir.normalized);
+                            // dot=1 straight, dot=0 right angle, dot=-1 reverse
+                            if (dot < 0.3f) // Sharp turn (>72°)
+                                edgeCost *= 1.3f;
+                            else if (dot < 0.7f) // Moderate turn (45-72°)
+                                edgeCost *= 1.1f;
+                            // Straight ahead (>45°) = no penalty
                         }
                     }
 
@@ -209,19 +222,14 @@ namespace StraftatBots
                     }
 
                     float tentativeG = currentG + edgeCost;
-                    float neighborG = gScore.ContainsKey(edge.To) ? gScore[edge.To] : float.MaxValue;
+                    if (!gScore.TryGetValue(edge.To, out float neighborG)) neighborG = float.MaxValue;
 
                     if (tentativeG < neighborG)
                     {
                         cameFrom[edge.To] = currentId;
                         gScore[edge.To] = tentativeG;
-
-                        var toNode = GetNodeById(edge.To);
-                        if (toNode != null)
-                        {
-                            float fScore = tentativeG + Vector3.Distance(toNode.Position, endNode.Position);
-                            openSet.Add((fScore, edge.To));
-                        }
+                        float fScore = tentativeG + Vector3.Distance(toN.Position, endNode.Position);
+                        openSet.Add((fScore, edge.To));
                     }
                 }
             }

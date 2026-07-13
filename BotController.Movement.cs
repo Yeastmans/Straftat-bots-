@@ -448,6 +448,26 @@ namespace StraftatBots
             return radius;
         }
 
+        // Pathfinding time spent by ALL bots this frame. With 8 bots, repaths landing on
+        // the same frame stack into one long hitch — a bot that still has a workable
+        // route defers ~0.15s when the frame's budget is spent. Pathless bots and
+        // moved-target repaths always proceed.
+        private static int s_repathFrame;
+        private static float s_repathMsThisFrame;
+
+        private bool RepathBudgetExhausted(bool hasWorkingPath, bool targetMoved)
+        {
+            if (Time.frameCount != s_repathFrame)
+            {
+                s_repathFrame = Time.frameCount;
+                s_repathMsThisFrame = 0f;
+            }
+            if (!hasWorkingPath || targetMoved) return false;
+            if (s_repathMsThisFrame <= 12f) return false;
+            _repathTimer = Mathf.Max(_repathTimer, 0.15f);
+            return true;
+        }
+
         private void AcceptGraphRoute(List<NavNode> path, PathSource source, Vector3 target, float score)
         {
             _graphPath = path ?? new List<NavNode>();
@@ -688,7 +708,8 @@ namespace StraftatBots
                     // Keep executing the committed corridor. This prevents flicker between
                     // equally plausible routes while climbing, jumping, or chasing weapons.
                 }
-                else if (!suppressRepath && (!hasWorkingPath || _repathTimer <= 0f || targetMoved))
+                else if (!suppressRepath && (!hasWorkingPath || _repathTimer <= 0f || targetMoved)
+                    && !RepathBudgetExhausted(hasWorkingPath, targetMoved))
                 {
                     // Adaptive repath interval: fast when no path, slow when path is working.
                     // A working navmesh route is deterministic — repathing it just regenerates
@@ -754,25 +775,55 @@ namespace StraftatBots
                     bool combatPath = State == BotState.Hunt && _playerTarget != null;
                     if (graphHasData)
                     {
+                        // Candidate evaluation used to fire up to 9 full A* searches + a
+                        // graph-wide scan + a BFS flood in one frame — the 50-105ms
+                        // "[Perf] SLOW bot update" spikes. Now: duplicates are gated on
+                        // whether they can actually differ, the expensive candidates run
+                        // cheapest-first behind a time budget, and fallbacks only run when
+                        // nothing was found. A pathless bot always keeps searching.
+                        var swRepath = System.Diagnostics.Stopwatch.StartNew();
+                        bool InBudget() => bestPath == null || swRepath.ElapsedMilliseconds < 6;
+
                         ConsiderCandidate(NavGraph.Instance.GetCachedRoute(transform.position, target), PathSource.GraphRoute);
-                        ConsiderCandidate(FindVerticalConnectorRoute(target), PathSource.GraphRoute);
                         if (!combatPath)
                         {
-                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight), PathSource.GraphRoute);
-                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
+                            var direct = NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight);
+                            ConsiderCandidate(direct, PathSource.GraphRoute);
+                            // 40f differs from the default 30f only in endpoint snapping —
+                            // rerun only when widening can snap a different endpoint.
+                            // Otherwise it repeats the identical search (worst on unreachable
+                            // targets, where every call exhausts the whole component).
+                            if ((direct == null || direct.Count == 0)
+                                && (NavGraph.Instance.FindNearestNode(transform.position, 30f) == null
+                                    || NavGraph.Instance.FindNearestNode(target, 30f) == null))
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
                         }
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                        var playerNear = NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true);
+                        ConsiderCandidate(playerNear, PathSource.ExploreBuildRoute);
                         if (weaponPath)
                         {
-                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
-                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
+                            if (playerNear == null || playerNear.Count == 0)
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                            if (InBudget())
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
                         }
 
-                        var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
-                        if (closestReachable != null)
-                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
+                        // Full node×edge scan + up to two more A* runs — the most expensive
+                        // candidate, so it moved from second to last and respects the budget.
+                        if (InBudget())
+                            ConsiderCandidate(FindVerticalConnectorRoute(target), PathSource.GraphRoute);
+
+                        // Reachability fallback — a BFS flood is only worth it when no
+                        // candidate produced a route at all.
+                        if (bestPath == null)
+                        {
+                            var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
+                            if (closestReachable != null)
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
+                        }
 
                         ConsiderCandidate(NavGraph.Instance.FindNearestPatrolRoute(transform.position, target), PathSource.ExploreBuildRoute);
+                        s_repathMsThisFrame += (float)swRepath.Elapsed.TotalMilliseconds;
                     }
 
                     // Wider keep-margin: only abandon the current route for a MATERIALLY better one
