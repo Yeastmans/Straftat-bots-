@@ -22,9 +22,9 @@ namespace StraftatBots
             int botCount = BotManager.Instance.LobbyBots.Count;
 
             float x = 10;
-            float y = Screen.height - 120;
+            float y = Screen.height - 155;
 
-            GUI.Box(new Rect(x, y, 200, 110), "Bots");
+            GUI.Box(new Rect(x, y, 200, 145), "Bots");
 
             if (GUI.Button(new Rect(x + 10, y + 25, 180, 30), $"Add Bot ({botCount}/{Plugin.MaxBots.Value})"))
             {
@@ -37,6 +37,12 @@ namespace StraftatBots
                 {
                     BotManager.Instance.RemoveLastBot();
                 }
+            }
+
+            bool overlayOn = Plugin.ShowOverlay != null && Plugin.ShowOverlay.Value;
+            if (GUI.Button(new Rect(x + 10, y + 95, 180, 30), overlayOn ? "Overlay: ON" : "Overlay: OFF"))
+            {
+                if (Plugin.ShowOverlay != null) Plugin.ShowOverlay.Value = !overlayOn;
             }
         }
     }
