@@ -670,6 +670,7 @@ namespace StraftatBots
                 // Hats re-enabled: retry attachment if the first pass didn't stick
                 // (cosmetics can race prefab/animator init on spawn).
                 StartCoroutine(RetryApplyCosmetics(botData, botObj));
+                StartCoroutine(HatStateProbe(botData, botObj));
 
                 // Ensure graphics are enabled
                 var ph = botObj.GetComponent<PlayerHealth>();
@@ -752,9 +753,92 @@ namespace StraftatBots
                 yield return new WaitForSeconds(delays[i]);
                 if (botObj == null) yield break;
                 if (HasVisibleHat(botObj)) yield break;
+                ProbeHatState(botData, botObj, i, "retry: visibility check failed");
                 ApplyAllCosmetics(botObj, botData);
                 if (HasVisibleHat(botObj)) yield break;
             }
+        }
+
+        /// <summary>Runtime hat diagnostics. Every spawn-time line reads healthy while
+        /// hats still don't show in game, so this samples the RENDER-time state the
+        /// spawn log can't capture: renderer.isVisible, world scale, drift from the
+        /// head bone, material/shader. Logs for a window after each dress pass and any
+        /// time something is anomalous.</summary>
+        private System.Collections.IEnumerator HatStateProbe(BotData botData, GameObject botObj)
+        {
+            var wait = new WaitForSeconds(4f);
+            int sample = 0;
+            while (botObj != null)
+            {
+                yield return wait;
+                if (botObj == null) yield break;
+                sample++;
+                try { ProbeHatState(botData, botObj, sample, null); } catch { }
+            }
+        }
+
+        private static void ProbeHatState(BotData botData, GameObject botObj, int sample, string context)
+        {
+            if (botObj == null) return;
+            string name = botData?.Name ?? botObj.name;
+            bool recentDress = botData != null && (Time.time - botData.LastDressTime) < 12f;
+
+            var setup = botObj.GetComponent<PlayerSetup>();
+            Transform pivot = setup != null ? setup.hatToWearPosition : null;
+            string pivotState;
+            bool anomaly = false;
+            if (pivot == null) { pivotState = "MISSING"; anomaly = true; }
+            else if (!pivot.gameObject.activeInHierarchy)
+            {
+                Transform guilty = pivot;
+                while (guilty != null && guilty.gameObject.activeSelf) guilty = guilty.parent;
+                pivotState = $"INACTIVE(via '{(guilty != null ? guilty.name : "?")}')";
+                anomaly = true;
+            }
+            else pivotState = "active";
+
+            Transform head = null;
+            var anim = botObj.GetComponentInChildren<Animator>(true);
+            if (anim != null && anim.isHuman) head = anim.GetBoneTransform(HumanBodyBones.Head);
+
+            int cosmeticCount = 0;
+            var sb = new System.Text.StringBuilder();
+            foreach (var hp in botObj.GetComponentsInChildren<HatPosition>(true))
+            {
+                if (hp == null || hp.gameObject == null) continue;
+                string n = hp.gameObject.name;
+                bool isBotCosmetic = n.StartsWith("BOT_HAT_", System.StringComparison.OrdinalIgnoreCase)
+                    || n.StartsWith("BOT_CIG_", System.StringComparison.OrdinalIgnoreCase);
+                if (!isBotCosmetic) continue;
+                cosmeticCount++;
+                var go = hp.gameObject;
+                var r = go.GetComponentInChildren<Renderer>(true);
+                float dHead = head != null ? Vector3.Distance(go.transform.position, head.position) : -1f;
+                float scl = go.transform.lossyScale.x;
+                float bnd = r != null ? Mathf.Max(r.bounds.size.x, Mathf.Max(r.bounds.size.y, r.bounds.size.z)) : -1f;
+                bool act = go.activeInHierarchy;
+                bool en = r != null && r.enabled;
+                bool vis = r != null && r.isVisible;
+                string mat = "none", shader = "none";
+                if (r != null && r.sharedMaterial != null)
+                {
+                    mat = r.sharedMaterial.name;
+                    shader = r.sharedMaterial.shader != null ? r.sharedMaterial.shader.name : "?";
+                }
+                if (!act || r == null || !en || !vis || scl < 0.05f || (dHead >= 0f && dHead > 1.5f))
+                    anomaly = true;
+                sb.Append($" | {n}: act={act} layer={go.layer} scl={scl:F2} bnd={bnd:F2} dHead={dHead:F2} " +
+                    $"rendEnabled={en} isVisible={vis} refSet={hp.reference != null} mat='{mat}' shader='{shader}'");
+            }
+            if (cosmeticCount == 0)
+            {
+                anomaly = true;
+                sb.Append(" | NO BOT_HAT/BOT_CIG instances under bot (destroyed?)");
+            }
+
+            if (anomaly || recentDress || context != null)
+                Plugin.Log.LogInfo($"[HatProbe] {name} s{sample}{(context != null ? $" ({context})" : "")}" +
+                    $"{(anomaly ? " ANOMALY" : "")}: pivot={pivotState}{sb}");
         }
 
         private bool HasLivingHumanPlayerHealth()
@@ -933,6 +1017,7 @@ namespace StraftatBots
             if (botObj == null) return;
             try
             {
+                if (botData != null) botData.LastDressTime = Time.time;
                 var setup = botObj.GetComponent<PlayerSetup>();
                 // Bots wear a random hat + cig again. The old white-slab bug had two
                 // ingredients, both fixed at the source: (1) the game's ChangeDress racing
@@ -1069,6 +1154,7 @@ namespace StraftatBots
             var hats = hatPos.GetComponentsInChildren<HatPosition>(true);
             if (hats == null || hats.Length == 0) return false;
             var setup = botObj.GetComponent<PlayerSetup>();
+            int visualLayer = GetBotVisualLayer(botObj);
             bool anyVisible = false;
             for (int i = 0; i < hats.Length; i++)
             {
@@ -1084,7 +1170,7 @@ namespace StraftatBots
                     if (r == null) continue;
                     renderersFound++;
                     if (!r.enabled) r.enabled = true;
-                    if (r.gameObject.layer != 18) r.gameObject.layer = 18;
+                    if (r.gameObject.layer != visualLayer) r.gameObject.layer = visualLayer;
                     if (r is SkinnedMeshRenderer smr) smr.updateWhenOffscreen = true;
                     r.forceRenderingOff = false;
                     if (r.enabled && r.gameObject.activeInHierarchy) { activeRenderers++; anyVisible = true; }
@@ -1491,7 +1577,11 @@ namespace StraftatBots
                 obj.transform.localPosition = new Vector3(0f, 0.11f, 0f);
             }
 
-            int layerToUse = isHat ? 18 : visualLayer;
+            // Hats share the bot's rendered body layer instead of the game's hat layer
+            // (18): every spawn-time diagnostic read healthy on 18 yet hats never showed,
+            // while cigs on the body layer take the identical path. Colliders are
+            // disabled, so body-layer raycasts can't hit them.
+            int layerToUse = visualLayer;
             foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
                 child.gameObject.layer = layerToUse;
             if (isHat)
@@ -1523,7 +1613,7 @@ namespace StraftatBots
                 GameObject obj = hp.gameObject;
                 obj.SetActive(true);
                 bool isHatObject = obj.name.StartsWith("BOT_HAT_", System.StringComparison.OrdinalIgnoreCase);
-                int layerToUse = isHatObject ? 18 : visualLayer;
+                int layerToUse = visualLayer; // hats render on the body layer now, same as cigs
                 if (isHatObject) obj.tag = "Hat";
                 foreach (Transform child in obj.GetComponentsInChildren<Transform>(true))
                     child.gameObject.layer = layerToUse;

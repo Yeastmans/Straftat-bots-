@@ -25,6 +25,10 @@ namespace StraftatBots
         public BotController Controller;
         public GameObject PlayerObject;
 
+        // Time.time of the last ApplyAllCosmetics pass — the hat probe logs full
+        // render-state for a window after each dress.
+        public float LastDressTime = -999f;
+
         public static BotData CreateRandom(int botId, int slot = -1)
         {
             if (slot < 0) slot = botId % 8;
