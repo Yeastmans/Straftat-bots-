@@ -110,6 +110,13 @@ namespace StraftatBots
                     if (!string.IsNullOrWhiteSpace(warning))
                         Log.LogWarning($"[Certification] {warning} (Play allowed — bots will keep learning the map as they go.)");
                     DisableTrainingSettings();
+                    // The overlay is a training/debug aid — switching to Play means
+                    // normal gameplay, so switch it off with the mode.
+                    if (ShowOverlay != null && ShowOverlay.Value)
+                    {
+                        ShowOverlay.Value = false;
+                        Log.LogInfo("[BOT] Overlay switched off with Play mode");
+                    }
                     // Clean slate: kill all bots + player and start a real round on this
                     // map (training suppressed rounds, so the current one is stale).
                     BotManager.Instance?.StartFreshPlayRound();
