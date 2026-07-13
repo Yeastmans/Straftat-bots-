@@ -11,6 +11,9 @@ namespace StraftatBots
         };
 
         public int BotId;
+        // Stable config slot 0-7 (lobby position). BotId keeps incrementing across
+        // respawns/re-adds, so BotId%8 drifted off the "Bot N Name/Skill" settings.
+        public int SlotIndex;
         public string Name;
         public int SuitIndex;
         public int CigIndex;
@@ -22,8 +25,9 @@ namespace StraftatBots
         public BotController Controller;
         public GameObject PlayerObject;
 
-        public static BotData CreateRandom(int botId)
+        public static BotData CreateRandom(int botId, int slot = -1)
         {
+            if (slot < 0) slot = botId % 8;
             int maxSuits = 1;
             int maxHats = 0;
             int maxCigs = 1;
@@ -38,8 +42,7 @@ namespace StraftatBots
             }
 
             // Use custom name from config if set, otherwise default
-            string name = BotNames[botId % BotNames.Length];
-            int slot = botId % 8;
+            string name = BotNames[slot % BotNames.Length];
             if (Plugin.BotNames != null && slot < Plugin.BotNames.Length && Plugin.BotNames[slot] != null)
             {
                 string custom = Plugin.BotNames[slot].Value;
@@ -50,6 +53,7 @@ namespace StraftatBots
             return new BotData
             {
                 BotId = botId,
+                SlotIndex = slot,
                 Name = name,
                 SuitIndex = Random.Range(0, maxSuits),
                 HatIndex = maxHats > 0 ? Random.Range(0, maxHats) : -1,

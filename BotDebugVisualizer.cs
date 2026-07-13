@@ -103,6 +103,7 @@ namespace StraftatBots
                 GL.LoadProjectionMatrix(GL.GetGPUProjectionMatrix(cam.projectionMatrix, false));
                 GL.modelview = cam.worldToCameraMatrix;
 
+                if (showEdges) DrawNavMesh(cam);
                 if (showNodes) DrawGraphNodes(cam);
                 if (showEdges) DrawGraphEdges(cam);
                 if (showPaths) DrawBotPaths();
@@ -151,6 +152,50 @@ namespace StraftatBots
                 }
                 GL.End();
             }
+        }
+
+        // ============ NAVMESH VISUALIZATION ============
+
+        /// <summary>Wireframe of the auto-baked ground navmesh (cyan). Makes "is the bake
+        /// actually working on this map" visible at a glance.</summary>
+        static void DrawNavMesh(Camera cam)
+        {
+            var verts = BotNavMesh.TriVertices;
+            var idx = BotNavMesh.TriIndices;
+            if (verts == null || idx == null || idx.Length < 3) return;
+
+            Vector3 camPos = cam.transform.position;
+            const float maxDist = 60f;
+            const float maxDistSqr = maxDist * maxDist;
+            Vector3 lift = Vector3.up * 0.03f;
+
+            GL.Begin(GL.LINES);
+            GL.Color(new Color(0f, 0.85f, 1f, 0.18f));
+            for (int i = 0; i + 2 < idx.Length; i += 3)
+            {
+                Vector3 a = verts[idx[i]];
+                Vector3 b = verts[idx[i + 1]];
+                Vector3 c = verts[idx[i + 2]];
+                // Cull only when the whole triangle is far away. Flat maps merge into a
+                // handful of GIANT triangles — testing a single vertex culled tris that
+                // span directly beneath the camera and made the mesh invisible.
+                if ((a - camPos).sqrMagnitude > maxDistSqr
+                    && (b - camPos).sqrMagnitude > maxDistSqr
+                    && (c - camPos).sqrMagnitude > maxDistSqr)
+                {
+                    // All corners far — still draw if the camera hovers over the tri's span.
+                    float minX = Mathf.Min(a.x, b.x, c.x), maxX = Mathf.Max(a.x, b.x, c.x);
+                    float minZ = Mathf.Min(a.z, b.z, c.z), maxZ = Mathf.Max(a.z, b.z, c.z);
+                    if (camPos.x < minX - maxDist || camPos.x > maxX + maxDist
+                        || camPos.z < minZ - maxDist || camPos.z > maxZ + maxDist)
+                        continue;
+                }
+                a += lift; b += lift; c += lift;
+                GL.Vertex(a); GL.Vertex(b);
+                GL.Vertex(b); GL.Vertex(c);
+                GL.Vertex(c); GL.Vertex(a);
+            }
+            GL.End();
         }
 
         // ============ GRAPH VISUALIZATION ============
@@ -606,8 +651,8 @@ namespace StraftatBots
                     GL.End();
                 }
 
-                // Stuck
-                if (bot.DbgStuckTimer > 1f)
+                // Stuck (never while climbing — ladder progress isn't stuck)
+                if (bot.DbgStuckTimer > 1f && !bot.DbgOnLadder)
                 {
                     GL.Begin(GL.LINES);
                     float pulse = Mathf.PingPong(Time.time * 3f, 1f);
@@ -644,7 +689,7 @@ namespace StraftatBots
                 string flags = "";
                 if (bot.DbgOnLadder) flags += " [LADDER]";
                 if (bot.DbgIsSliding) flags += " [SLIDE]";
-                if (bot.DbgStuckTimer > 0.5f) flags += $" [STUCK {bot.DbgStuckTimer:F1}s E{bot.DbgStuckEscalation}]";
+                if (bot.DbgStuckTimer > 0.5f && !bot.DbgOnLadder) flags += $" [STUCK {bot.DbgStuckTimer:F1}s E{bot.DbgStuckEscalation}]";
                 if (bot.DbgIsCrouching) flags += " [CROUCH]";
 
                 int graphNodes = NavGraph.Instance?.NodeCount ?? 0;

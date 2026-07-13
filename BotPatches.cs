@@ -197,9 +197,10 @@ namespace StraftatBots
                         null, new[] { typeof(GameObject), typeof(GameObject), typeof(Vector3) }, null);
                     if (changeDress != null)
                     {
+                        var prefix = typeof(BotPatches).GetMethod(nameof(ChangeDress_Prefix), BindingFlags.Public | BindingFlags.Static);
                         var postfix = typeof(BotPatches).GetMethod(nameof(ChangeDress_Postfix), BindingFlags.Public | BindingFlags.Static);
-                        _harmony.Patch(changeDress, postfix: new HarmonyMethod(postfix));
-                        Plugin.Log.LogInfo("  Patched: PlayerSetup.ChangeDress (strip bot hat/cig)");
+                        _harmony.Patch(changeDress, prefix: new HarmonyMethod(prefix), postfix: new HarmonyMethod(postfix));
+                        Plugin.Log.LogInfo("  Patched: PlayerSetup.ChangeDress (skip for bots + strip backup)");
                     }
                 }
                 catch (Exception e) { Plugin.Log.LogWarning($"  ChangeDress patch failed: {e.Message}"); }
@@ -557,13 +558,32 @@ namespace StraftatBots
             Plugin.Log.LogInfo($"  Patched: {type.Name}.{methodName}");
         }
 
+        /// <summary>Skip ChangeDress ENTIRELY for bots — they dress themselves via
+        /// ApplyAllCosmetics. The instance-id registry works even before BotController is
+        /// attached (the race that let a hat slip through; the game's death code then
+        /// detached it into the world as a giant white slab frozen at the death spot).</summary>
+        public static bool ChangeDress_Prefix(PlayerSetup __instance)
+        {
+            try
+            {
+                if (__instance == null) return true;
+                if (BotManager.IsBotObject(__instance.gameObject)) return false;
+                if (__instance.GetComponent<BotController>() != null) return false;
+            }
+            catch { }
+            return true;
+        }
+
         /// <summary>Strip the hat + cig the game's ChangeDress instantiates on bots (they render
-        /// as white untextured slabs). Suit is applied earlier in ChangeDress and is left intact.</summary>
+        /// as white untextured slabs). Backup behind the prefix skip. Mod-dressed cosmetics
+        /// (BOT_HAT_/BOT_CIG_ from ApplyAllCosmetics) are NOT touched — bots wear those.</summary>
         public static void ChangeDress_Postfix(PlayerSetup __instance)
         {
             try
             {
-                if (__instance == null || __instance.GetComponent<BotController>() == null) return;
+                if (__instance == null) return;
+                if (!BotManager.IsBotObject(__instance.gameObject)
+                    && __instance.GetComponent<BotController>() == null) return;
                 if (__instance.hat != null) { UnityEngine.Object.Destroy(__instance.hat); __instance.hat = null; }
                 var mount = __instance.hatToWearPosition;
                 if (mount != null)
@@ -571,10 +591,13 @@ namespace StraftatBots
                     for (int i = mount.childCount - 1; i >= 0; i--)
                     {
                         var child = mount.GetChild(i);
-                        if (child.GetComponent<HatPosition>() != null)
-                            UnityEngine.Object.Destroy(child.gameObject);
+                        if (child.GetComponent<HatPosition>() == null) continue;
+                        if (child.name.StartsWith("BOT_HAT_", StringComparison.OrdinalIgnoreCase)
+                            || child.name.StartsWith("BOT_CIG_", StringComparison.OrdinalIgnoreCase))
+                            continue; // mod-applied cosmetics stay on
+                        UnityEngine.Object.Destroy(child.gameObject);
                     }
-                    mount.gameObject.SetActive(false);
+                    // Mount stays ACTIVE — bots wear mod-applied cosmetics now.
                 }
             }
             catch (Exception e) { Plugin.Log.LogWarning($"ChangeDress_Postfix: {e.Message}"); }

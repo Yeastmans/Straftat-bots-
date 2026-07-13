@@ -137,7 +137,8 @@ namespace StraftatBots
         public static NavGraph Instance { get; private set; }
 
         // v5: adds persistent edge trust / bot validation fields.
-        private const int FILE_VERSION = 5;
+        // v6: adds training stage + walked coverage (no retraining every session).
+        private const int FILE_VERSION = 6;
         private const float BASE_MERGE_RADIUS = 1.0f;         // Min spacing between nodes (scaled by density)
         private const float BASE_CLUSTER_MERGE = 1.5f;      // Cluster merge radius (scaled by density)
         private const float BASE_NeighborRadius = 2.0f;    // Connection range (scaled by density)

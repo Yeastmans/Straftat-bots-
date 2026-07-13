@@ -89,12 +89,32 @@ namespace StraftatBots
             _camPos = _camTf.position;
 
             Active = true;
-            Plugin.Log.LogInfo("[FreeCam] ENABLED — WASD move, mouse look, Shift=fast, Ctrl=slow. Click button again to return.");
+            Plugin.Log.LogInfo("[FreeCam] ENABLED — WASD move, mouse look, Shift=fast, Ctrl=slow. Click button again to drop in at the camera.");
         }
 
         private void Disable()
         {
             Active = false;
+
+            // Teleport the player body to where the freecam is, eye-height corrected,
+            // facing the freecam's yaw — turning freecam off resumes play from here,
+            // not from where the body was left standing.
+            if (_fpc != null && _camTf != null)
+            {
+                Vector3 eyeWorld = _originalParent != null
+                    ? _originalParent.TransformPoint(_originalLocalPos) // camera's would-be position (body hasn't moved since enable)
+                    : _fpc.transform.position + Vector3.up * 1.6f;
+                Vector3 eyeOffset = eyeWorld - _fpc.transform.position;
+                Vector3 targetPos = _camPos - eyeOffset;
+
+                var cc = _fpc.GetComponent<CharacterController>();
+                bool ccWasEnabled = cc != null && cc.enabled;
+                if (cc != null) cc.enabled = false;
+                _fpc.transform.position = targetPos;
+                _fpc.transform.rotation = Quaternion.Euler(0f, _yaw, 0f); // yaw only — pitch lives on the camera
+                if (cc != null) cc.enabled = ccWasEnabled;
+                Plugin.Log.LogInfo($"[FreeCam] Player dropped in at freecam position {targetPos}");
+            }
 
             if (_camTf != null && _originalParent != null)
             {

@@ -18,6 +18,7 @@ namespace StraftatBots
         public int BlockedEdges;
         public int SpecialEdges;
         public int TrustedSpecialEdges;
+        public int NeedsDemoSpecialEdges;   // special edges bots gave up on — resolved, not pending
         public int AnchorCount;
         public int ConnectedAnchors;
         public int ValidatedAnchorRoutes;
@@ -35,6 +36,10 @@ namespace StraftatBots
         public float TrustProgress;
         public float CleanupProgress;
         public float StageProgress;
+        // True when the stage metric hasn't moved for a while with bots actively
+        // training — the honest "nothing more is coming, advance when ready" signal
+        // instead of a bar that silently stalls at an arbitrary percentage.
+        public bool StageSettled;
         public string StageName;
         public string StageInstruction;
         public string DemoHint;
@@ -48,6 +53,7 @@ namespace StraftatBots
         public bool HasRouteTarget;
         public Vector3 RouteStartPosition;
         public Vector3 RouteEndPosition;
+        public List<Vector3> UnconnectedWeaponPositions;
         public string Summary;
     }
 
@@ -58,15 +64,124 @@ namespace StraftatBots
         private const int MIN_PLAY_NODES = 200;
         private MapCertificationReport _cachedCertification;
         private float _lastCertificationTime = -999f;
+        private float _nextAutoPruneTime;
         private readonly Dictionary<string, float> _validationLabelCooldowns = new Dictionary<string, float>();
-        private string _trainingHint;
-        private float _trainingHintUntil;
 
         private static EdgeTrustState NormalizeTrustState(byte value)
         {
             return value <= (byte)EdgeTrustState.Blocked
                 ? (EdgeTrustState)value
                 : EdgeTrustState.Candidate;
+        }
+
+        // ---- Manual 3-stage training progression (per map, session-persistent) ----
+        // Stage 1: Explore — bots & player roam, connect areas.
+        // Stage 2: Weapons — disconnected junk pruned on entry; unlinked weapons marked,
+        //          bots & player reach them.
+        // Stage 3: Confirmation — bots run routes across the map to confirm walkability.
+        private static readonly Dictionary<string, int> _stageByMap = new Dictionary<string, int>();
+
+        public int TrainingStage
+        {
+            get
+            {
+                return CurrentMap != null && _stageByMap.TryGetValue(CurrentMap, out int s)
+                    ? s : 1;
+            }
+            set
+            {
+                if (CurrentMap != null) _stageByMap[CurrentMap] = Mathf.Clamp(value, 1, 3);
+                _cachedCertification = null;
+            }
+        }
+
+        /// <summary>The one training button. 1→2 prunes disconnected data; 3→ hands off to Play.</summary>
+        public void AdvanceTrainingStage()
+        {
+            int stage = TrainingStage;
+            if (stage == 1)
+            {
+                PruneDisconnectedFromSpawn();
+                TrainingStage = 2;
+                Plugin.Log.LogInfo("[NavGraph] Training advanced to Stage 2: Weapons");
+            }
+            else if (stage == 2)
+            {
+                TrainingStage = 3;
+                Plugin.Log.LogInfo("[NavGraph] Training advanced to Stage 3: Confirmation");
+            }
+            else if (Plugin.NavGraphMode != null)
+            {
+                Plugin.NavGraphMode.Value = "Play";
+                Plugin.Log.LogInfo("[NavGraph] Training complete — switched to Play");
+            }
+            _cachedCertification = null;
+        }
+
+        /// <summary>Stage-2 entry cleanup: drop every node the map can't actually reach —
+        /// not connected to a spawn by graph edges AND not sitting on the baked ground
+        /// mesh. Map-location nodes (weapons/spawns/patrol) always survive: unlinked
+        /// weapons are exactly what stage 2 is about.</summary>
+        public void PruneDisconnectedFromSpawn()
+        {
+            if (IsLocked || !HasData) return;
+
+            var spawnIds = new List<int>();
+            foreach (var loc in MapLocations)
+                if (loc.label == "Spawn")
+                {
+                    var sn = GetNodeById(loc.nodeId);
+                    if (sn != null && sn.Confidence > 0f) spawnIds.Add(sn.Id);
+                }
+            if (spawnIds.Count == 0)
+                foreach (var loc in MapLocations)
+                {
+                    var sn = GetNodeById(loc.nodeId);
+                    if (sn != null && sn.Confidence > 0f) spawnIds.Add(sn.Id);
+                }
+
+            var keep = new HashSet<int>();
+            foreach (int s in spawnIds)
+                foreach (int id in FloodReachable(s, trustedOnly: false))
+                    keep.Add(id);
+
+            var locIds = new HashSet<int>();
+            foreach (var loc in MapLocations) locIds.Add(loc.nodeId);
+
+            // Spawn WORLD positions for mesh-route checks. Merely sitting on the baked
+            // mesh is not enough to survive: the downward bake scan leaves isolated
+            // mesh islands (roof tops, wall interiors) that sample fine but route
+            // nowhere — nodes there are exactly the junk this prune is for.
+            var spawnPositions = new List<Vector3>();
+            foreach (var loc in MapLocations)
+                if (loc.label == "Spawn") spawnPositions.Add(loc.pos);
+            if (spawnPositions.Count == 0)
+                foreach (int sid in spawnIds)
+                {
+                    var sn = GetNodeById(sid);
+                    if (sn != null) spawnPositions.Add(sn.Position);
+                }
+
+            int removed = 0;
+            foreach (var node in Nodes)
+            {
+                if (node == null || node.Confidence <= 0f) continue;
+                if (keep.Contains(node.Id) || locIds.Contains(node.Id)) continue;
+                if (BotNavMesh.Ready
+                    && UnityEngine.AI.NavMesh.SamplePosition(
+                        node.Position, out _, 0.8f, UnityEngine.AI.NavMesh.AllAreas)
+                    && MeshRoutedFromAnySpawn(spawnPositions, node.Position))
+                    continue; // mesh can genuinely WALK there from a spawn
+                node.Confidence = 0f;
+                removed++;
+            }
+            if (removed > 0)
+            {
+                Compact();
+                _dirty = true;
+            }
+            Plugin.Log.LogInfo($"[NavGraph] Cleanup: removed {removed} disconnected nodes/paths");
+            _cachedCertification = null;
         }
 
         public MapCertificationReport GetCertificationReport(bool force = false)
@@ -134,6 +249,8 @@ namespace StraftatBots
 
                 if (IsTrustedForPlay(edge) && IsSpecialTraversal(edge))
                     report.TrustedSpecialEdges++;
+                if (edge.TrustState == EdgeTrustState.NeedsDemo && IsSpecialTraversal(edge))
+                    report.NeedsDemoSpecialEdges++;
             }
 
             report.ConnectedAnchors = CountConnectedAnchors(anchorIds, trustedOnly: false);
@@ -180,9 +297,59 @@ namespace StraftatBots
                 ? (totalPlayer > 0 ? reachablePlayer / (float)totalPlayer : 0f)
                 : (report.ActiveNodes > 0 ? reachableAll / (float)report.ActiveNodes : 0f);
 
-            int connectedWeapons = 0;
-            foreach (int wid in weaponIds) if (reachableFromSpawn.Contains(wid)) connectedWeapons++;
+            var connectedWeaponSet = new HashSet<int>();
+            foreach (int wid in weaponIds) if (reachableFromSpawn.Contains(wid)) connectedWeaponSet.Add(wid);
+
+            // ---- NavMesh augmentation: a complete baked-mesh route from spawn IS a working
+            // route — it needs no bot-validation grind. Without this, weapon/route progress
+            // stalls forever once bots walk the navmesh instead of grinding graph edges. ----
+            bool navmeshReady = BotNavMesh.Ready;
+            if (navmeshReady)
+            {
+                Vector3 spawnPos = Vector3.zero;
+                bool haveSpawn = false;
+                foreach (var loc in MapLocations)
+                    if (loc.label == "Spawn") { spawnPos = loc.pos; haveSpawn = true; break; }
+                if (!haveSpawn && spawnSources.Count > 0)
+                {
+                    var sn = GetNodeById(spawnSources[0]);
+                    if (sn != null) { spawnPos = sn.Position; haveSpawn = true; }
+                }
+                if (haveSpawn)
+                {
+                    var nmRouted = new HashSet<int>();
+                    foreach (int aid in anchorIds)
+                    {
+                        var an = GetNodeById(aid);
+                        if (an != null && NavMeshRouteExists(spawnPos, an.Position))
+                            nmRouted.Add(aid);
+                    }
+                    int nmWeapons = 0;
+                    foreach (int wid in weaponIds)
+                        if (nmRouted.Contains(wid)) { nmWeapons++; connectedWeaponSet.Add(wid); }
+
+                    report.ConnectedAnchors = Mathf.Max(report.ConnectedAnchors, nmRouted.Count);
+                    report.ValidatedAnchorRoutes = Mathf.Max(report.ValidatedAnchorRoutes, nmRouted.Count);
+                    report.ValidatedWeaponRoutes = Mathf.Max(report.ValidatedWeaponRoutes, nmWeapons);
+                    // Ground coverage is MEASURED against the baked mesh: every
+                    // spawn-reachable scan cell starts unwalked and fills in as bots and
+                    // players actually walk it. Out-of-bounds bake islands were excluded
+                    // by the bake-time flood fill, so 100% is genuinely attainable.
+                    report.ReachableNodeFraction = BotNavMesh.WalkedCoverage;
+                }
+            }
+            int connectedWeapons = connectedWeaponSet.Count;
             report.ConnectedWeaponCount = connectedWeapons;
+
+            // Weapons NOT yet connected — stage 2 marks these in the world as targets.
+            report.UnconnectedWeaponPositions = new List<Vector3>();
+            foreach (int wid in weaponIds)
+            {
+                if (connectedWeaponSet.Contains(wid)) continue;
+                var wn = GetNodeById(wid);
+                if (wn != null && wn.Confidence > 0f)
+                    report.UnconnectedWeaponPositions.Add(wn.Position);
+            }
 
             report.CoverageProgress = report.ReachableNodeFraction;
             report.ConnectionProgress = report.AnchorCount <= 1
@@ -216,14 +383,30 @@ namespace StraftatBots
             float candidatePenalty = Mathf.Min(8f, Mathf.Max(0, report.CandidateEdges - report.BotValidatedEdges) * 0.05f);
             float badNodePenalty = Mathf.Min(16f, report.BadNodeCount * 2f);
 
-            report.Score = Mathf.Clamp(nodeScore + edgeScore + anchorScore + routeScore + weaponScore + trustScore + specialScore
-                - candidatePenalty - badNodePenalty, 0f, 100f);
-            report.NeedsTraining = report.ActiveNodes < MIN_PLAY_NODES
-                || report.ReachableNodeFraction < 0.6f
-                || report.Score < 70f
-                || report.BadNodeCount > 2
-                || (connectedWeapons > 0 && report.ValidatedWeaponRoutes < Mathf.Max(1, connectedWeapons / 2))
-                || (report.AnchorCount > 2 && report.ConnectedAnchors < Mathf.Max(2, report.AnchorCount / 2));
+            if (navmeshReady)
+            {
+                // Ground navigation is solved by the baked mesh; the score only reflects what
+                // is actually left: linking areas/weapons (jumps, ladders) and bad-data cleanup.
+                report.Score = Mathf.Clamp(40f
+                    + report.ConnectionProgress * 20f
+                    + report.WeaponProgress * 25f
+                    + report.CleanupProgress * 15f
+                    - badNodePenalty, 0f, 100f);
+                report.NeedsTraining = report.BadNodeCount > 2
+                    || (report.ConnectedWeaponCount > 0 && report.WeaponProgress < 0.5f)
+                    || (report.AnchorCount > 2 && report.ConnectionProgress < 0.5f);
+            }
+            else
+            {
+                report.Score = Mathf.Clamp(nodeScore + edgeScore + anchorScore + routeScore + weaponScore + trustScore + specialScore
+                    - candidatePenalty - badNodePenalty, 0f, 100f);
+                report.NeedsTraining = report.ActiveNodes < MIN_PLAY_NODES
+                    || report.ReachableNodeFraction < 0.6f
+                    || report.Score < 70f
+                    || report.BadNodeCount > 2
+                    || (connectedWeapons > 0 && report.ValidatedWeaponRoutes < Mathf.Max(1, connectedWeapons / 2))
+                    || (report.AnchorCount > 2 && report.ConnectedAnchors < Mathf.Max(2, report.AnchorCount / 2));
+            }
 
             ApplyCertificationStage(report, weaponIds, anchorIds);
 
@@ -242,17 +425,43 @@ namespace StraftatBots
             return $"Map undertrained: {r.Summary}. Switch to Training/Validate before Play.";
         }
 
+        // ---- Fall-death heatmap (session): where bots died falling into the void.
+        // Path candidates near recent death spots score down and stage-1 explore avoids
+        // them, so the same lip doesn't claim bot after bot. Entries decay (4 min). ----
+        private readonly List<Vector4> _fallDeaths = new List<Vector4>(32); // xyz + timestamp
+
+        public void ReportFallDeath(Vector3 lastGroundedPos)
+        {
+            _fallDeaths.Add(new Vector4(lastGroundedPos.x, lastGroundedPos.y, lastGroundedPos.z, Time.time));
+            if (_fallDeaths.Count > 64) _fallDeaths.RemoveAt(0);
+            Plugin.Log.LogInfo($"[NavGraph] Fall death recorded near {lastGroundedPos} ({_fallDeaths.Count} hot spots)");
+        }
+
+        /// <summary>Accumulated penalty for a position near recent fall deaths.
+        /// ~1 per fresh death within 4m, fading to ~0.15 over 4 minutes.</summary>
+        public float FallDeathPenalty(Vector3 pos)
+        {
+            if (_fallDeaths.Count == 0) return 0f;
+            float penalty = 0f;
+            float now = Time.time;
+            for (int i = _fallDeaths.Count - 1; i >= 0; i--)
+            {
+                Vector4 d = _fallDeaths[i];
+                float age = now - d.w;
+                if (age > 240f) { _fallDeaths.RemoveAt(i); continue; }
+                float dx = pos.x - d.x, dz = pos.z - d.z;
+                if (dx * dx + dz * dz < 16f && Mathf.Abs(pos.y - d.y) < 4f)
+                    penalty += Mathf.Lerp(1f, 0.15f, age / 240f);
+            }
+            return penalty;
+        }
+
+        /// <summary>Training events worth surfacing. The UI hint panel was removed in the
+        /// stage redesign, so these go to the log now (grep "[TrainingHint]").</summary>
         public void SetTrainingHint(string message, float seconds = 12f)
         {
             if (string.IsNullOrWhiteSpace(message)) return;
-            _trainingHint = message;
-            _trainingHintUntil = Time.time + Mathf.Max(1f, seconds);
-            _cachedCertification = null;
-        }
-
-        public string GetTrainingHint()
-        {
-            return Time.time <= _trainingHintUntil ? _trainingHint : null;
+            Plugin.Log.LogInfo($"[TrainingHint] {message}");
         }
 
         public void SuppressValidationLabel(string label, float seconds, string message = null)
@@ -352,7 +561,7 @@ namespace StraftatBots
                     edge.TrustState = EdgeTrustState.NeedsDemo;
                     _demoNeededEdges.Add(((long)edge.From << 32) | (uint)edge.To);
                     if (newlyNeedsDemo)
-                        SetTrainingHint("WALK THIS YOURSELF: follow the START and END markers and just walk the route once — it becomes trusted instantly.", 30f);
+                        SetTrainingHint("Bots keep failing one route — if you happen to walk that area yourself, they learn it instantly.", 15f);
                 }
             }
         }
@@ -391,12 +600,30 @@ namespace StraftatBots
                 }
             }
 
-            foreach (var loc in MapLocations)
+            // PERFORMANCE: every Consider() is a full graph pathfind. Only try the few
+            // nearest non-suppressed locations instead of scanning every location on the
+            // map (with callers throttled, this brings stage 3 from a pathfind storm to
+            // a handful of searches per bot every couple of seconds).
+            var nearLocs = new List<KeyValuePair<float, int>>();
+            for (int li = 0; li < MapLocations.Count; li++)
             {
+                var loc = MapLocations[li];
                 if (loc.label == "PatrolPoint") continue;
+                if (IsValidationLabelSuppressed(loc.label)) continue;
                 var node = GetNodeById(loc.nodeId);
                 if (node == null || node.Confidence <= 0f) continue;
+                nearLocs.Add(new KeyValuePair<float, int>(
+                    (node.Position - startPos).sqrMagnitude, li));
+            }
+            nearLocs.Sort((a, b) => a.Key.CompareTo(b.Key));
+            int considered = 0;
+            for (int i = 0; i < nearLocs.Count && considered < 5; i++)
+            {
+                var loc = MapLocations[nearLocs[i].Value];
+                var node = GetNodeById(loc.nodeId);
+                if (node == null) continue;
                 Consider(node.Position, loc.label, requireTargetClose: true);
+                considered++;
             }
 
             var frontier = FindFrontierNode(startPos, 8f);
@@ -425,7 +652,10 @@ namespace StraftatBots
                 else if (edge.TrustState == EdgeTrustState.BotTesting) score += 3f;
                 else if (edge.TrustState == EdgeTrustState.PlayerProven) score += 2f;
                 else if (edge.TrustState == EdgeTrustState.BotValidated) score -= 0.75f;
-                if (IsSpecialTraversal(edge)) score += 2.5f;
+                // Untrusted SPECIAL edges (jumps/falls/ladders/teleporters) are what
+                // stage 3 exists to confirm — the mesh already covers plain ground.
+                if (IsSpecialTraversal(edge))
+                    score += IsTrustedForPlay(edge) ? 2.5f : 12f;
             }
 
             return score;
@@ -450,69 +680,120 @@ namespace StraftatBots
 
         private void ApplyCertificationStage(MapCertificationReport report, List<int> weaponIds, List<int> anchorIds)
         {
-            string liveHint = GetTrainingHint();
-            if (!string.IsNullOrWhiteSpace(liveHint))
-                report.DemoHint = liveHint;
-
-            // Stage 0 (only when bad data is really piling up): clean it so it stops dragging
-            // the mesh down. A couple of bad points are tolerated — Play is non-blocking anyway.
-            if (report.BadNodeCount > 2)
+            // Background hygiene (never shown as a stage): bad route points self-prune.
+            if (report.BadNodeCount > 2 && !IsLocked && Time.time >= _nextAutoPruneTime)
             {
-                report.StageNumber = 0;
-                report.StageName = "Repair: Bad Data";
-                report.StageProgress = report.CleanupProgress;
-                report.StageInstruction = "Several route points keep failing and are dragging the mesh down.";
-                report.PrimaryAction = "Press Clean Bad Nodes, then keep building the mesh.";
-                report.NextButtonLabel = "Clean Bad Nodes";
-                report.RecommendedBehavior = "Validate";
-                return;
+                _nextAutoPruneTime = Time.time + 20f;
+                try
+                {
+                    PruneBadNodes(50);
+                    Plugin.Log.LogInfo($"[NavGraph] Auto-pruned bad route points ({report.BadNodeCount} flagged)");
+                }
+                catch { }
             }
 
-            // Stage 1 — BUILD THE MESH (the initial connect pass): the player walks and bots
-            // Explore until most of the map AND its weapons are reachable from spawn.
-            bool meshThin = report.ActiveNodes < MIN_PLAY_NODES
-                || report.ReachableNodeFraction < 0.6f
-                || (report.AnchorCount > 2 && report.ConnectedAnchors < Mathf.Max(2, report.AnchorCount / 2));
-            if (meshThin)
+            // Manual 3-stage flow — the user advances stages with ONE button; everything
+            // inside a stage runs automatically.
+            int stage = TrainingStage;
+            report.StageNumber = stage;
+            float rawProgress;
+            switch (stage)
             {
-                report.StageNumber = 1;
-                report.StageName = "Stage 1: Build the Mesh";
-                report.StageProgress = Mathf.Min(report.CoverageProgress, report.ConnectionProgress);
-                report.StageInstruction = "Connect the map: walk it yourself and let bots Explore so most rooms, "
-                    + "upper levels, ladders, jumps and weapon spawns link up from a spawn.";
-                report.PrimaryAction = "Walk around (you train fastest) and run Explore. Reach every area and weapon.";
-                report.NextButtonLabel = "Run Explore";
-                report.RecommendedBehavior = "Explore";
-                TryAssignUnvalidatedWeaponTarget(report, weaponIds, anchorIds);
-                return;
+                case 1:
+                    report.StageName = "STAGE 1/3 — EXPLORE";
+                    // Coverage-led: stage 1 is about walking the map. Anchor connection
+                    // contributes but can't hard-cap the bar the way the old min() did
+                    // (jump-only anchors belong to stages 2-3, not here).
+                    rawProgress = report.CoverageProgress * 0.7f + report.ConnectionProgress * 0.3f;
+                    report.StageInstruction = "Bots and you run around the map — coverage fills as the ground actually gets walked.";
+                    report.NextButtonLabel = "Next Stage: Weapons";
+                    report.RecommendedBehavior = "Explore";
+                    break;
+                case 2:
+                    report.StageName = "STAGE 2/3 — WEAPONS";
+                    // Connected-out-of-ALL-weapons. The old metric divided validated by
+                    // *already-connected* weapons, so it read 100% while unreachable
+                    // weapons remained and DROPPED when a bot connected a new one.
+                    rawProgress = report.WeaponAnchorCount > 0
+                        ? Mathf.Clamp01(report.ConnectedWeaponCount / (float)report.WeaponAnchorCount)
+                        : 1f;
+                    report.StageInstruction = "Unlinked weapons are marked in the world — bots and you reach them to connect their routes.";
+                    report.NextButtonLabel = "Next Stage: Confirmation";
+                    report.RecommendedBehavior = "Explore";
+                    break;
+                default:
+                    report.StageName = "STAGE 3/3 — CONFIRMATION";
+                    // Progress measures what stage 3 actually exists to confirm: special
+                    // traversal (jumps/falls/ladders/teleporters) and a working route to
+                    // every key location. NeedsDemo edges count as RESOLVED — bots asked
+                    // and answered ("can't do it without a demo"); leaving them in the
+                    // denominator stalled the bar forever on maps with junk jump edges.
+                    float specialProgress = report.SpecialEdges > 0
+                        ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges) / (float)report.SpecialEdges)
+                        : 1f;
+                    float anchorProgress = report.AnchorCount > 1
+                        ? Mathf.Clamp01(report.ValidatedAnchorRoutes / (float)report.AnchorCount)
+                        : 1f;
+                    rawProgress = Mathf.Min(specialProgress, anchorProgress);
+                    report.StageInstruction = "Bots confirm jumps, ladders and routes to every key location.";
+                    report.NextButtonLabel = "Finish: Switch To Play";
+                    report.RecommendedBehavior = "Validate";
+                    break;
             }
+            TrackStageProgress(report, stage, rawProgress);
+            report.PrimaryAction = null;
+            report.NeedsTraining = stage < 3;
+        }
 
-            // Stage 2 — VALIDATE: the mesh is connected; bots prove the routes are reliable.
-            // Anything they keep failing is surfaced as a "walk this yourself" route — no
-            // recording ceremony, your normal walking is already trusted.
-            if (report.Score < 70f || report.TrustProgress < 0.6f
-                || (report.ConnectedWeaponCount > 0 && report.ValidatedWeaponRoutes < Mathf.Max(1, report.ConnectedWeaponCount / 2)))
+        // ---- Stage progress high-water + settle detection ----
+        // The displayed bar never regresses within a stage (denominators legitimately
+        // grow as bots discover more map, which used to make bars run BACKWARD), and
+        // when the metric stops moving while bots are actively training we say so
+        // instead of stalling silently.
+        private string _stageHwMap;
+        private int _stageHwStage = -1;
+        private float _stageHwValue;
+        private float _stageLastGainTime;
+        private const float STAGE_SETTLE_SECONDS = 40f;
+
+        private void TrackStageProgress(MapCertificationReport report, int stage, float rawProgress)
+        {
+            rawProgress = Mathf.Clamp01(rawProgress);
+            if (_stageHwMap != CurrentMap || _stageHwStage != stage)
             {
-                report.StageNumber = 2;
-                report.StageName = "Stage 2: Validate";
-                report.StageProgress = Mathf.Clamp01(report.TrustProgress / 0.6f);
-                report.StageInstruction = "The mesh is connected; bots now need repetition to trust the routes.";
-                report.PrimaryAction = "Run Validate. If a marked route keeps failing, just walk it yourself once — that instantly trusts it.";
-                report.NextButtonLabel = "Run Validate";
-                report.RecommendedBehavior = "Validate";
-                TryAssignUnvalidatedWeaponTarget(report, weaponIds, anchorIds);
-                TryAssignNeedsDemoTarget(report);
-                return;
+                _stageHwMap = CurrentMap;
+                _stageHwStage = stage;
+                _stageHwValue = rawProgress;
+                _stageLastGainTime = Time.time;
             }
+            if (rawProgress > _stageHwValue + 0.004f)
+            {
+                _stageHwValue = rawProgress;
+                _stageLastGainTime = Time.time;
+            }
+            // Paused bots (or Play mode) can't make progress — don't count that as a stall.
+            if (Plugin.TrainingPaused || Mode != NavMode.Training)
+                _stageLastGainTime = Time.time;
 
-            // Stage 3 — READY. A soft finish line: bots keep learning during Play too.
-            report.StageNumber = 3;
-            report.StageName = "Ready";
-            report.StageProgress = 1f;
-            report.StageInstruction = "Map is connected and validated. Bots keep improving it during Play.";
-            report.PrimaryAction = "Switch to Play whenever you like — or keep playing and bots keep learning.";
-            report.NextButtonLabel = "Switch To Play";
-            report.RecommendedBehavior = "None";
+            report.StageProgress = Mathf.Max(_stageHwValue, rawProgress);
+            report.StageSettled = report.StageProgress < 0.99f
+                && Time.time - _stageLastGainTime > STAGE_SETTLE_SECONDS;
+        }
+
+        private static bool NavMeshRouteExists(Vector3 from, Vector3 to)
+        {
+            if (!BotNavMesh.Ready) return false;
+            var path = BotNavMesh.FindCornerPath(from, to, out bool complete);
+            return path != null && complete;
+        }
+
+        /// <summary>Complete baked-mesh route from any spawn to pos — distinguishes
+        /// genuinely walkable spots from isolated bake islands.</summary>
+        private static bool MeshRoutedFromAnySpawn(List<Vector3> spawnPositions, Vector3 pos)
+        {
+            for (int i = 0; i < spawnPositions.Count; i++)
+                if (NavMeshRouteExists(spawnPositions[i], pos)) return true;
+            return false;
         }
 
         private int CountBadNodes(out Vector3 worstPos, out string worstReason, out int worstStrikes)
@@ -534,69 +815,6 @@ namespace StraftatBots
             return count;
         }
 
-        private bool TryAssignNeedsDemoTarget(MapCertificationReport report)
-        {
-            foreach (long packed in _demoNeededEdges)
-            {
-                int from = (int)(packed >> 32);
-                int to = (int)(packed & 0xFFFFFFFF);
-                var fromNode = GetNodeById(from);
-                var toNode = GetNodeById(to);
-                if (fromNode == null || toNode == null) continue;
-                report.HasTargetPosition = true;
-                report.TargetPosition = Vector3.Lerp(fromNode.Position, toNode.Position, 0.5f);
-                report.HasRouteTarget = true;
-                report.RouteStartPosition = fromNode.Position;
-                report.RouteEndPosition = toNode.Position;
-                report.TargetLabel = "Walk this route: START -> END";
-                return true;
-            }
-
-            foreach (var edge in Edges)
-            {
-                if (edge == null || edge.Confidence <= 0f || edge.TrustState != EdgeTrustState.NeedsDemo) continue;
-                var fromNode = GetNodeById(edge.From);
-                var toNode = GetNodeById(edge.To);
-                if (fromNode == null || toNode == null) continue;
-                report.HasTargetPosition = true;
-                report.TargetPosition = Vector3.Lerp(fromNode.Position, toNode.Position, 0.5f);
-                report.HasRouteTarget = true;
-                report.RouteStartPosition = fromNode.Position;
-                report.RouteEndPosition = toNode.Position;
-                report.TargetLabel = $"Walk this {edge.Type} route: START -> END";
-                return true;
-            }
-            return false;
-        }
-
-        private bool TryAssignUnvalidatedWeaponTarget(MapCertificationReport report, List<int> weaponIds, List<int> anchorIds)
-        {
-            foreach (var loc in MapLocations)
-            {
-                if (!IsWeaponLocationLabel(loc.label)) continue;
-                if (!weaponIds.Contains(loc.nodeId)) continue;
-                if (WeaponHasTrustedConnection(loc.nodeId, anchorIds)) continue;
-                var node = GetNodeById(loc.nodeId);
-                if (node == null || node.Confidence <= 0f) continue;
-                report.HasTargetPosition = true;
-                report.TargetPosition = node.Position;
-                report.TargetLabel = $"Weapon route: {loc.label}";
-                return true;
-            }
-            return false;
-        }
-
-        private bool WeaponHasTrustedConnection(int weaponId, List<int> anchorIds)
-        {
-            var reachable = FloodReachable(weaponId, trustedOnly: true);
-            foreach (int anchor in anchorIds)
-            {
-                if (anchor == weaponId) continue;
-                if (reachable.Contains(anchor)) return true;
-            }
-            return false;
-        }
-
         private bool PathHasBadEdges(List<NavNode> path)
         {
             for (int i = 0; i + 1 < path.Count; i++)
@@ -605,6 +823,30 @@ namespace StraftatBots
                     return true;
             }
             return false;
+        }
+
+        /// <summary>Trusted special edge whose endpoints match a from→to hop (used to
+        /// execute mesh-link crossings with the recorded trajectory instead of a blind
+        /// reactive jump).</summary>
+        public NavEdge FindTrustedSpecialEdgeNear(Vector3 from, Vector3 to, float tolerance = 2f)
+        {
+            float tolSqr = tolerance * tolerance;
+            NavEdge best = null;
+            float bestScore = float.MaxValue;
+            foreach (var e in Edges)
+            {
+                if (e == null || e.Confidence <= 0f) continue;
+                if (!IsSpecialTraversal(e) || !IsTrustedForPlay(e)) continue;
+                var fn = GetNodeById(e.From);
+                var tn = GetNodeById(e.To);
+                if (fn == null || tn == null) continue;
+                float dF = (fn.Position - from).sqrMagnitude;
+                float dT = (tn.Position - to).sqrMagnitude;
+                if (dF > tolSqr || dT > tolSqr) continue;
+                float s = dF + dT;
+                if (s < bestScore) { bestScore = s; best = e; }
+            }
+            return best;
         }
 
         private static bool IsSpecialTraversal(NavEdge edge)

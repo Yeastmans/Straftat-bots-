@@ -6,6 +6,50 @@ namespace StraftatBots
     public partial class BotController
     {
 
+        // Recently visited/assigned wander spots (xyz + timestamp in w). Stage-1
+        // pickers reject anything within 7m of an entry younger than 45s so bots
+        // spread onto fresh ground instead of looping familiar routes.
+        private readonly List<Vector4> _recentVisits = new List<Vector4>(24);
+
+        private void RememberVisit(Vector3 pos)
+        {
+            _recentVisits.Add(new Vector4(pos.x, pos.y, pos.z, Time.time));
+            if (_recentVisits.Count > 24) _recentVisits.RemoveAt(0);
+        }
+
+        private bool IsRecentlyVisited(Vector3 pos)
+        {
+            float now = Time.time;
+            for (int i = _recentVisits.Count - 1; i >= 0; i--)
+            {
+                Vector4 v = _recentVisits[i];
+                if (now - v.w > 45f) { _recentVisits.RemoveAt(i); continue; }
+                float dx = pos.x - v.x, dz = pos.z - v.z;
+                if (dx * dx + dz * dz < 49f && Mathf.Abs(pos.y - v.y) < 3f) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Another live bot is already heading within 8m of this spot — pick
+        /// something else so the pack fans out instead of converging.</summary>
+        private bool IsOtherBotTargetingNear(Vector3 pos)
+        {
+            var bots = BotManager.ActiveBots;
+            if (bots == null) return false;
+            foreach (var other in bots)
+            {
+                if (other == null || other == this || other.IsDead) continue;
+                if (!other._hasWanderTarget) continue;
+                float dx = other._wanderTarget.x - pos.x, dz = other._wanderTarget.z - pos.z;
+                if (dx * dx + dz * dz < 64f) return true;
+            }
+            return false;
+        }
+
+        private bool RejectStage1Cell(Vector3 pos)
+            => IsRecentlyVisited(pos) || IsOtherBotTargetingNear(pos)
+            || (NavGraph.Instance != null && NavGraph.Instance.FallDeathPenalty(pos) >= 1.6f);
+
         // SmartExplore state machine — replaces random explore
         private ExploreState _exploreState = ExploreState.None;
         private float _exploreStateTimer;          // Time remaining in current state
@@ -131,6 +175,30 @@ namespace StraftatBots
         private bool TryCommitExploreRoute(Vector3 target, out Vector3 routeEnd)
         {
             routeEnd = target;
+
+            // Navmesh first — on baked maps the corner route IS the explore route. This was
+            // the missing piece: explore committed graph routes directly, so bots never
+            // used the mesh at all in Training (src=NavMeshRoute never appeared in logs).
+            if (BotNavMesh.Ready)
+            {
+                var nm = BotNavMesh.FindCornerPath(transform.position, target, out bool nmComplete);
+                if (nm != null && nm.Count > 1)
+                {
+                    Vector3 nmEnd = nm[nm.Count - 1].Position;
+                    bool useful = nmComplete
+                        || Vector3.Distance(transform.position, target) - Vector3.Distance(nmEnd, target) > 4f;
+                    if (useful)
+                    {
+                        routeEnd = nmComplete ? target : nmEnd;
+                        AcceptGraphRoute(nm, PathSource.NavMeshRoute, routeEnd, ScorePathCandidate(nm, target));
+                        _lastPathTarget = routeEnd;
+                        _repathTimer = Mathf.Max(_repathTimer, 3.5f);
+                        _lastReachedNode = null;
+                        return true;
+                    }
+                }
+            }
+
             if (NavGraph.Instance == null || !NavGraph.Instance.HasData) return false;
 
             List<NavNode> bestPath = null;
@@ -140,6 +208,7 @@ namespace StraftatBots
             void Consider(List<NavNode> path, Vector3 scoreTarget)
             {
                 if (path == null || path.Count <= 1) return;
+                if (IsImmediateBacktrack(path)) return;
                 float score = ScorePathCandidate(path, scoreTarget);
                 if (score > bestScore)
                 {
@@ -612,6 +681,8 @@ namespace StraftatBots
 
         // ===================== WANDER =====================
 
+        private float _validationSearchTimer; // Route search is EXPENSIVE — throttle it
+
         private void HandleTrainingValidation()
         {
             if (NavGraph.Instance == null || !NavGraph.Instance.HasData)
@@ -640,11 +711,18 @@ namespace StraftatBots
                     if (reached >= 2)
                         NavGraph.Instance.ReportRouteValidation(
                             _validationRouteNodeIds.GetRange(0, reached), success: true, _validationRouteLabel);
+                    // ANTI-PING-PONG: a just-validated route goes on cooldown for everyone,
+                    // and this bot remembers the spot — otherwise the next search instantly
+                    // picks the reverse of the same corridor and bots shuttle back and forth.
+                    if (!string.IsNullOrWhiteSpace(_validationRouteLabel))
+                        NavGraph.Instance.SuppressValidationLabel(_validationRouteLabel, 12f);
+                    RememberVisit(_validationRouteTarget);
                     _validationRouteNodeIds.Clear();
                     _validationRouteTimer = 0f;
                     _hasWanderTarget = false;
                     _graphPath.Clear();
                     _graphPathIndex = 0;
+                    _validationSearchTimer = 0.6f + Random.value * 0.6f;
                     return;
                 }
 
@@ -668,10 +746,22 @@ namespace StraftatBots
                     _graphPath.Clear();
                     _graphPathIndex = 0;
                     _stuckTimer = 0f;
+                    _validationSearchTimer = 1.2f + Random.value * 0.8f;
                     return;
                 }
 
                 MoveToward(_validationRouteTarget, _sprintSpeed);
+                return;
+            }
+
+            // PERFORMANCE: TryGetValidationRoute runs a full graph pathfind per candidate.
+            // It used to be called EVERY FRAME per bot whenever no route was active (worst
+            // when all labels were suppressed — permanent per-frame pathfind storm). Now a
+            // bot searches at most every couple of seconds and wanders in between.
+            _validationSearchTimer -= Time.deltaTime;
+            if (_validationSearchTimer > 0f)
+            {
+                Wander();
                 return;
             }
 
@@ -696,8 +786,10 @@ namespace StraftatBots
                 return;
             }
 
-            // No certifiable route exists yet. Fall back to route-first exploration to
-            // gather more candidate data, but do not mark random movement validated.
+            // No certifiable route exists yet (or everything is on cooldown). Back off
+            // before searching again — the search is the expensive part — and gather
+            // more candidate data meanwhile without marking random movement validated.
+            _validationSearchTimer = 2f + Random.value * 1.5f;
             Wander();
         }
 
@@ -741,21 +833,46 @@ namespace StraftatBots
             // using when we gave up is attached so the next bot biases away ≥45°.
             if (_stuckTimer > 2f && _hasWanderTarget && _wanderTarget != Vector3.zero)
             {
-                if (NavGraph.Instance != null)
+                // SmartExplore's ground tactics (EdgeWalk pacing, probing) are what the
+                // player SEES as ping-pong. On a baked map its only remaining job is
+                // discovering jump/ladder links to spots the mesh can't route to — for a
+                // plain stuck-on-walkable-ground case, just pick a fresh target instead.
+                bool meshCantRoute = true;
+                if (BotNavMesh.Ready)
                 {
-                    Vector3 approachDir = _wanderTarget - transform.position;
-                    approachDir.y = 0f;
-                    if (approachDir.sqrMagnitude > 0.01f) approachDir.Normalize();
-                    NavGraph.Instance.PushFrontier(_wanderTarget, approachDir, BotId);
+                    var probe = BotNavMesh.FindCornerPath(transform.position, _wanderTarget, out bool probeComplete);
+                    meshCantRoute = probe == null || !probeComplete;
                 }
-                BeginSmartExplore(_wanderTarget);
+                if (meshCantRoute)
+                {
+                    if (NavGraph.Instance != null)
+                    {
+                        Vector3 approachDir = _wanderTarget - transform.position;
+                        approachDir.y = 0f;
+                        if (approachDir.sqrMagnitude > 0.01f) approachDir.Normalize();
+                        NavGraph.Instance.PushFrontier(_wanderTarget, approachDir, BotId);
+                    }
+                    BeginSmartExplore(_wanderTarget);
+                    _stuckTimer = 0f;
+                    return;
+                }
+
+                _hasWanderTarget = false; // routable but stuck — re-pick below, no pacing
                 _stuckTimer = 0f;
-                return;
+                _graphPath.Clear();
+                _graphPathIndex = 0;
+                _repathTimer = 0f;
             }
 
             if (!_hasWanderTarget || HorizontalDist(transform.position, _wanderTarget) < 3f
                 || _wanderChangeTimer <= 0f || _wanderTarget == Vector3.zero)
             {
+                // Arriving at a target records it — recently visited spots are rejected
+                // by the stage-1 pickers so bots never loop over the same ground.
+                if (_hasWanderTarget && _wanderTarget != Vector3.zero
+                    && HorizontalDist(transform.position, _wanderTarget) < 3f)
+                    RememberVisit(_wanderTarget);
+
                 bool trainingMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
 
                 // Budget decay — when the graph has plateaued, lengthen commitment to
@@ -787,6 +904,33 @@ namespace StraftatBots
                     {
                         _exploredStaleCount = 0; // Reset after forcing new behavior
                         Plugin.Log.LogInfo($"[{BotName}] Explore stale — forcing distant target");
+                    }
+
+                    // STAGE 1 — EXPLORE: unwalked ground IS the objective. Relentlessly
+                    // target unwalked coverage cells; a walked cell can never be returned
+                    // by the picker again, so bots physically cannot re-cover old ground.
+                    // Recently visited/assigned spots are rejected for 45s as retry backoff.
+                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 1
+                        && BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1Cell, out Vector3 unwalked))
+                    {
+                        if (TryAssignExploreTarget(unwalked, Random.Range(10f, 16f) * commitmentMultiplier, requireRoute: false))
+                        {
+                            RememberVisit(unwalked); // backoff even if the run gets abandoned
+                            goto doneWanderPick;
+                        }
+                    }
+
+                    // STAGE 2 — WEAPONS: unlinked weapons are THE objective. Bots hammer
+                    // them until every weapon has a working route.
+                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 2 && Random.value < 0.75f)
+                    {
+                        var (wPos, wLabel) = NavGraph.Instance.FindUnreachableMapLocation(transform.position);
+                        if (wPos != Vector3.zero
+                            && TryAssignExploreTarget(wPos, Random.Range(14f, 22f) * commitmentMultiplier, requireRoute: false))
+                        {
+                            Plugin.Log.LogInfo($"[{BotName}] Stage 2: targeting unlinked weapon '{wLabel}'");
+                            goto doneWanderPick;
+                        }
                     }
 
                     // PRIORITY 0 — Frontier queue. A previous bot gave up on this cell;

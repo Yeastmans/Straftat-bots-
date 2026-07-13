@@ -323,6 +323,19 @@ namespace StraftatBots
                             Edges[ei].TrustState = EdgeTrustState.BotTesting;
                         }
 
+                        // Every real traversal counts toward trust, not just Validate-mode
+                        // runs. This is the learn-during-play loop: a jump a bot lands
+                        // three times becomes BotValidated, which unlocks it for Play
+                        // routing AND mirrors it into the navmesh as a link (SyncGraphLinks).
+                        if (!isPlayer && IsSpecialTraversal(Edges[ei])
+                            && Edges[ei].TrustState != EdgeTrustState.PlayerProven
+                            && Edges[ei].TrustState != EdgeTrustState.BotValidated)
+                        {
+                            Edges[ei].BotValidationSuccesses++;
+                            if (Edges[ei].BotValidationSuccesses >= BOT_VALIDATION_SUCCESSES_TO_TRUST)
+                                Edges[ei].TrustState = EdgeTrustState.BotValidated;
+                        }
+
                         // Jump/Slide edges get massive boost on success — proven traversable
                         float edgeBoost = boost;
                         if (Edges[ei].Type == EdgeType.Jump || Edges[ei].Type == EdgeType.Slide || Edges[ei].Type == EdgeType.WallJump)

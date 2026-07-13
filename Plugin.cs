@@ -23,18 +23,33 @@ namespace StraftatBots
 
         // ===== Gameplay =====
         public static ConfigEntry<bool> LockGraph;
-        public static ConfigEntry<string> RecoveryAggression;
+        public static ConfigEntry<bool> UseNavMesh;
 
         // ===== Training =====
-        public static ConfigEntry<string> TrainingBehavior;
+        // Behavior is STAGE-DRIVEN now (Explore for stages 1-2, Validate for stage 3,
+        // None in Play or when paused) — no user knob, so it is deliberately NOT a
+        // ConfigEntry and never appears in the mod menu.
+        public class BehaviorSetting { public string Value = "Explore"; }
+        public static readonly BehaviorSetting TrainingBehavior = new BehaviorSetting();
 
         // Helper properties
         public static bool IsExploreMode => TrainingBehavior?.Value == "Explore";
         public static bool IsValidateMode => TrainingBehavior?.Value == "Validate";
         public static bool IsTrainingNone => TrainingBehavior?.Value == "None";
+        // Pause flag — the one manual control left in training (walk the map yourself)
+        public static bool TrainingPaused;
 
         // ===== Customise =====
         public static ConfigEntry<string>[] BotNames = new ConfigEntry<string>[8];
+        // Per-bot skill 1-10: scales aim error, reaction time, lock-on speed,
+        // detection range, fire discipline and dodge rate. 5 = the old fixed tuning.
+        public static ConfigEntry<int>[] BotSkills = new ConfigEntry<int>[8];
+
+        public static int GetBotSkill(int slot)
+        {
+            slot = ((slot % 8) + 8) % 8;
+            return BotSkills[slot]?.Value ?? 5;
+        }
 
         // ===== Patrol Locations =====
         public static List<(Vector3 pos, int nodeId)> CustomPatrolLocations = new List<(Vector3, int)>();
@@ -77,6 +92,14 @@ namespace StraftatBots
                     new AcceptableValueList<string>("Training", "Play")));
             NavGraphMode.SettingChanged += (s, e) =>
             {
+                // Apply the mode IMMEDIATELY. It used to be set only at map load
+                // (SpawnBotsDelayed), so a mid-map switch left everything on the stale
+                // mode: bots sat in TRAIN IDLE after switching to Play (Training mode +
+                // behavior None), recorders kept Play gating during training, and the
+                // UI/overlay disagreed with the buttons.
+                if (NavGraph.Instance != null)
+                    NavGraph.Instance.Mode = NavGraphMode.Value == "Play" ? NavMode.Play : NavMode.Training;
+
                 if (NavGraphMode.Value == "Play")
                 {
                     // Play is a warning, not a block. Let the user enter Play even on an
@@ -85,6 +108,15 @@ namespace StraftatBots
                     if (!string.IsNullOrWhiteSpace(warning))
                         Log.LogWarning($"[Certification] {warning} (Play allowed — bots will keep learning the map as they go.)");
                     DisableTrainingSettings();
+                    // Clean slate: kill all bots + player and start a real round on this
+                    // map (training suppressed rounds, so the current one is stale).
+                    BotManager.Instance?.StartFreshPlayRound();
+                }
+                else if (TrainingBehavior != null && TrainingBehavior.Value == "None")
+                {
+                    // Training is automatic: entering it always starts bots exploring
+                    // (the old flow left them frozen on "None" after a Play round-trip).
+                    TrainingBehavior.Value = "Explore";
                 }
             };
 
@@ -120,24 +152,13 @@ namespace StraftatBots
             LockGraph = Config.Bind("Gameplay", "Freeze Map Data", false,
                 "Freeze the navigation graph. Nothing is created, deleted, or modified. " +
                 "Use when you're happy with the trained data and want to preserve it exactly.");
-            RecoveryAggression = Config.Bind("Gameplay", "Recovery Aggression", "Fast",
-                new ConfigDescription(
-                    "How quickly bots escalate through unstuck stages: Slow, Medium, Fast.",
-                    new AcceptableValueList<string>("Slow", "Medium", "Fast")));
+            UseNavMesh = Config.Bind("Gameplay", "Auto Ground Navigation", true,
+                "Automatically generate a walkable navigation mesh for every map at load. " +
+                "Bots can walk anywhere immediately with no training; learned data is still " +
+                "used for jumps, ladders and special routes. Disable to use only learned paths.");
             // ================================================================
-            //  TRAINING — Only active in Training mode. Locked in Play mode.
+            //  TRAINING — behavior is stage-driven (no Bot Behavior knob anymore).
             // ================================================================
-            TrainingBehavior = Config.Bind("Training", "Bot Behavior", "Explore",
-                new ConfigDescription(
-                    "NONE: Bots freeze in place. Train the map yourself.\n" +
-                    "EXPLORE: Bots autonomously explore the map, discover routes.\n" +
-                    "VALIDATE: Bots run route-certification trials and promote reliable paths.",
-                    new AcceptableValueList<string>("None", "Explore", "Validate")));
-            TrainingBehavior.SettingChanged += (s, e) =>
-            {
-                if (NavGraphMode?.Value == "Play" && TrainingBehavior.Value != "None")
-                    TrainingBehavior.Value = "None";
-            };
 
             // ---- Training Buttons (blocked in Play mode) ----
             Config.Bind("Training", "--- Clear All Map Data ---", false,
@@ -180,6 +201,11 @@ namespace StraftatBots
             {
                 BotNames[i] = Config.Bind("Customise", $"Bot {i + 1} Name", defaultNames[i],
                     $"Name for bot slot {i + 1}. Leave blank for default.");
+                BotSkills[i] = Config.Bind("Customise", $"Bot {i + 1} Skill", 5,
+                    new ConfigDescription(
+                        $"Difficulty for bot slot {i + 1}. 1 = easy (slow reactions, wild aim), " +
+                        "5 = normal, 10 = deadly (snap aim, instant reactions). Applies live.",
+                        new AcceptableValueRange<int>(1, 10)));
             }
 
             BotPatches.Apply();
@@ -194,8 +220,9 @@ namespace StraftatBots
         public static float GetScanRadius() => SCAN_RADIUS;
         public static float GetMaxJumpDist() => MAX_JUMP_DIST;
         public static float GetAutoSaveInterval() => AUTO_SAVE_SEC;
-        public static bool IsFastRecovery => RecoveryAggression?.Value == "Fast";
-        public static bool IsMediumRecovery => RecoveryAggression?.Value == "Medium";
+        // Recovery aggression knob removed — normal (medium) pacing always.
+        public static bool IsFastRecovery => false;
+        public static bool IsMediumRecovery => true;
         private static void DisableTrainingSettings()
         {
             if (TrainingBehavior != null) TrainingBehavior.Value = "None";
@@ -203,8 +230,34 @@ namespace StraftatBots
         }
 
         private float _damageSyncDelay = 2f;
+        private float _behaviorSyncTimer;
+        private float _graphLinkSyncTimer;
         private void Update()
         {
+            // Stage-driven behavior: Explore during stages 1-2, Validate during stage 3
+            // (confirmation), None in Play mode or while the user paused the bots.
+            _behaviorSyncTimer -= Time.deltaTime;
+            if (_behaviorSyncTimer <= 0f)
+            {
+                _behaviorSyncTimer = 1f;
+                string want;
+                if (NavGraphMode == null || NavGraphMode.Value == "Play" || TrainingPaused)
+                    want = "None";
+                else
+                    want = (NavGraph.Instance != null && NavGraph.Instance.TrainingStage >= 3)
+                        ? "Validate" : "Explore";
+                if (TrainingBehavior.Value != want) TrainingBehavior.Value = want;
+
+                // Keep trusted jump/fall/teleporter edges mirrored as NavMesh links.
+                // No-op unless the trusted set changed; full sync ~every 10s.
+                _graphLinkSyncTimer -= 1f;
+                if (_graphLinkSyncTimer <= 0f)
+                {
+                    _graphLinkSyncTimer = 10f;
+                    try { BotNavMesh.SyncGraphLinks(); } catch { }
+                }
+            }
+
             if (_damageSyncDelay > 0f)
             {
                 _damageSyncDelay -= Time.deltaTime;

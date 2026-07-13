@@ -653,6 +653,25 @@ namespace StraftatBots
             return null;
         }
 
+        /// <summary>Nearest node bots have barely/never visited — training's nodeless
+        /// fallback walks here so a pathless bot keeps discovering instead of grinding.</summary>
+        public NavNode FindNearestUnvisitedNode(Vector3 pos, float maxRadius = 40f)
+        {
+            NavNode best = null;
+            float bestD = maxRadius * maxRadius;
+            foreach (var n in Nodes)
+            {
+                if (n == null || n.Confidence <= 0f || n.VisitCount > 1) continue;
+                float d = (n.Position - pos).sqrMagnitude;
+                if (d > 4f && d < bestD)
+                {
+                    bestD = d;
+                    best = n;
+                }
+            }
+            return best;
+        }
+
         public NavNode GetNodeById(int id)
         {
             if (id >= 0 && id < Nodes.Count && Nodes[id].Id == id)
@@ -660,6 +679,32 @@ namespace StraftatBots
             foreach (var n in Nodes)
                 if (n.Id == id) return n;
             return null;
+        }
+
+        /// <summary>A known node meaningfully ABOVE a position — used by hunting bots to
+        /// take high ground instead of always pushing the flat chase line. Prefers
+        /// higher, closer, confident nodes; avoids ledge lips.</summary>
+        public NavNode FindVantageNode(Vector3 around, float radius, float minHeightAbove)
+        {
+            NavNode best = null;
+            float bestScore = float.MinValue;
+            foreach (var node in FindNodesInRadius(around, radius))
+            {
+                if (node == null || node.Confidence <= 0.3f) continue;
+                if (IsBlacklisted(node.Id)) continue;
+                float rise = node.Position.y - around.y;
+                if (rise < minHeightAbove) continue;
+                float horiz = new Vector3(node.Position.x - around.x, 0, node.Position.z - around.z).magnitude;
+                float score = rise * 2f - horiz * 0.5f
+                    + (node.PlayerSourced ? 3f : 0f)
+                    - (node.NearEdge ? 2f : 0f);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = node;
+                }
+            }
+            return best;
         }
     }
 }

@@ -12,8 +12,97 @@ namespace StraftatBots
         private void DoMove(Vector3 motion)
         {
             if (_cc == null || !_cc.enabled) return;
+            if (!_movedThisFrame)
+            {
+                // Ice slide + continuous ForceZone push ride on top of whatever movement
+                // runs this frame — the FPC adds slopeSlideMove/steepSlopeSlideMove and
+                // ForceZone force into its single Move the same way.
+                Vector3 ice = _iceSlideMove + _iceCrouchSlideMove;
+                Vector3 iceHoriz = new Vector3(ice.x, 0f, ice.z);
+                // The ice push must never carry a bot over a void lip: the final-safety
+                // footprint check runs on the COMMANDED move before DoMove, so a shove
+                // added here bypassed it entirely — that's the "slides into the void on
+                // ice" death. A human steers/brakes against the push at a lip; the bot
+                // kills the push and commits an escape direction instead. Zone forces
+                // stay untouched (launch pads are meant to throw you).
+                if (iceHoriz.sqrMagnitude > 0.01f && _cc.isGrounded && _intentionalJumpTimer <= 0f)
+                {
+                    float lookahead = Mathf.Clamp(iceHoriz.magnitude * 0.12f, 0.6f, 1.6f);
+                    if (!HasGroundFootprintAhead(iceHoriz, lookahead))
+                    {
+                        _iceSlideMove = Vector3.zero;
+                        _iceCrouchSlideMove = Vector3.zero;
+                        ice = Vector3.zero;
+                        if (TryGetSafeEdgeEscapeDir(iceHoriz, out Vector3 iceEscape))
+                        {
+                            _commitDir = iceEscape;
+                            _commitTimer = Mathf.Max(_commitTimer, 0.5f);
+                        }
+                    }
+                }
+                Vector3 extra = ice + _zoneFrameForce;
+                if (extra.sqrMagnitude > 0.0001f)
+                    motion += extra * Time.deltaTime;
+            }
             _cc.Move(motion);
             _movedThisFrame = true;
+        }
+
+        /// <summary>
+        /// Ice detection + slide vectors, mirroring the game's SlopeSlide component.
+        /// Tag raycast straight down (SlopeSlide uses 8m on landLayer); on Footsteps/Ice
+        /// and Footsteps/SuperIce the bot gets the same downhill push players get.
+        /// Tuning constants are the shipped PlayerIK.prefab values (iceSpeed=26,
+        /// minWalkIceSlideSpeed=4, maxWalkIceSlideSpeed=20, iceAcceleration=2,
+        /// iceDeceleration=1, steepSlopeSlideDeceleration=10, clamps 10/30, walk clamps 0/50),
+        /// NOT the SlopeSlide.cs field initializers — the prefab overrides them.
+        /// </summary>
+        private void UpdateIceState()
+        {
+            if (_cc == null || !_cc.enabled) return;
+
+            RaycastHit hit;
+            bool downRay = Physics.Raycast(transform.position, Vector3.down, out hit, 8f, GROUND_MASK);
+            if (downRay)
+            {
+                if (hit.transform.CompareTag("Footsteps/Ice"))           { _onIce = true;  _onSuperIce = false; }
+                else if (hit.transform.CompareTag("Footsteps/SuperIce")) { _onIce = true;  _onSuperIce = true;  }
+                else                                                     { _onIce = false; _onSuperIce = false; }
+                _iceSlopeAngle = Vector3.Angle(hit.normal, Vector3.up);
+            }
+            // No hit: keep last surface flags like SlopeSlide does — grounded checks below
+            // stop the vectors from building while airborne anyway.
+
+            bool grounded = _cc.isGrounded;
+
+            // Walk-on-ice push (SlopeSlide.steepSlopeSlideMove): horizontal component of the
+            // surface normal = downhill. Zero on flat ice, ramps hard with slope angle.
+            if (downRay && _onIce && grounded)
+            {
+                float walkFactor = Mathf.Clamp(_iceSlopeAngle, 0f, 50f) / 20f; // divisor is (secondClamp-firstClamp), game's own math
+                Vector3 target = new Vector3(hit.normal.x, 0f, hit.normal.z) * Mathf.Lerp(4f, 20f, walkFactor);
+                _iceSlideMove = Vector3.Lerp(_iceSlideMove, target, 2f * Time.deltaTime);
+            }
+            else
+            {
+                _iceSlideMove = Vector3.Lerp(new Vector3(_iceSlideMove.x, 0f, _iceSlideMove.z),
+                    Vector3.zero, 10f * Time.deltaTime);
+            }
+
+            // Crouch slide on ice slopes (SlopeSlide.slopeSlideMove, ice branch only —
+            // the bot's own slide system covers normal sprint slides).
+            if (downRay && _onIce && grounded && _isCrouching && _iceSlopeAngle > 13f)
+            {
+                float speedFactor = Mathf.Clamp(_iceSlopeAngle, 10f, 30f) / 20f;
+                Vector3 target = new Vector3(hit.normal.x, -hit.normal.y, hit.normal.z) * speedFactor * 26f;
+                _iceCrouchSlideMove = Vector3.Lerp(_iceCrouchSlideMove, target, 2f * Time.deltaTime);
+            }
+            else
+            {
+                // iceDeceleration=1 while still on ice (slide keeps carrying), concrete's 3 once off
+                _iceCrouchSlideMove = Vector3.Lerp(new Vector3(_iceCrouchSlideMove.x, 0f, _iceCrouchSlideMove.z),
+                    Vector3.zero, (_onIce ? 1f : 3f) * Time.deltaTime);
+            }
         }
 
         private bool TryFollowTeleporterEdge(NavNode fromNode, NavNode toNode, NavEdge edge, float speed)
@@ -129,6 +218,23 @@ namespace StraftatBots
             return dir.normalized;
         }
 
+        // Direction-oscillation tracking (visible bouncing the id-based detector misses)
+        private int _dirFlipCount;
+        private float _lastDirFlipTime;
+
+        /// <summary>Training guard: never accept a route that immediately re-walks the two
+        /// nodes just walked through (the seed of every A→B→A→B loop).</summary>
+        private bool IsImmediateBacktrack(List<NavNode> path)
+        {
+            if (path == null || path.Count < 2) return false;
+            if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Training) return false;
+            if (_lastReachedNode == null || _prevReachedNode == null) return false;
+            int lastId = _lastReachedNode.Id, prevId = _prevReachedNode.Id;
+            if (lastId < 0 || prevId < 0) return false;
+            if (path[0].Id == lastId && path[1].Id == prevId) return true;
+            return path.Count >= 3 && path[1].Id == lastId && path[2].Id == prevId;
+        }
+
         private NavEdge FindBestPathEdge(int fromId, int toId)
         {
             if (NavGraph.Instance == null) return null;
@@ -228,11 +334,17 @@ namespace StraftatBots
                 }
             }
 
+            // Death heatmap: routes through spots where bots recently fell to their
+            // deaths score down hard (~2 per fresh death near a waypoint).
+            float deathPenalty = 0f;
+            for (int i = 0; i < path.Count; i += 2)
+                deathPenalty += NavGraph.Instance.FallDeathPenalty(path[i].Position) * 2f;
+
             float nodePenalty = path.Count * 0.3f;
             float endPenalty = endToTarget * 0.8f;
             float verticalPenalty = wantsVertical ? endHeightError * 2.2f : 0f;
             return closure * 3f + specialBonus + confidenceBonus + playerBonus
-                - nodePenalty - endPenalty - verticalPenalty - turnPenalty;
+                - nodePenalty - endPenalty - verticalPenalty - turnPenalty - deathPenalty;
         }
 
         private bool IsRouteSafeForPlay(List<NavNode> path)
@@ -287,10 +399,17 @@ namespace StraftatBots
         {
             if (!hasWorkingPath || _graphPath == null || _graphPathIndex >= _graphPath.Count) return false;
             if (Time.time >= _routeCommitUntil) return false;
-            if (_progressState == ProgressState.HardStuck || _stuckTimer > 1.4f) return false;
+
+            int specialEdges = CountRouteSpecialEdges(_graphPath);
+            // Special-traversal chains (jump→ladder→jump up a tower) legitimately stall
+            // for a moment between segments — lining up a jump, mounting a ladder. The
+            // old 1.4s stuck limit dumped the whole sequence right there and a mesh
+            // repath sent the bot around (or back down). Give chains real slack; only
+            // a hard stuck breaks them.
+            float stuckLimit = specialEdges > 0 ? 2.8f : 1.4f;
+            if (_progressState == ProgressState.HardStuck || _stuckTimer > stuckLimit) return false;
 
             float movedFromCommit = Vector3.Distance(_routeCommitTarget, target);
-            int specialEdges = CountRouteSpecialEdges(_graphPath);
             float allowedTargetMove = specialEdges > 0 ? 11f : 7f;
             if (movedFromCommit > allowedTargetMove) return false;
 
@@ -339,8 +458,9 @@ namespace StraftatBots
             int specialEdges = CountRouteSpecialEdges(_graphPath);
             // Stickier commits = bots stop re-deciding their route every couple seconds (smoother,
             // less direction-thrashing). Safe now that A* is deterministic, so the committed route
-            // is the same one a repath would pick anyway.
-            float commitTime = specialEdges > 0 ? 5.5f : 3.0f;
+            // is the same one a repath would pick anyway. Navmesh corner routes are the most
+            // deterministic of all — hold them longest.
+            float commitTime = specialEdges > 0 ? 7.5f : (source == PathSource.NavMeshRoute ? 4.5f : 3.0f);
             if (State == BotState.GoToWeapon) commitTime += 1.5f;
             if (Mathf.Abs(target.y - transform.position.y) > 2.25f) commitTime += 1.5f;
             _routeCommitUntil = Time.time + commitTime;
@@ -406,9 +526,12 @@ namespace StraftatBots
             return path;
         }
 
+        private bool _gapApproachSprint; // This frame is a deliberate sprint-at-edge for a gap jump
+
         private void MoveToward(Vector3 target, float speed)
         {
             if (_cc == null || !_cc.enabled) return;
+            _gapApproachSprint = false;
 
             // Auto-nodeless: if graph is unusable, bot is in an untrained area, or bot has hit
             // a bounce/stuck lock, use direct movement. Always on — previously toggleable via
@@ -425,21 +548,29 @@ namespace StraftatBots
                     _nodelessLockTimer -= Time.deltaTime;
 
                     // Probe graph recovery during nodeless lock instead of waiting out the full timer.
-                    if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+                    if (BotNavMesh.Ready || (NavGraph.Instance != null && NavGraph.Instance.HasData))
                     {
                         _repathTimer -= Time.deltaTime;
                         if (_repathTimer <= 0f)
                         {
                             _repathTimer = 0.6f;
-                            var recoverPath = NavGraph.Instance.FindPath(transform.position, target, searchRadius: 45f);
+                            // Navmesh escape route first — it can't ping-pong on bad graph data.
+                            List<NavNode> recoverPath = null;
+                            if (BotNavMesh.Ready)
+                            {
+                                recoverPath = BotNavMesh.FindCornerPath(transform.position, target, out bool nmComplete);
+                                if (recoverPath != null && !nmComplete) recoverPath = null;
+                            }
+                            if (recoverPath == null && NavGraph.Instance != null && NavGraph.Instance.HasData)
+                                recoverPath = NavGraph.Instance.FindPath(transform.position, target, searchRadius: 45f);
                             if (recoverPath != null && recoverPath.Count > 1)
                             {
                                 _graphPath = recoverPath;
                                 _graphPathIndex = 0;
                                 _nodelessLockTimer = 0f;
                                 _noPathRecoveryStreak = 0;
-                                SwitchPathSource(PathSource.GraphRoute);
-                                Plugin.Log.LogInfo($"[{BotName}] Recovered graph route during nodeless ({recoverPath.Count} nodes)");
+                                SwitchPathSource(recoverPath[0].Id < 0 ? PathSource.NavMeshRoute : PathSource.GraphRoute);
+                                Plugin.Log.LogInfo($"[{BotName}] Recovered route during nodeless ({recoverPath.Count} nodes, {(recoverPath[0].Id < 0 ? "navmesh" : "graph")})");
                             }
                         }
                     }
@@ -450,28 +581,34 @@ namespace StraftatBots
                     return;
                 }
 
+                // With a baked navmesh, untrained areas are routable — skip the nodeless
+                // offramps that exist to cover a thin/absent learned graph.
+                bool navmeshReady = BotNavMesh.Ready;
                 bool graphUsable = NavGraph.Instance != null && NavGraph.Instance.HasData
                     && NavGraph.Instance.NodeCount >= 10;
-                if (!graphUsable)
+                if (!graphUsable && !navmeshReady)
                 {
                     SwitchPathSource(PathSource.ExploreBuildRoute);
                     MoveTowardNodeless(target, speed);
                     return;
                 }
 
-                var nearBot = NavGraph.Instance.FindNearestNode(transform.position, 8f);
-                if (nearBot == null)
+                if (!navmeshReady)
                 {
-                    SwitchPathSource(PathSource.ExploreBuildRoute);
-                    MoveTowardNodeless(target, speed);
-                    return;
-                }
+                    var nearBot = NavGraph.Instance.FindNearestNode(transform.position, 8f);
+                    if (nearBot == null)
+                    {
+                        SwitchPathSource(PathSource.ExploreBuildRoute);
+                        MoveTowardNodeless(target, speed);
+                        return;
+                    }
 
-                if (IsDegeneratePath(target))
-                {
-                    SwitchPathSource(PathSource.DirectTacticalRoute);
-                    MoveTowardNodeless(target, speed);
-                    return;
+                    if (IsDegeneratePath(target))
+                    {
+                        SwitchPathSource(PathSource.DirectTacticalRoute);
+                        MoveTowardNodeless(target, speed);
+                        return;
+                    }
                 }
             }
 
@@ -527,7 +664,8 @@ namespace StraftatBots
             NavEdge nextEdge = null;
             NavNode nextEdgeFromNode = null;
 
-            if (NavGraph.Instance != null && NavGraph.Instance.HasData)
+            bool graphHasData = NavGraph.Instance != null && NavGraph.Instance.HasData;
+            if (graphHasData || BotNavMesh.Ready)
             {
                 _repathTimer -= Time.deltaTime;
                 float distToTarget = Vector3.Distance(_lastPathTarget, target);
@@ -546,9 +684,13 @@ namespace StraftatBots
                 }
                 else if (!suppressRepath && (!hasWorkingPath || _repathTimer <= 0f || targetMoved))
                 {
-                    // Adaptive repath interval: fast when no path, slow when path is working
+                    // Adaptive repath interval: fast when no path, slow when path is working.
+                    // A working navmesh route is deterministic — repathing it just regenerates
+                    // the same corners, so hold it even longer between refreshes.
                     bool weaponPath = State == BotState.GoToWeapon || (State == BotState.FindWeapon && _weaponTarget != null);
-                    _repathTimer = hasWorkingPath ? 2f : (weaponPath ? 1.8f : 1f);
+                    _repathTimer = hasWorkingPath
+                        ? (_pathSource == PathSource.NavMeshRoute ? 3.5f : 2f)
+                        : (weaponPath ? 1.8f : 1f);
                     _lastPathTarget = target;
 
                     // Weighted multi-candidate routing. Prefer routes that materially close
@@ -560,11 +702,12 @@ namespace StraftatBots
                     float bestScore = float.MinValue;
                     PathSource bestSrc = PathSource.DirectTacticalRoute;
 
-                    void ConsiderCandidate(List<NavNode> candidate, PathSource src)
+                    void ConsiderCandidate(List<NavNode> candidate, PathSource src, float bonus = 0f, bool skipSafety = false)
                     {
                         if (candidate == null || candidate.Count == 0) return;
-                        if (!IsRouteSafeForPlay(candidate)) return;
-                        float score = ScorePathCandidate(candidate, target);
+                        if (IsImmediateBacktrack(candidate)) return;
+                        if (!skipSafety && !IsRouteSafeForPlay(candidate)) return;
+                        float score = ScorePathCandidate(candidate, target) + bonus;
                         if (score > bestScore)
                         {
                             bestScore = score;
@@ -573,26 +716,58 @@ namespace StraftatBots
                         }
                     }
 
+                    // NAVMESH FIRST: a complete ground route IS the route — deterministic,
+                    // geometrically safe, and immune to learned-data noise, so there is
+                    // nothing to score it against (this also kills route flip-flop, the main
+                    // ping-pong source). A partial route (a gap/jump blocks the last stretch)
+                    // drops into candidate scoring below so learned jump/ladder routes can
+                    // win instead. Skipped while executing a validation route — those must
+                    // follow the exact graph edges being tested.
+                    bool validating = Plugin.IsValidateMode && _validationRouteNodeIds.Count > 1;
+                    List<NavNode> nmDirect = null;
+                    if (BotNavMesh.Ready && !validating)
+                    {
+                        var nmPath = BotNavMesh.FindCornerPath(transform.position, target, out bool nmComplete);
+                        if (nmPath != null)
+                        {
+                            // Partial routes still get a solid bonus: graph candidates accrue
+                            // per-edge confidence/player bonuses a corner path can never earn,
+                            // which starved navmesh routes out of the running entirely.
+                            if (nmComplete) nmDirect = nmPath;
+                            else ConsiderCandidate(nmPath, PathSource.NavMeshRoute, 5f, skipSafety: true);
+                        }
+                    }
+
+                    if (nmDirect != null)
+                    {
+                        AcceptGraphRoute(nmDirect, PathSource.NavMeshRoute, target,
+                            ScorePathCandidate(nmDirect, target));
+                    }
+                    else
+                    {
                     bool combatPath = State == BotState.Hunt && _playerTarget != null;
-                    ConsiderCandidate(NavGraph.Instance.GetCachedRoute(transform.position, target), PathSource.GraphRoute);
-                    ConsiderCandidate(FindVerticalConnectorRoute(target), PathSource.GraphRoute);
-                    if (!combatPath)
+                    if (graphHasData)
                     {
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight), PathSource.GraphRoute);
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
-                    }
-                    ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
-                    if (weaponPath)
-                    {
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
-                    }
+                        ConsiderCandidate(NavGraph.Instance.GetCachedRoute(transform.position, target), PathSource.GraphRoute);
+                        ConsiderCandidate(FindVerticalConnectorRoute(target), PathSource.GraphRoute);
+                        if (!combatPath)
+                        {
+                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight), PathSource.GraphRoute);
+                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
+                        }
+                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                        if (weaponPath)
+                        {
+                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
+                        }
 
-                    var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
-                    if (closestReachable != null)
-                        ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
+                        var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
+                        if (closestReachable != null)
+                            ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
 
-                    ConsiderCandidate(NavGraph.Instance.FindNearestPatrolRoute(transform.position, target), PathSource.ExploreBuildRoute);
+                        ConsiderCandidate(NavGraph.Instance.FindNearestPatrolRoute(transform.position, target), PathSource.ExploreBuildRoute);
+                    }
 
                     // Wider keep-margin: only abandon the current route for a MATERIALLY better one
                     // (was 0.75). Prevents swapping between near-equal routes — a key jitter source.
@@ -606,12 +781,21 @@ namespace StraftatBots
                     }
 
                     AcceptGraphRoute(bestPath ?? new List<NavNode>(), bestSrc, target, bestScore);
+                    }
 
                     if (_graphPath.Count == 0)
                     {
-                        // All graph pathing failed — fall back to nodeless direct movement
+                        // All pathing failed. In Training, don't blindly push at the old
+                        // target — nodeless-walk toward the nearest UNVISITED node so the
+                        // bot keeps discovering instead of grinding the same spot.
+                        Vector3 fallbackTarget = target;
+                        if (NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training)
+                        {
+                            var unvisited = NavGraph.Instance.FindNearestUnvisitedNode(transform.position, 40f);
+                            if (unvisited != null) fallbackTarget = unvisited.Position;
+                        }
                         SwitchPathSource(PathSource.DirectTacticalRoute);
-                        MoveTowardNodeless(target, speed);
+                        MoveTowardNodeless(fallbackTarget, speed);
                         return;
                     }
                     _noPathRecoveryStreak = 0;
@@ -665,10 +849,14 @@ namespace StraftatBots
                     {
                         var reachedNode = _graphPath[_graphPathIndex];
 
-                        bool trainingGraph = NavGraph.Instance.Mode == NavMode.Training;
+                        // Synthetic navmesh waypoints carry negative ids — they must never
+                        // create or reinforce learned graph data.
+                        bool trainingGraph = NavGraph.Instance != null
+                            && NavGraph.Instance.Mode == NavMode.Training
+                            && reachedNode.Id >= 0;
 
                         // Training success feeds certification; Play stays read-only here.
-                        if (trainingGraph && _lastReachedNode != null)
+                        if (trainingGraph && _lastReachedNode != null && _lastReachedNode.Id >= 0)
                             NavGraph.Instance.ReportSuccess(_lastReachedNode.Id, reachedNode.Id);
 
                         // Compress clusters around well-traveled areas (every 5th node to avoid spam)
@@ -768,7 +956,8 @@ namespace StraftatBots
                         // Shortcut detection: bot walked prev → last → reached cleanly.
                         // If prev → reached is directly walkable, add the shortcut edge and
                         // decay the detour so A* prefers the straight route next time.
-                        if (trainingGraph && _prevReachedNode != null && _lastReachedNode != null && NavGraph.Instance != null)
+                        if (trainingGraph && _prevReachedNode != null && _prevReachedNode.Id >= 0
+                            && _lastReachedNode != null && _lastReachedNode.Id >= 0 && NavGraph.Instance != null)
                         {
                             NavGraph.Instance.TryShortcut(_prevReachedNode.Id, _lastReachedNode.Id, reachedNode.Id);
                         }
@@ -824,24 +1013,87 @@ namespace StraftatBots
                         }
                     }
 
-                    // Walk-route lookahead: once close to the current waypoint, steer a
-                    // little farther down the corridor. This removes the hard left-right
-                    // twitch that caused bots to ping-pong between valid planned nodes.
-                    if (nextEdgeType == EdgeType.Walk && _graphPathIndex + 1 < _graphPath.Count && distToNext < 2.1f)
+                    // LOS SKIP (Play only): if the waypoint AFTER the current one is
+                    // directly walkable-visible, advance past the current one. Exact
+                    // node-center visits are a training behavior (edge crediting needs
+                    // them); in Play they just look robotic.
+                    _losSkipTimer -= Time.deltaTime;
+                    if (_losSkipTimer <= 0f && NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play
+                        && nextEdgeType == EdgeType.Walk && _cc.isGrounded && _intentionalJumpTimer <= 0f && !_onLadder
+                        && _graphPathIndex + 1 < _graphPath.Count)
                     {
-                        var aheadNode = _graphPath[_graphPathIndex + 1];
-                        var aheadEdge = FindBestPathEdge(_graphPath[_graphPathIndex].Id, aheadNode.Id);
-                        if (aheadEdge != null && aheadEdge.Type == EdgeType.Walk
-                            && (NavGraph.Instance == null || !NavGraph.Instance.IsBadForPlay(aheadEdge)))
+                        _losSkipTimer = 0.4f;
+                        var skipEdge = FindBestPathEdge(_graphPath[_graphPathIndex].Id, _graphPath[_graphPathIndex + 1].Id);
+                        if ((skipEdge == null || skipEdge.Type == EdgeType.Walk)
+                            && CanWalkStraightTo(_graphPath[_graphPathIndex + 1].Position))
                         {
-                            Vector3 aheadPos = aheadNode.Position;
-                            Vector3 toAhead = aheadPos - transform.position;
-                            toAhead.y = 0f;
-                            if (toAhead.sqrMagnitude > 0.25f)
+                            _graphPathIndex++;
+                            nodePos = _graphPath[_graphPathIndex].Position;
+                            dir = nodePos - transform.position;
+                            distToNext = new Vector3(dir.x, 0, dir.z).magnitude;
+                            if (_lastReachedNode != null)
                             {
-                                nodePos = Vector3.Lerp(nodePos, aheadPos, 0.65f);
-                                dir = nodePos - transform.position;
-                                distToNext = new Vector3(dir.x, 0, dir.z).magnitude;
+                                nextEdge = FindBestPathEdge(_lastReachedNode.Id, _graphPath[_graphPathIndex].Id);
+                                if (nextEdge != null) { nextEdgeType = nextEdge.Type; nextEdgeFromNode = _lastReachedNode; }
+                            }
+                        }
+                    }
+
+                    // PURE PURSUIT on walk legs: steer toward a point ~2.6m along the
+                    // remaining path polyline instead of at the next node center — the
+                    // classic fix for robotic node-to-node movement. Waypoint ADVANCEMENT
+                    // stays distance-based against the real waypoint; only steering
+                    // smooths. Special edges are excluded (jump lineups and ladder mounts
+                    // must hit their nodes exactly).
+                    if (nextEdgeType == EdgeType.Walk && _cc.isGrounded && _intentionalJumpTimer <= 0f)
+                    {
+                        Vector3 pursuit = ComputePursuitPoint(nodePos);
+                        Vector3 toPursuit = pursuit - transform.position;
+                        toPursuit.y = 0f;
+                        if (toPursuit.sqrMagnitude > 0.25f)
+                            dir = pursuit - transform.position;
+                    }
+
+                    // MESH-LINK EXECUTION: mesh routes can now cross trusted jump/fall
+                    // links (SyncGraphLinks). A corner meaningfully above or across a gap
+                    // is one of those crossings — look up the learned edge that matches
+                    // this hop and launch its RECORDED trajectory (hard rail included)
+                    // instead of leaving it to blind reactive jumping. Falls just need
+                    // the void-safety walk-off allowance.
+                    if (_pathSource == PathSource.NavMeshRoute && nextEdgeType == EdgeType.Walk
+                        && _cc.isGrounded && _intentionalJumpTimer <= 0f && !_onLadder
+                        && distToNext < 3.2f && NavGraph.Instance != null)
+                    {
+                        float hopUp = nodePos.y - transform.position.y;
+                        Vector3 flatHop = new Vector3(nodePos.x - transform.position.x, 0f, nodePos.z - transform.position.z);
+                        bool needsJump = hopUp > 1.1f
+                            || (flatHop.sqrMagnitude > 1.2f && !HasGroundFootprintAhead(flatHop, 1.1f));
+                        bool isDrop = hopUp < -1.5f;
+
+                        if (needsJump)
+                        {
+                            var linkEdge = NavGraph.Instance.FindTrustedSpecialEdgeNear(transform.position, nodePos);
+                            if (linkEdge != null && (linkEdge.Type == EdgeType.Jump || linkEdge.Type == EdgeType.WallJump))
+                            {
+                                if (flatHop.sqrMagnitude > 0.04f
+                                    && TryJump(JumpReason.GraphJump, flatHop.normalized, jumpEdge: linkEdge))
+                                {
+                                    _airStrafeTarget = nodePos;
+                                    _airStrafeActive = true;
+                                    jumped = true;
+                                }
+                            }
+                        }
+                        else if (isDrop && flatHop.sqrMagnitude > 0.04f)
+                        {
+                            // Trusted fall link: authorize the walk-off (void safety would
+                            // otherwise zero the horizontal move right at the lip).
+                            var fallEdge = NavGraph.Instance.FindTrustedSpecialEdgeNear(transform.position, nodePos, 2.5f);
+                            if (fallEdge != null && fallEdge.Type == EdgeType.Fall)
+                            {
+                                _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, 0.45f);
+                                _jumpDir = flatHop.normalized;
+                                dir = flatHop;
                             }
                         }
                     }
@@ -1101,49 +1353,106 @@ namespace StraftatBots
 
                         if (_cc.isGrounded)
                         {
-                            // PHASE 1: Walk to takeoff node
-                            float distToTakeoff = takeoffNode != null ?
-                                Vector3.Distance(transform.position, takeoffNode.Position) : 0f;
-
-                            if (distToTakeoff > 0.5f && takeoffNode != null)
+                            // Resolve target takeoff speed/direction FIRST — every phase
+                            // (approach, run-up, commit) needs them, not just the lip.
+                            float targetTakeoffSpeed = speed; // default from physics calc
+                            if (jumpEdge != null)
                             {
-                                // Walk to takeoff position — sprint if in a jump chain
-                                Vector3 toTakeoff = takeoffNode.Position - transform.position;
-                                toTakeoff.y = 0;
-                                if (toTakeoff.sqrMagnitude > 0.1f) dir = toTakeoff.normalized;
-                                speed = _inJumpChain ? _sprintSpeed : _walkSpeed;
+                                if (jumpEdge.TakeoffSpeed > 0.1f)
+                                    targetTakeoffSpeed = jumpEdge.TakeoffSpeed;
+                                else if (jumpEdge.LockedSpeed > 0f)
+                                    targetTakeoffSpeed = jumpEdge.LockedSpeed;
                             }
-                            // PHASE 2: At takeoff — speed-match and jump with momentum
-                            else if (IsEdgeAhead(jumpFaceDir, 0.7f) || jumpHorizDist < 1.5f)
+                            targetTakeoffSpeed = Mathf.Clamp(targetTakeoffSpeed, _walkSpeed, _sprintSpeed);
+
+                            Vector3 takeoffDir = jumpFaceDir;
+                            if (jumpEdge != null && jumpEdge.TakeoffDir.sqrMagnitude > 0.01f)
+                                takeoffDir = jumpEdge.TakeoffDir;
+
+                            Vector3 takeoffPos = takeoffNode != null ? takeoffNode.Position : transform.position;
+                            float distToTakeoff = new Vector3(
+                                takeoffPos.x - transform.position.x, 0,
+                                takeoffPos.z - transform.position.z).magnitude;
+
+                            // Actual horizontal velocity — the smoothed-input check used
+                            // before let bots leave the lip while the CC was still
+                            // accelerating, which is why long jumps kept falling short.
+                            Vector3 horizVel = _cc.velocity; horizVel.y = 0;
+                            float curSpeed = horizVel.magnitude;
+
+                            // Fast jumps need acceleration room: a run-up point behind the
+                            // lip along the takeoff line, proportional to required speed.
+                            float runupDist = Mathf.Lerp(0.8f, 3.5f,
+                                Mathf.InverseLerp(_walkSpeed, _sprintSpeed, targetTakeoffSpeed));
+                            Vector3 runupPoint = takeoffPos - takeoffDir * runupDist;
+                            bool needsFastTakeoff = targetTakeoffSpeed > _walkSpeed + 0.5f;
+
+                            bool atLip = IsEdgeAhead(jumpFaceDir, 0.7f) || jumpHorizDist < 1.5f;
+
+                            // PHASE 0: Backing off from the lip to build a run-up.
+                            if (_jumpBackoffTimer > 0f)
                             {
-                                // Determine target takeoff speed from recorded data
-                                float targetTakeoffSpeed = speed; // default from physics calc
-                                if (jumpEdge != null)
+                                _jumpBackoffTimer -= Time.deltaTime;
+                                Vector3 toRunup = runupPoint - transform.position; toRunup.y = 0;
+                                if (toRunup.magnitude < 0.4f)
                                 {
-                                    if (jumpEdge.TakeoffSpeed > 0.1f)
-                                        targetTakeoffSpeed = jumpEdge.TakeoffSpeed;
-                                    else if (jumpEdge.LockedSpeed > 0f)
-                                        targetTakeoffSpeed = jumpEdge.LockedSpeed;
+                                    _jumpBackoffTimer = 0f; // in position — charge this frame
                                 }
-                                targetTakeoffSpeed = Mathf.Clamp(targetTakeoffSpeed, _walkSpeed, _sprintSpeed);
+                                else
+                                {
+                                    dir = toRunup.normalized;
+                                    speed = _sprintSpeed;
+                                    LookAtDirection(takeoffDir); // keep eyes on the jump
+                                }
+                            }
 
-                                // Use recorded takeoff direction if available
-                                Vector3 takeoffDir = jumpFaceDir;
-                                if (jumpEdge != null && jumpEdge.TakeoffDir.sqrMagnitude > 0.01f)
-                                    takeoffDir = jumpEdge.TakeoffDir;
-
-                                // Maintain speed and direction — no stopping
+                            if (_jumpBackoffTimer > 0f)
+                            {
+                                // still repositioning — no jump this frame
+                            }
+                            // PHASE 1: Walk/sprint to the takeoff node
+                            else if (distToTakeoff > 0.5f && takeoffNode != null && !atLip)
+                            {
+                                // Fast jumps route through the run-up point so the bot
+                                // arrives already moving along the takeoff line.
+                                Vector3 goal = takeoffPos;
+                                if (needsFastTakeoff && distToTakeoff > runupDist * 0.7f)
+                                {
+                                    Vector3 toTk = takeoffPos - transform.position; toTk.y = 0;
+                                    if (toTk.sqrMagnitude > 0.01f
+                                        && Vector3.Dot(toTk.normalized, takeoffDir) < 0.7f)
+                                        goal = runupPoint; // approaching from the side — swing behind first
+                                }
+                                Vector3 toGoal = goal - transform.position;
+                                toGoal.y = 0;
+                                if (toGoal.sqrMagnitude > 0.1f) dir = toGoal.normalized;
+                                speed = (needsFastTakeoff || _inJumpChain) ? _sprintSpeed : _walkSpeed;
+                            }
+                            // PHASE 2: At the lip — commit and jump on REAL speed
+                            else if (atLip)
+                            {
                                 dir = takeoffDir;
                                 speed = targetTakeoffSpeed;
                                 _currentHorizInput = Mathf.MoveTowards(_currentHorizInput, 1f, 5f * Time.deltaTime);
                                 LookAtDirection(takeoffDir);
 
-                                // Jump when facing and speed are adequate
                                 float facingDot = Vector3.Dot(transform.forward, takeoffDir);
                                 bool facingOk = facingDot > 0.85f;
-                                bool speedOk = _currentHorizInput > 0.6f || jumpHorizDist < 1.0f;
+                                bool speedOk = jumpHorizDist < 1.0f
+                                    || curSpeed >= targetTakeoffSpeed * 0.8f;
 
-                                if (facingOk && speedOk)
+                                // Too slow for this jump and standing at the lip: back off
+                                // once to build a run-up instead of leaping short into the
+                                // gap. One attempt per few seconds — never ping-pong.
+                                if (facingOk && !speedOk && needsFastTakeoff
+                                    && distToTakeoff < 1.0f && Time.time >= _jumpBackoffCooldownUntil)
+                                {
+                                    _jumpBackoffTimer = 1.2f;
+                                    _jumpBackoffCooldownUntil = Time.time + 4f;
+                                }
+                                // After a failed/cooling backoff, take the jump anyway —
+                                // air-strafe correction beats standing at the lip forever.
+                                else if (facingOk && (speedOk || Time.time < _jumpBackoffCooldownUntil))
                                 {
                                     // Air-strafe: target the landing node directly so the
                                     // bot nudges itself back onto the node mid-arc.
@@ -1157,11 +1466,10 @@ namespace StraftatBots
                                     }
                                 }
                             }
-                            // PHASE 3: Approaching edge — sprint toward it
+                            // PHASE 3: Approaching edge — run toward it
                             else
                             {
-                                // Approaching — run toward edge at calculated speed
-                                speed = Mathf.Max(speed, _walkSpeed);
+                                speed = Mathf.Max(speed, needsFastTakeoff ? _sprintSpeed : _walkSpeed);
                             }
                         }
                         else
@@ -1191,6 +1499,26 @@ namespace StraftatBots
                         if (dir.sqrMagnitude > 0.01f) dir.Normalize();
                     }
 
+                    // Navmesh ladder links carry no graph edge: the next waypoint just sits
+                    // well above us (the ladder top). Steer into the nearby ladder so the
+                    // grab logic takes over — the flattened direction alone would circle
+                    // beneath the target forever.
+                    if (nextEdge == null && !_onLadder && _cc.isGrounded)
+                    {
+                        Vector3 toWp = nodePos - transform.position;
+                        float horizToWp = new Vector2(toWp.x, toWp.z).magnitude;
+                        if (toWp.y > 1.5f && horizToWp < 3.5f)
+                        {
+                            Collider ladder = FindNearbyLadder(6f);
+                            if (ladder != null)
+                            {
+                                Vector3 toLadder = ladder.ClosestPoint(transform.position + Vector3.up) - transform.position;
+                                toLadder.y = 0f;
+                                if (toLadder.sqrMagnitude > 0.04f) dir = toLadder.normalized;
+                            }
+                        }
+                    }
+
                     dir.y = 0f;
                     if (dir.sqrMagnitude < 0.01f) dir = transform.forward;
                     else dir.Normalize();
@@ -1199,7 +1527,7 @@ namespace StraftatBots
                 {
                     // Path exhausted or empty
                     bool seekingLadder = false;
-                    if (_cc.isGrounded && !_onLadder && target.y > transform.position.y + 2f && _stuckTimer > 1f)
+                    if (_cc.isGrounded && !_onLadder && target.y > transform.position.y + 2f && _stuckTimer > 0.5f)
                     {
                         Collider ladder = FindNearbyLadder(8f);
                         if (ladder != null)
@@ -1306,6 +1634,11 @@ namespace StraftatBots
                         // No safe landing or fully blocked — go around, don't blind jump
                         dir = TryAngledDirections(dir, wallMask);
                     }
+                }
+                else
+                {
+                    // Feet ray (0.7m) clear — check for KNEE-HIGH blockers underneath it.
+                    jumped = TryKneeHop(dir, wallMask);
                 }
             }
 
@@ -1419,6 +1752,7 @@ namespace StraftatBots
                             // Approaching — sprint toward edge, don't turn away
                             dir = gapJumpDir;
                             speed = _sprintSpeed;
+                            _gapApproachSprint = true; // exempt from the edge speed governor
                         }
                     }
                     else
@@ -1556,12 +1890,16 @@ namespace StraftatBots
                         Vector3 toTarget = targetPos - transform.position;
                         float totalDrift = toTarget.magnitude;
 
-                        // Proportional drift correction — engage early, scale with distance
-                        if (totalDrift > 0.05f)
+                        // HARD RAIL ("cheat"): the recorded arc is ground truth — a jump a
+                        // player demonstrated must land every time. Allow 0.25m of slack
+                        // around the recorded position and close the rest IMMEDIATELY
+                        // (capped at 4m/frame; CC.Move still respects walls). The old
+                        // proportional 10 m/s pull let drift accumulate and bots missed.
+                        if (totalDrift > 0.25f)
                         {
-                            float correctionStrength = Mathf.Clamp01(totalDrift / 0.5f);
-                            Vector3 correction = toTarget.normalized * correctionStrength
-                                * Mathf.Min(totalDrift, 1.0f) * Time.deltaTime * 10f;
+                            Vector3 correction = toTarget * (1f - 0.25f / totalDrift);
+                            if (correction.sqrMagnitude > 16f)
+                                correction = correction.normalized * 4f;
                             _cc.Move(correction);
                         }
 
@@ -1588,6 +1926,35 @@ namespace StraftatBots
 
                         _currentHorizInput = 1f;
                         _jumpDir = dir;
+
+                        // ARC CONSUMED: past the final sample without a landing means the
+                        // recording ends short of (or above) the real ground here. Hand
+                        // control back to physics so gravity finishes the landing — the
+                        // rail must NOT hold the bot hovering at the last sample.
+                        if (_trajIndex >= count - 1 && airTime > timestamps[count - 1] + 0.1f)
+                        {
+                            _trajActive = false;
+                            _currentJumpEdge = null;
+                            _verticalVelocity = Mathf.Min(_verticalVelocity, 0f);
+                        }
+                        // BAD MATCH ABORT: persistently huge drift means this recording
+                        // doesn't fit the current takeoff (mesh-link lookups match within
+                        // 2m). Stop fighting it — physics + air strafe finish the jump.
+                        else if (totalDrift > 3.5f)
+                        {
+                            _trajDriftTimer += Time.deltaTime;
+                            if (_trajDriftTimer > 0.35f)
+                            {
+                                _trajDriftTimer = 0f;
+                                _trajActive = false;
+                                _currentJumpEdge = null;
+                                Plugin.Log.LogInfo($"[{BotName}] Trajectory replay aborted — recording doesn't fit takeoff (drift {totalDrift:F1}m)");
+                            }
+                        }
+                        else
+                        {
+                            _trajDriftTimer = 0f;
+                        }
                     }
                     // FALLBACK: no trajectory data — lock direction with single mid-air correction
                     else
@@ -1793,6 +2160,16 @@ namespace StraftatBots
                 }
             }
 
+            // EDGE GOVERNOR: never sprint blindly at a cliff lip. Approach edges at walk
+            // speed unless this frame is a deliberate gap-jump run-up or a jump is
+            // already in flight — kills the "walked off at full speed" class of deaths.
+            if (grounded && targetSpeed > _walkSpeed && !_gapApproachSprint
+                && _intentionalJumpTimer <= 0f && !_isSliding && !_onLadder
+                && IsEdgeAhead(dir, 2.2f))
+            {
+                targetSpeed = _walkSpeed;
+            }
+
             // During slide: force impulse handles movement, reduce normal speed to near-zero
             // so the slide force is the primary mover (matches FPC behavior)
             if (_isSliding) targetSpeed = 0.5f;
@@ -1844,7 +2221,7 @@ namespace StraftatBots
                 if (!standBlocked)
                 {
                     _isCrouching = false;
-                    if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
+                    ApplyStance(STAND_HEIGHT, SKIN_STANDING);
                     if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
                     if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
                 }
@@ -1879,9 +2256,15 @@ namespace StraftatBots
                 if (centerDist > 0.15f)
                     move += toCenter.normalized * Mathf.Min(centerDist * 5f, 3f);
 
-                // Slight pull into ladder surface to stay attached (increased 0.3 → 0.8)
+                // Slight pull into ladder surface to stay attached — TAPERED near the
+                // collider top: grinding full force into the wall at the lip is what
+                // pinned bots against it instead of letting them step over.
                 if (_ladderFaceDir.sqrMagnitude > 0.01f)
-                    move += _ladderFaceDir * 0.8f;
+                {
+                    float facePull = (_ladderTopY > 0f && _ladderTopY - transform.position.y < 1.2f)
+                        ? 0.25f : 0.8f;
+                    move += _ladderFaceDir * facePull;
+                }
 
                 // Face into the ladder
                 LookAtDirection(_ladderFaceDir);
@@ -1893,22 +2276,48 @@ namespace StraftatBots
                 Vector3 exitDir = _ladderExitDir.sqrMagnitude > 0.01f
                     ? _ladderExitDir
                     : PickLadderExitDir(GetLadderObjective());
+                // Never grind the dismount push into a wall — a bad exit pick used to
+                // pin the bot against geometry at full sprint for the whole timer.
+                if (Physics.Raycast(transform.position + Vector3.up * 0.9f, exitDir, 0.7f,
+                    WALL_MASK, QueryTriggerInteraction.Ignore))
+                {
+                    Vector3 alt = TryAngledDirections(exitDir, WALL_MASK);
+                    if (alt.sqrMagnitude > 0.01f) { exitDir = alt; _ladderExitDir = alt; }
+                }
                 move = exitDir * _sprintSpeed + Vector3.up * 4.2f;
                 _intentionalJumpTimer = 0.35f;
             }
             else
             {
+                // Low-pass the commanded direction: kills the single-frame flip-flop
+                // jitter from waypoint switches and reactive nudges while still following
+                // a genuine turn within ~0.1s. Reversals (>~100°) pass through instantly —
+                // edge escapes and breakouts must never be softened.
+                if (grounded && _intentionalJumpTimer <= 0f && _jumpBackoffTimer <= 0f
+                    && dir.sqrMagnitude > 0.01f)
+                {
+                    if (_smoothedMoveDir.sqrMagnitude < 0.01f) _smoothedMoveDir = dir;
+                    float k = 1f - Mathf.Exp(-12f * Time.deltaTime);
+                    _smoothedMoveDir = Vector3.Slerp(_smoothedMoveDir, dir, k);
+                    if (Vector3.Dot(_smoothedMoveDir.normalized, dir.normalized) > -0.2f)
+                        dir = _smoothedMoveDir.normalized * dir.magnitude;
+                    else
+                        _smoothedMoveDir = dir;
+                }
                 move = dir * targetSpeed * _currentHorizInput + forceComponent;
                 move.y = _verticalVelocity;
             }
             // FINAL SAFETY: if grounded and not in an intentional jump, check for void ahead
-            // This is the last line of defense — catches anything the earlier checks missed
+            // This is the last line of defense — catches anything the earlier checks missed.
+            // Lookahead scales with actual speed: the old fixed 0.8m gave a sprinting bot
+            // ~0.07s of margin, which is why they still ran off map edges.
             if (grounded && _intentionalJumpTimer <= 0f && !_onLadder && _ladderDismountTimer <= 0f)
             {
                 Vector3 horizMove = new Vector3(move.x, 0, move.z);
                 if (horizMove.sqrMagnitude > 0.01f)
                 {
-                    if (!HasGroundFootprintAhead(horizMove, 0.8f))
+                    float voidLookahead = Mathf.Clamp(horizMove.magnitude * 0.16f, 0.8f, 2.0f);
+                    if (!HasGroundFootprintAhead(horizMove, voidLookahead))
                     {
                         if (TryGetSafeEdgeEscapeDir(horizMove, out Vector3 escapeDir))
                         {
@@ -1965,12 +2374,9 @@ namespace StraftatBots
                 float heightDiff = Mathf.Abs(target.y - transform.position.y);
                 if (heightDiff < 2f)
                 {
-                    // Close in H and V — arrived, settle.
+                    // Close in H and V — arrived, settle. (DoMove so ice slide still applies.)
                     if (_cc != null && _cc.enabled && !_movedThisFrame)
-                    {
-                        _cc.Move(new Vector3(0f, _verticalVelocity * Time.deltaTime, 0f));
-                        _movedThisFrame = true;
-                    }
+                        DoMove(new Vector3(0f, _verticalVelocity * Time.deltaTime, 0f));
                     _currentHorizInput = 0f;
                     return;
                 }
@@ -2020,6 +2426,10 @@ namespace StraftatBots
             // Speed
             bool grounded = _cc.isGrounded;
             float targetSpeed = grounded ? speed : (speed >= _sprintSpeed ? _sprintAirSpeed : _airSpeed);
+            // Edge governor (see MoveToward): don't sprint blindly at cliff lips.
+            if (grounded && targetSpeed > _walkSpeed && _intentionalJumpTimer <= 0f && !_onLadder
+                && IsEdgeAhead(dir, 2.2f))
+                targetSpeed = _walkSpeed;
             if (_intentionalJumpTimer > 0f && !grounded) _currentHorizInput = 1f;
             else _currentHorizInput = Mathf.Lerp(_currentHorizInput, 1f, _acceleration * Time.deltaTime);
 
@@ -2047,6 +2457,36 @@ namespace StraftatBots
                             move.z = 0f;
                         }
                         _slideForceFactor = 0f;
+                    }
+                }
+            }
+
+            // Oscillation detector: the id-based ping-pong check can't see navmesh routes
+            // (fresh synthetic ids every repath), but the bouncing is plainly visible in
+            // game. Several near-reversals of steering direction inside a couple of
+            // seconds = bouncing — break out via the existing nodeless machinery and log
+            // it so the log finally matches what the player sees.
+            if (grounded && _intentionalJumpTimer <= 0f && !_onLadder && !_isSliding)
+            {
+                if (Time.time - _lastDirFlipTime > 2.5f) _dirFlipCount = 0;
+                if (_lastMoveDir.sqrMagnitude > 0.01f && dir.sqrMagnitude > 0.01f
+                    && Vector3.Dot(_lastMoveDir, dir) < -0.4f)
+                {
+                    _dirFlipCount++;
+                    _lastDirFlipTime = Time.time;
+                    if (_dirFlipCount >= 4)
+                    {
+                        _dirFlipCount = 0;
+                        _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
+                        _lastBounceTime = Time.time;
+                        _graphPath.Clear();
+                        _graphPathIndex = 0;
+                        _repathTimer = 0f;
+                        _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
+                        SwitchPathSource(PathSource.DirectTacticalRoute);
+                        Plugin.Log.LogInfo($"[{BotName}] Direction oscillation — breaking out (bounce #{_nodelessBounceCount})");
+                        MoveTowardNodeless(target, speed);
+                        return;
                     }
                 }
             }
@@ -2200,14 +2640,44 @@ namespace StraftatBots
         /// Lightweight edge detection: raycast down at check position.
         /// Returns true if there's no ground ahead (edge/void).
         /// </summary>
+        // Per-frame memo for IsEdgeAhead — steering, the speed governor, gap detection
+        // and the emergency stop all probe the same directions every frame. With 8+
+        // bots this was one of the biggest recurring raycast costs.
+        private int _edgeCacheFrame = -1;
+        private int _edgeCacheCount;
+        private readonly Vector4[] _edgeCacheEntries = new Vector4[8]; // dir.xz, dist, result(0/1)
+
         private bool IsEdgeAhead(Vector3 dir, float checkDist)
         {
             if (_onLadder || _nearLadder || _ladderDismountTimer > 0f) return false;
+
+            int frame = Time.frameCount;
+            if (frame != _edgeCacheFrame)
+            {
+                _edgeCacheFrame = frame;
+                _edgeCacheCount = 0;
+            }
+            for (int i = 0; i < _edgeCacheCount; i++)
+            {
+                Vector4 e = _edgeCacheEntries[i];
+                if (Mathf.Abs(e.z - checkDist) < 0.05f
+                    && e.x * dir.x + e.y * dir.z > 0.995f * new Vector2(dir.x, dir.z).magnitude)
+                    return e.w > 0.5f;
+            }
+
             Vector3 checkPos = transform.position + dir * checkDist;
             // Cast from 2.5m above bot — on ramps the ground ahead is HIGHER than the bot,
             // so a low origin (0.2m) misses the ramp surface entirely → false "edge" detection.
             // 2.5m covers slopes up to ~60° at 1.5m check distance.
-            return !Physics.Raycast(checkPos + Vector3.up * 2.5f, Vector3.down, 5f, GROUND_MASK, QueryTriggerInteraction.Ignore);
+            bool result = !Physics.Raycast(checkPos + Vector3.up * 2.5f, Vector3.down, 5f, GROUND_MASK, QueryTriggerInteraction.Ignore);
+
+            Vector2 flat = new Vector2(dir.x, dir.z);
+            if (_edgeCacheCount < _edgeCacheEntries.Length && flat.sqrMagnitude > 0.001f)
+            {
+                flat.Normalize();
+                _edgeCacheEntries[_edgeCacheCount++] = new Vector4(flat.x, flat.y, checkDist, result ? 1f : 0f);
+            }
+            return result;
         }
 
         private bool HasGroundFootprintAhead(Vector3 dir, float checkDist = 0.9f)
@@ -2304,6 +2774,46 @@ namespace StraftatBots
         private const float STAND_CENTER_Y = 1f;
         private const float SLIDE_HEIGHT = 0.8f;
         private const float SLIDE_CENTER_Y = 0.4f;
+        private const float CROUCH_HEIGHT = 1.25f;   // game Player.prefab override (script default 1f is wrong)
+        private const float SKIN_STANDING = 0.2f;    // game CC default skin width
+        private const float SKIN_CROUCHED = 0.07f;   // game's crouch skin width (FPC.Update)
+
+        private Transform _graphicsTf;
+
+        /// <summary>
+        /// Mirrors the game's stance handling exactly: CC bottom pinned at the feet
+        /// (center = height/2, FPC.AdjustHeight), skin width 0.2 standing / 0.07
+        /// crouched, and the body model offset down by exactly -skinWidth
+        /// (PlayerSetup.ChangeSkinWidthObservers). The old fixed skinWidth of 0.08
+        /// combined with the prefab's inherited -0.2 model offset rendered bot feet
+        /// 0.12m inside the floor — worse when crouching.
+        /// </summary>
+        private void ApplyStance(float height, float skin)
+        {
+            if (_cc != null)
+            {
+                _cc.height = height;
+                _cc.center = new Vector3(0, height * 0.5f, 0);
+                _cc.skinWidth = skin;
+            }
+            if (_graphicsTf == null)
+            {
+                try
+                {
+                    var ps = GetComponent<PlayerSetup>();
+                    var f = typeof(PlayerSetup).GetField("graphics",
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic);
+                    object g = ps != null && f != null ? f.GetValue(ps) : null;
+                    if (g is GameObject go) _graphicsTf = go.transform;
+                    else if (g is Transform tf) _graphicsTf = tf;
+                }
+                catch { }
+            }
+            if (_graphicsTf != null)
+                _graphicsTf.localPosition = new Vector3(0, -skin, 0);
+        }
 
         /// <summary>
         /// Single entry point for ALL slide initiation. Handles CC resize, animator,
@@ -2327,7 +2837,7 @@ namespace StraftatBots
             _slideForceFactor = force;
             _slideStartTime = Time.time;
 
-            if (_cc != null) { _cc.height = SLIDE_HEIGHT; _cc.center = new Vector3(0, SLIDE_CENTER_Y, 0); }
+            ApplyStance(SLIDE_HEIGHT, SKIN_STANDING); // game keeps 0.2 skin while sliding
             if (_bodyAnimator != null) TrySet(_bodyAnimator, "Slide", true);
             if (_globalAnimator != null) TrySet(_globalAnimator, "Slide", true);
 
@@ -2353,8 +2863,7 @@ namespace StraftatBots
                 float heightDiff = STAND_HEIGHT - _cc.height;
                 if (heightDiff > 0.1f && _cc.enabled)
                     _cc.Move(Vector3.up * heightDiff * 0.5f);
-                _cc.height = STAND_HEIGHT;
-                _cc.center = new Vector3(0, STAND_CENTER_Y, 0);
+                ApplyStance(STAND_HEIGHT, SKIN_STANDING);
             }
             if (_bodyAnimator != null) { TrySet(_bodyAnimator, "Slide", false); TrySet(_bodyAnimator, "Crouch", false); }
             if (_globalAnimator != null) { TrySet(_globalAnimator, "Slide", false); TrySet(_globalAnimator, "Crouch", false); }
@@ -2442,19 +2951,29 @@ namespace StraftatBots
                         dir = TryAngledDirections(dir, wallMask);
                     }
                 }
+                else
+                {
+                    // Feet ray clear — check for KNEE-HIGH blockers underneath it.
+                    jumped = TryKneeHop(dir, wallMask);
+                }
             }
 
-            // Proactive slide: detect low ceilings and crawl spaces
+            // Proactive crouch/slide under obstacles:
+            //  * Face-height opening (head blocked, waist clear): CROUCH-WALK immediately.
+            //    A slide here was wrong — it's momentary, locks direction, and the bot
+            //    stood back up into the obstacle over and over.
+            //  * True crawl gap (waist blocked too): slide is the only shape that fits.
             if (!zoneLaunched && !commitActive && !jumped && _cc.isGrounded && !_isSliding && !_onLadder
                 && _intentionalJumpTimer <= 0f)
             {
                 var obs = CheckObstructions(dir);
-                bool shouldSlide = false;
                 if (obs.CrouchClear && obs.HeadBlocked && !obs.WaistBlocked)
-                    shouldSlide = true;
-                else if (obs.CrouchClear && obs.WaistBlocked && _stuckTimer > 0.3f)
-                    shouldSlide = true;
-                if (shouldSlide)
+                {
+                    if (!_isCrouching) StartCrouch(0.9f);
+                    else _crouchTimer = Mathf.Max(_crouchTimer, 0.4f); // keep it held while still blocked
+                    _stuckTimer = 0f;
+                }
+                else if (obs.CrouchClear && obs.WaistBlocked && _stuckTimer > 0.15f)
                 {
                     InitSlide(dir);
                     _stuckTimer = 0f;
@@ -2939,6 +3458,7 @@ namespace StraftatBots
 
                         Vector3 ladderCenter = closestLadder.bounds.center;
                         _lastLadderPos = ladderCenter;
+                        _ladderTopY = closestLadder.bounds.max.y;
 
                         Vector3 ladderObjective = GetLadderObjective();
                         // Dismount at the top of ANY ladder collider (not just "tall" ones) so the bot
@@ -3177,6 +3697,87 @@ namespace StraftatBots
             }
         }
 
+        private float _afterVaultJumpTimer;
+
+        /// <summary>
+        /// Per-frame vault check — mirrors FPC.CheckForVault exactly: while airborne
+        /// moving into a near-vertical face whose lip is passable (feet ray hits,
+        /// chest + head rays clear), boost straight up (y=9, killed after 0.15s like
+        /// the player's). The old collider-hit vault only fired while physically
+        /// TOUCHING the wall and never during the bot's own jumps — which is exactly
+        /// the player's mantle flow ("jump into the wall, vault"). Also implements the
+        /// FPC after-vault jump: within 0.5s of a vault one extra full-force boost if
+        /// the lip still isn't cleared — "vault, jump again" for taller ledges.
+        /// </summary>
+        private void HandleVaultMantle()
+        {
+            _afterVaultJumpTimer -= Time.deltaTime;
+            if (_cc == null || !_cc.enabled || _cc.isGrounded || _onLadder || IsDead) return;
+            if (_zoneForceDuration > 0f) return;
+            if (_trajActive) return;             // recorded arcs are authoritative
+            if (_verticalVelocity < -6f) return; // falling fast — wall jump handles that
+
+            // Allowed during the bot's own close-range jumps; never during long
+            // planned arcs (graph jumps / gap crossings have their own landing).
+            if (_intentionalJumpTimer > 0f
+                && _activeJumpReason != JumpReason.Obstacle
+                && _activeJumpReason != JumpReason.StuckRecovery
+                && _activeJumpReason != JumpReason.ExploreStuck
+                && _activeJumpReason != JumpReason.WallJump
+                && _activeJumpReason != JumpReason.Vault
+                && _activeJumpReason != JumpReason.None)
+                return;
+
+            Vector3 fwd = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+            fwd.y = 0f;
+            if (fwd.sqrMagnitude < 0.01f) return;
+            fwd.Normalize();
+
+            if (!Physics.Raycast(transform.position + Vector3.up * 0.3f, fwd, out RaycastHit feetHit, 1.4f,
+                    WALL_MASK, QueryTriggerInteraction.Ignore))
+                return;
+            float wallAngle = Vector3.Angle(feetHit.normal, Vector3.up);
+            if (wallAngle < 80f || wallAngle > 130f) return;
+            if (Physics.Raycast(transform.position + Vector3.up * 1.2f, fwd, 1.5f, WALL_MASK, QueryTriggerInteraction.Ignore))
+                return;
+            if (Physics.Raycast(transform.position + Vector3.up * 1.8f, fwd, 2f, WALL_MASK, QueryTriggerInteraction.Ignore))
+                return;
+
+            // The lip must have standable ground — never boost into nothing.
+            Vector3 topCheck = transform.position + fwd * 1f + Vector3.up * 2.5f;
+            if (!Physics.Raycast(topCheck, Vector3.down, out RaycastHit topHit, 3f,
+                    GROUND_MASK, QueryTriggerInteraction.Ignore))
+                return;
+
+            if (!_vaultCooldown)
+            {
+                // VAULT — FPC: moveDirection.y = 9 + forward BForce, one per airtime.
+                _verticalVelocity = 9f;
+                _vaultCooldown = true;
+                _vaultTakeoffPos = transform.position;
+                _afterVaultJumpTimer = 0.5f;
+                _vaultKillTimer = 0.15f;
+                _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, 0.4f);
+                _jumpDir = fwd;
+                _activeJumpReason = JumpReason.Vault;
+                _airStrafeTarget = topHit.point + fwd * 0.3f;
+                _airStrafeActive = true;
+                _cc.Move(fwd * 1.5f * Time.deltaTime);
+            }
+            else if (_afterVaultJumpTimer > 0f && _verticalVelocity < 3f)
+            {
+                // AFTER-VAULT JUMP — FPC allows one full mid-air jump within 0.5s of a
+                // vault (aftervaultjumpTimer): the "jump again" that mantles taller lips.
+                _afterVaultJumpTimer = 0f;
+                _verticalVelocity = _jumpForce;
+                _vaultKillTimer = 0f;
+                _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, 0.5f);
+                _airStrafeTarget = topHit.point + fwd * 0.3f;
+                _airStrafeActive = true;
+                Plugin.Log.LogInfo($"[{BotName}] After-vault jump");
+            }
+        }
+
         private void HandleWallJump()
         {
             // Reset wall jump count when grounded — record wall jump edge on landing
@@ -3280,6 +3881,7 @@ namespace StraftatBots
             if (reason != JumpReason.WallJump && reason != JumpReason.Vault)
             {
                 if (!_cc.isGrounded && _coyoteTimer <= 0f) return false;
+                if (_onSuperIce) return false; // FPC blocks all jumps on super ice (FirstPersonController L1076)
             }
 
             // --- Defaults ---
@@ -3287,6 +3889,24 @@ namespace StraftatBots
             if (direction.sqrMagnitude < 0.01f) direction = transform.forward;
             direction.y = 0f;
             direction.Normalize();
+
+            // --- Landing gate: reactive jumps must see SOME ground along the arc ---
+            // These jumps used to launch on faith ("target is within max jump distance")
+            // and bots regularly leapt into the void. Learned graph jumps keep their
+            // recorded trust; every reactive/panic jump is gated — including stuck
+            // recovery, which could panic-jump a bot straight off a void edge.
+            if (reason == JumpReason.EdgeAhead || reason == JumpReason.GapDetection
+                || reason == JumpReason.StuckRecovery || reason == JumpReason.ExploreStuck)
+            {
+                if (!HasJumpLanding(direction)) return false;
+            }
+
+            // --- Arc rehearsal: does the first half-second of the parabola even fit? ---
+            if (reason == JumpReason.EdgeAhead || reason == JumpReason.GapDetection
+                || reason == JumpReason.Obstacle)
+            {
+                if (!RehearseJumpArc(direction, force)) return false;
+            }
 
             // Default intentional time based on reason if not specified
             if (intentionalTime <= 0f)
@@ -3369,6 +3989,148 @@ namespace StraftatBots
             return true;
         }
 
+        private float _losSkipTimer;
+        private float _trajDriftTimer; // Replay drift accumulator — aborts bad-match recordings
+
+        /// <summary>Point ~2.6m along the remaining path polyline (walk edges only) —
+        /// the pure-pursuit steering target. Stops at the node BEFORE any special edge
+        /// so jump lineups and ladder mounts still hit their nodes exactly.</summary>
+        private Vector3 ComputePursuitPoint(Vector3 fallback)
+        {
+            if (_graphPath == null || _graphPathIndex >= _graphPath.Count) return fallback;
+            float remaining = 2.6f;
+            Vector3 cur = transform.position;
+            for (int i = _graphPathIndex; i < _graphPath.Count; i++)
+            {
+                if (i > _graphPathIndex)
+                {
+                    var e = FindBestPathEdge(_graphPath[i - 1].Id, _graphPath[i].Id);
+                    if (e != null && e.Type != EdgeType.Walk)
+                        return _graphPath[i - 1].Position;
+                }
+                Vector3 wp = _graphPath[i].Position;
+                float segLen = Vector3.Distance(cur, wp);
+                if (segLen >= remaining)
+                    return Vector3.Lerp(cur, wp, remaining / Mathf.Max(segLen, 0.001f));
+                remaining -= segLen;
+                cur = wp;
+            }
+            return _graphPath[_graphPath.Count - 1].Position;
+        }
+
+        /// <summary>Straight-line walkability: eye-level line of sight plus ground
+        /// continuity samples along the way. Used by the Play-mode waypoint skip.</summary>
+        private bool CanWalkStraightTo(Vector3 wp)
+        {
+            if (Mathf.Abs(wp.y - transform.position.y) > 1.5f) return false;
+            Vector3 eye = transform.position + Vector3.up * 1.2f;
+            Vector3 to = (wp + Vector3.up * 1.2f) - eye;
+            float dist = to.magnitude;
+            if (dist > 12f || dist < 0.05f) return false;
+            if (Physics.Raycast(eye, to / dist, dist, WALL_MASK, QueryTriggerInteraction.Ignore)) return false;
+
+            Vector3 flat = wp - transform.position;
+            flat.y = 0f;
+            float fd = flat.magnitude;
+            if (fd < 1f) return true;
+            Vector3 fdir = flat / fd;
+            for (float d = 1.5f; d < fd; d += 2f)
+            {
+                Vector3 probe = transform.position + fdir * d + Vector3.up * 1f;
+                if (!Physics.Raycast(probe, Vector3.down, 3f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Arc rehearsal: sphere-cast the first half-second of the predicted parabola.
+        /// Catches "the doorframe/lip overhead clips me right after launch" — the
+        /// landing gate only proves ground exists, not that the arc fits. Only refuses
+        /// on overhead (ceiling-facing) hits so mantling a ledge still works.
+        /// </summary>
+        private bool RehearseJumpArc(Vector3 dir, float force)
+        {
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) return true;
+            dir.Normalize();
+            Vector3 vel = _cc != null ? _cc.velocity : Vector3.zero;
+            float h = Mathf.Clamp(new Vector2(vel.x, vel.z).magnitude, 4f, _sprintAirSpeed);
+            Vector3 prev = transform.position + Vector3.up * 0.9f; // capsule center
+            for (int i = 1; i <= 4; i++)
+            {
+                float t = 0.12f * i;
+                Vector3 p = transform.position + dir * (h * t)
+                    + Vector3.up * (0.9f + force * t - 0.5f * _gravityJump * t * t);
+                Vector3 seg = p - prev;
+                if (seg.sqrMagnitude > 0.0001f)
+                {
+                    float segLen = seg.magnitude;
+                    if (Physics.SphereCast(prev, 0.34f, seg / segLen, out RaycastHit hit, segLen,
+                            WALL_MASK, QueryTriggerInteraction.Ignore)
+                        && hit.normal.y < -0.35f)
+                        return false; // smacks the underside of something overhead
+                }
+                prev = p;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Is there ANY real ground along the jump direction? Samples downward rays
+        /// along the flight corridor out to max jump range; if every sample falls into
+        /// nothing (void), the jump is refused. Depth doesn't matter — Straftat has no
+        /// fall damage; only the kill-void does.
+        /// </summary>
+        private bool HasJumpLanding(Vector3 dir)
+        {
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) return false;
+            dir.Normalize();
+            float maxD = Mathf.Min(Plugin.GetMaxJumpDist(), 10f);
+            for (float d = 1.2f; d <= maxD; d += 1f)
+            {
+                Vector3 probe = transform.position + dir * d + Vector3.up * 1.2f;
+                if (Physics.Raycast(probe, Vector3.down, 80f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Knee-high obstacles sit BELOW the 0.7m feet ray and defeat the CC's 0.6 step
+        /// offset on sharp edges — bots used to grind against them forever. Detect a low
+        /// blocker with a clear top within hop height and jump onto it.
+        /// </summary>
+        private bool TryKneeHop(Vector3 dir, int wallMask)
+        {
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) return false;
+            dir.Normalize();
+
+            if (!Physics.Raycast(transform.position + Vector3.up * 0.3f, dir, out RaycastHit kneeHit, 0.9f,
+                    wallMask, QueryTriggerInteraction.Ignore))
+                return false;
+            if (Vector3.Angle(kneeHit.normal, Vector3.up) < 55f) return false; // walkable ramp — let CC handle it
+
+            // Chest must be clear — otherwise this is a real wall, not a knee blocker.
+            if (Physics.Raycast(transform.position + Vector3.up * 1.3f, dir, kneeHit.distance + 0.5f,
+                    wallMask, QueryTriggerInteraction.Ignore))
+                return false;
+
+            // A top surface within hop height.
+            Vector3 topProbe = transform.position + dir * (kneeHit.distance + 0.45f) + Vector3.up * 1.6f;
+            if (!Physics.Raycast(topProbe, Vector3.down, out RaycastHit topHit, 1.7f,
+                    GROUND_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            float rise = topHit.point.y - transform.position.y;
+            if (rise < 0.25f || rise > 1.05f) return false;
+
+            _airStrafeTarget = topHit.point + dir * 0.3f;
+            _airStrafeActive = true;
+            return TryJump(JumpReason.Obstacle, dir, intentionalTime: 0.45f);
+        }
+
         /// <summary>
         /// Reset jump state when landing. Called from landing pause logic.
         /// </summary>
@@ -3435,11 +4197,21 @@ namespace StraftatBots
             }
 
             if (_onLadder) return; // Ladder handles vertical velocity
-            if (_trajActive && _currentJumpEdge != null) return; // Trajectory replay controls vertical velocity
+            if (_trajActive && _currentJumpEdge != null)
+            {
+                // Replay controls vertical velocity — but ONLY while the jump window is
+                // live. If the arc ended without a landing (mismatched/stale recording),
+                // a blind return here froze vertical velocity forever and bots WALKED IN
+                // MID-AIR. Hand back to real gravity instead.
+                if (_intentionalJumpTimer > 0f) return;
+                _trajActive = false;
+                _currentJumpEdge = null;
+            }
 
             // Hard cap on upward velocity — nothing in Straftat should send bots above jump impulse.
-            // If external forces push above 2× jumpForce, clamp (zones can still launch normally).
-            if (_verticalVelocity > _jumpForce * 2.5f && _zoneForceDuration <= 0f)
+            // If external forces push above 2× jumpForce, clamp (zones can still launch normally,
+            // including continuous updraft ForceZones which don't set a launch duration).
+            if (_verticalVelocity > _jumpForce * 2.5f && _zoneForceDuration <= 0f && !_zoneVerticalActive)
                 _verticalVelocity = _jumpForce * 2.5f;
 
             // Vault velocity kill — FPC kills moveDirection.y after 0.15s via coroutine
@@ -3471,6 +4243,19 @@ namespace StraftatBots
                 else
                 {
                     _verticalVelocity = -1f; // Match FPC: moveDirection.y = -1 when grounded
+                    // Ice slope: press into the surface like FPC's OnSlopeIce gravity pump,
+                    // so the capsule stays grounded while the ice slide pushes it downhill
+                    // (otherwise the horizontal push skips the bot off the slope every frame).
+                    if (_onIce && _iceSlopeAngle > 10f && _iceSlopeAngle < 65f)
+                    {
+                        float slideMagSqr = (_iceSlideMove.x + _iceCrouchSlideMove.x) * (_iceSlideMove.x + _iceCrouchSlideMove.x)
+                                          + (_iceSlideMove.z + _iceCrouchSlideMove.z) * (_iceSlideMove.z + _iceCrouchSlideMove.z);
+                        if (slideMagSqr > 0.25f)
+                        {
+                            float needed = Mathf.Sqrt(slideMagSqr) * Mathf.Tan(_iceSlopeAngle * Mathf.Deg2Rad) + 2f;
+                            _verticalVelocity = Mathf.Max(-needed, _maxFallSpeed);
+                        }
+                    }
                     _coyoteTimer = 0.15f;
                     _activeJumpReason = JumpReason.None; // Landed — clear priority lock
                     // Air-strafe is only valid while airborne — clear on landing.

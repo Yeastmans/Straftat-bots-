@@ -193,6 +193,14 @@ namespace StraftatBots
             bool hasLosNow = HasLineOfSight();
             if (hasLosNow)
             {
+                // Target re-appeared after a real LOS break: skill-scaled re-acquire
+                // delay. Without this, bots snap-fired the instant of a re-peek
+                // regardless of skill — reaction time only applied on target SWITCH.
+                if (_huntNoLosTimer > 0.6f && _reactionTimer <= 0f)
+                {
+                    _reactionTimer = Random.Range(_skillReactionMin, _skillReactionMax) * 0.7f;
+                    _aimSmoothing = Mathf.Min(_aimSmoothing, 0.4f);
+                }
                 _huntNoLosTimer = 0f;
                 _huntHasLastSeenTarget = true;
                 _huntLastSeenTargetPos = _playerTarget.position;
@@ -240,10 +248,17 @@ namespace StraftatBots
                 TryShoot();
             }
 
-            // Multi-level: graph handles this via jump/ladder edges — just MoveToward target
+            // Multi-level: route UP to the enemy like a player would (ladders/jumps via
+            // preferHeight routing) — plain MoveToward at a target overhead just circled
+            // underneath them forever.
             if (onDifferentLevel)
             {
-                if (hasLosNow) MoveToward(_playerTarget.position, _sprintSpeed);
+                if (hasLosNow)
+                {
+                    bool targetAbove = _playerTarget.position.y > transform.position.y + 3f;
+                    if (targetAbove) TryBuildHuntGraphRoute(_playerTarget.position);
+                    MoveToward(_playerTarget.position, _sprintSpeed);
+                }
                 else HandleNoLosChase(dist);
                 return;
             }
@@ -635,6 +650,29 @@ namespace StraftatBots
             float flank = dist > 18f ? 1.1f : 2.2f;
             Vector3 chasePoint = anchor + side * flank;
 
+            // Occasional high-ground bid: with a ranged weapon and broken LOS, take a
+            // vantage node above the last-seen spot instead of always pushing the flat
+            // chase corridor — this is what makes bots traverse maps like players.
+            if (!_cachedIsMelee && _huntNoLosTimer > 1.2f && Time.time >= _nextHighGroundBidTime
+                && NavGraph.Instance != null)
+            {
+                _nextHighGroundBidTime = Time.time + Random.Range(7f, 12f);
+                var vantage = NavGraph.Instance.FindVantageNode(anchor, 16f, 2.5f);
+                if (vantage != null)
+                {
+                    var vPath = NavGraph.Instance.FindPath(transform.position, vantage.Position,
+                        jitter: 0.03f, searchRadius: 60f, preferHeight: true);
+                    if (vPath != null && vPath.Count > 1)
+                    {
+                        _graphPath = vPath;
+                        _graphPathIndex = 0;
+                        _lastReachedNode = null;
+                        _prevReachedNode = null;
+                        SwitchPathSource(PathSource.GraphRoute);
+                    }
+                }
+            }
+
             // Keep hunt graph pressure even when LOS is broken so bots continue traversing
             // navmesh corridors (jump/ladder routes) instead of repeatedly stalling nodeless.
             TryBuildHuntGraphRoute(anchor);
@@ -880,7 +918,7 @@ namespace StraftatBots
             if (_playerHealth != null && !_isDodging)
             {
                 float healthPct = _playerHealth.health / _playerHealth.fullHealth;
-                if (healthPct < 0.6f && Random.value < 0.02f)
+                if (healthPct < 0.6f && Random.value < _skillDodgeChance)
                 {
                     _isDodging = true;
                     _dodgeTimer = 0.3f;
@@ -970,11 +1008,7 @@ namespace StraftatBots
             if (_isCrouching || _isSliding) return;
             _isCrouching = true;
             _crouchTimer = duration;
-            if (_cc != null)
-            {
-                _cc.height = 1f;
-                _cc.center = new Vector3(0, 0.5f, 0);
-            }
+            ApplyStance(CROUCH_HEIGHT, SKIN_CROUCHED);
             if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", true);
             if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", true);
         }
@@ -990,11 +1024,8 @@ namespace StraftatBots
 
             _isCrouching = false;
             if (_cc != null)
-            {
-                _cc.Move(Vector3.up * 0.5f); // Push up to prevent ground clipping
-                _cc.height = STAND_HEIGHT;
-                _cc.center = new Vector3(0, STAND_CENTER_Y, 0);
-            }
+                _cc.Move(Vector3.up * 0.4f); // Push up to prevent ground clipping
+            ApplyStance(STAND_HEIGHT, SKIN_STANDING);
             if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
             if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
         }
@@ -1048,19 +1079,19 @@ namespace StraftatBots
             if (_playerTarget != _lastAimTarget)
             {
                 _lastAimTarget = _playerTarget;
-                _reactionTimer = Random.Range(0.15f, 0.4f); // Human reaction time
+                _reactionTimer = Random.Range(_skillReactionMin, _skillReactionMax); // Human reaction time, skill-scaled
                 _aimSmoothing = 0f;
             }
             if (_reactionTimer > 0f)
             {
                 _reactionTimer -= Time.deltaTime;
                 // During reaction, aim drifts randomly (not locked on yet)
-                targetPos += Random.insideUnitSphere * 3f;
+                targetPos += Random.insideUnitSphere * (_aimInaccuracy * 1.2f);
             }
             else
             {
                 // Gradually improve aim over time (ramp up accuracy)
-                _aimSmoothing = Mathf.MoveTowards(_aimSmoothing, 1f, Time.deltaTime * 1.5f);
+                _aimSmoothing = Mathf.MoveTowards(_aimSmoothing, 1f, Time.deltaTime * _skillLockOnRate);
             }
 
             // Persistent aim drift — human-like sustained inaccuracy
@@ -1068,8 +1099,11 @@ namespace StraftatBots
             if (_aimOffsetTimer <= 0f)
             {
                 float dist = Vector3.Distance(origin, targetPos);
-                // Base inaccuracy from config, scaled by distance AND aim smoothing
-                float inaccuracy = _aimInaccuracy * Mathf.Clamp01(dist / _attackRange);
+                // Base inaccuracy from skill, scaled by distance AND aim smoothing.
+                // The distance factor has a skill-scaled FLOOR: most fights are close
+                // range, and Clamp01 used to crush every skill level to near-zero
+                // drift there — the main reason the slider felt like it did nothing.
+                float inaccuracy = _aimInaccuracy * Mathf.Clamp(dist / _attackRange, _skillDriftFloor, 1f);
                 // Less accurate when bot is moving
                 float moveSpeed = _cc != null ? Mathf.Sqrt(_cc.velocity.x * _cc.velocity.x + _cc.velocity.z * _cc.velocity.z) : 0f;
                 if (moveSpeed > _walkSpeed * 0.5f) inaccuracy *= 1.5f;
@@ -1090,7 +1124,7 @@ namespace StraftatBots
             _botCam.transform.position = origin;
             // Smooth aim transition — fast enough to track target but not instant
             Quaternion desiredRot = Quaternion.LookRotation((targetPos - origin).normalized);
-            _botCam.transform.rotation = Quaternion.Slerp(_botCam.transform.rotation, desiredRot, 10f * Time.deltaTime);
+            _botCam.transform.rotation = Quaternion.Slerp(_botCam.transform.rotation, desiredRot, _skillAimSlerp * Time.deltaTime);
         }
 
         private Vector3 GetTargetAimPoint(Vector3 origin, bool leadMovingTarget)
@@ -1280,9 +1314,10 @@ namespace StraftatBots
             // --- FIRE TIMER ---
             _fireTimer += Time.deltaTime;
             float delay = _heldWeapon.timeBetweenFire;
-            // Semi-auto weapons (onePressShoot) need click-release-click — humans can't click faster than ~0.5s
+            // Semi-auto weapons (onePressShoot) need click-release-click — the floor is
+            // skill-scaled: low-skill bots click slow, high-skill bots near human cap.
             if (ReadBoolField(_heldWeapon, "onePressShoot"))
-                delay = Mathf.Max(delay, 0.55f);
+                delay = Mathf.Max(delay, _skillSemiAutoFloor);
             if (_cachedIsBubbleLauncher)
                 delay = Mathf.Min(delay, 0.18f);
             if (delay < 0.05f) delay = 0.05f; // Absolute floor to prevent frame-rate shooting
@@ -1356,13 +1391,23 @@ namespace StraftatBots
                 return;
             }
 
-            // Projectile weapons (rockets, launchers) — don't fire at close walls (self-damage)
+            // Projectile weapons (rockets, launchers) — hold fire only when the shot
+            // would detonate dangerously close to US. The old blanket "any wall within
+            // 8m of the aim line" check meant the Serac/rockets almost never fired
+            // indoors — a floor or side wall is nearly always within 8m of the ray.
             if ((_isProjectileWeapon || _cachedIsDualLauncher) && !_cachedIsBubbleLauncher)
             {
-                int envMask = WALL_MASK;
-                if (Physics.Raycast(_botCam.transform.position, _botCam.transform.forward, 8f, envMask, QueryTriggerInteraction.Ignore))
+                float targetDist = _playerTarget != null
+                    ? Vector3.Distance(_botCam.transform.position, _playerTarget.position + Vector3.up)
+                    : 99f;
+                // Point-blank explosive = suicide regardless of what we hit.
+                if (targetDist < 4.5f) return;
+                // Otherwise only a wall SHORT of the target inside the blast-danger
+                // window blocks the shot; geometry behind the target is irrelevant.
+                if (Physics.Raycast(_botCam.transform.position, _botCam.transform.forward,
+                    out RaycastHit projWallHit, 4f, WALL_MASK, QueryTriggerInteraction.Ignore)
+                    && projWallHit.distance < targetDist - 0.75f)
                 {
-                    // Wall within 4m — don't fire, move instead
                     return;
                 }
             }
@@ -1383,10 +1428,10 @@ namespace StraftatBots
             if (!ReadBoolField(_heldWeapon, "onePressShoot") && !_minigunSpunUp)
             {
                 _autoShotsFired++;
-                if (_autoShotsFired >= Random.Range(3, 6))
+                if (_autoShotsFired >= Random.Range(_skillBurstMin, _skillBurstMax + 1))
                 {
                     _autoShotsFired = 0;
-                    _autoPauseTimer = Random.Range(0.4f, 0.8f);
+                    _autoPauseTimer = Random.Range(0.4f, 0.8f) * _skillBurstPauseMult;
                 }
             }
         }

@@ -11,10 +11,16 @@ namespace StraftatBots
         public static BotManager Instance { get; private set; }
 
         public List<BotData> LobbyBots = new List<BotData>();
+        // GameObject instance IDs of every bot object ever spawned this session — filled
+        // at Instantiate time, before any component or network state exists.
+        internal static readonly HashSet<int> BotObjectIds = new HashSet<int>();
+        internal static bool IsBotObject(GameObject go) => go != null && BotObjectIds.Contains(go.GetInstanceID());
         private List<BotController> _activeBots = new List<BotController>();
         private int _nextBotId;
         private GameObject _cachedPrefab;
         private float _onlyBotsAliveTimer;
+        private float _trainingPlayerDeadTimer;
+        private float _cosmeticSweepTimer;
         private float _stuckRoundTimer;
         private float _botWinConfirmTimer;
         private bool _takeAdvancePending;
@@ -50,6 +56,10 @@ namespace StraftatBots
         {
             if (!FishNet.InstanceFinder.IsServer) return;
             if (_activeBots.Count == 0 || GameManager.Instance == null) return;
+
+            // Deferred explosive kill-feed watch: writes bot-on-human lines whose
+            // isKilled flipped after the explosion postfix ran (RPC ordering race).
+            BotPatches.ProcessPendingExplosiveFeeds();
 
             if (_takeAdvancePending)
             {
@@ -100,7 +110,7 @@ namespace StraftatBots
                             if (key != _lastDemoNeededLogged)
                             {
                                 _lastDemoNeededLogged = key;
-                                Plugin.Log.LogInfo($"[BOT] Demo-needed edge near player at {mid:F1} — bots keep failing this jump, consider a Watch-Me demo");
+                                Plugin.Log.LogInfo($"[BOT] Bots keep failing a route near {mid:F1} — walking it yourself once will teach it");
                             }
                             goto demoNeededFound;
                         }
@@ -113,6 +123,29 @@ namespace StraftatBots
             _drawCheckTimer -= Time.deltaTime;
             if (_drawCheckTimer > 0f) return;
             _drawCheckTimer = 0.5f;
+
+            // Sweep stray cosmetics: hats the game detached from dying bots render as giant
+            // white untextured slabs frozen in the world. A player's own thrown hat keeps a
+            // live reference to their mount and is left alone. Bots WEAR cosmetics again
+            // (mod-applied, parented to their mount) — those stay; only DETACHED bot
+            // cosmetics (thrown into the world) or reference-less orphans are junk.
+            _cosmeticSweepTimer -= 0.5f;
+            if (_cosmeticSweepTimer <= 0f)
+            {
+                _cosmeticSweepTimer = 5f;
+                try
+                {
+                    foreach (var hp in FindObjectsOfType<HatPosition>())
+                    {
+                        if (hp == null) continue;
+                        bool orphan = hp.reference == null;
+                        bool detachedBotCosmetic = !orphan && hp.transform.parent == null
+                            && hp.reference.GetComponentInParent<BotController>() != null;
+                        if (orphan || detachedBotCosmetic) Destroy(hp.gameObject);
+                    }
+                }
+                catch { }
+            }
 
             // Draw timer: if only bots are alive (all humans dead), force a draw after 25 seconds
             bool anyHumanAlive = false;
@@ -144,9 +177,40 @@ namespace StraftatBots
             if (anyHumanAlive && !HasLivingHumanPlayerHealth())
                 anyHumanAlive = false;
 
-            // Training mode: never end the round — bots need uninterrupted time
+            // Training mode: never end the round — bots need uninterrupted time.
+            // But rounds never ending means a dead PLAYER would spectate forever, so
+            // bring them back through the game's own round-spawn flow (same path the
+            // game uses at round start: fresh object, camera, HUD all handled).
             bool trainingMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
-            if (trainingMode) return;
+            if (trainingMode)
+            {
+                if (!anyHumanAlive)
+                {
+                    _trainingPlayerDeadTimer += 0.5f;
+                    if (_trainingPlayerDeadTimer >= 2.5f)
+                    {
+                        _trainingPlayerDeadTimer = 0f;
+                        try
+                        {
+                            var pm = ClientInstance.Instance?.PlayerSpawner;
+                            if (pm != null)
+                            {
+                                Plugin.Log.LogInfo("[BOT] Training: respawning dead player");
+                                pm.RoundSpawn();
+                            }
+                        }
+                        catch (System.Exception e)
+                        {
+                            Plugin.Log.LogWarning($"[BOT] Training player respawn failed: {e.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    _trainingPlayerDeadTimer = 0f;
+                }
+                return;
+            }
 
             if (!anyHumanAlive && aliveBotCount == 1)
             {
@@ -201,6 +265,39 @@ namespace StraftatBots
             {
                 _onlyBotsAliveTimer = 0f;
                 _stuckRoundTimer = 0f;
+            }
+        }
+
+        /// <summary>
+        /// Entering Play from training: wipe every bot and player, then run the game's
+        /// own round-start flow on the CURRENT map. RoundSpawn respawns the player fresh
+        /// at a spawn point (with the round-start countdown), resets round items, and the
+        /// RoundSpawn postfix brings fresh bots in ~1.5s after it.
+        /// </summary>
+        public void StartFreshPlayRound()
+        {
+            if (InstanceFinder.NetworkManager == null || !InstanceFinder.NetworkManager.IsServer) return;
+
+            ResetDrawTimer();
+            _trainingPlayerDeadTimer = 0f;
+            DespawnAllBots();
+
+            try
+            {
+                var pm = ClientInstance.Instance?.PlayerSpawner;
+                if (pm != null)
+                {
+                    Plugin.Log.LogInfo("[BOT] Play mode: starting fresh round on this map");
+                    pm.RoundSpawn();
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[BOT] Play round start: no PlayerSpawner — not in a match?");
+                }
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[BOT] Play round start failed: {e.Message}");
             }
         }
 
@@ -291,7 +388,8 @@ namespace StraftatBots
         public void AddBot()
         {
             if (LobbyBots.Count >= Plugin.MaxBots.Value) return;
-            BotData bot = BotData.CreateRandom(_nextBotId++);
+            // Slot = lobby position, so "Bot 1 Name/Skill" always means the first bot.
+            BotData bot = BotData.CreateRandom(_nextBotId++, LobbyBots.Count % 8);
             LobbyBots.Add(bot);
             Plugin.Log.LogInfo($"Added {bot.Name} to lobby (suit {bot.SuitIndex})");
         }
@@ -331,6 +429,7 @@ namespace StraftatBots
                     controller = botObj.AddComponent<BotController>();
 
                 controller.BotId = botData.BotId;
+                controller.SkillSlot = botData.SlotIndex;
                 controller.BotName = botData.Name;
                 controller.PlayerId = botData.PlayerId;
                 botData.Controller = controller;
@@ -513,6 +612,11 @@ namespace StraftatBots
                 prefab.SetActive(wasActive);
 
                 botObj.name = $"Bot_{botData.Name}";
+                // Register BEFORE activation/network spawn: the game's ChangeDress RPC can
+                // fire before BotController is attached, and a component check alone let it
+                // create the hat that later detached as a white slab. The registry has no
+                // such race — the prefix skip works from frame zero.
+                BotObjectIds.Add(botObj.GetInstanceID());
 
                 // Set cosmetics before activation
                 PlayerSetup setup = botObj.GetComponent<PlayerSetup>();
@@ -530,6 +634,7 @@ namespace StraftatBots
                 if (controller == null)
                     controller = botObj.AddComponent<BotController>();
                 controller.BotId = botData.BotId;
+                controller.SkillSlot = botData.SlotIndex;
                 controller.BotName = botData.Name;
                 controller.PlayerId = botData.PlayerId;
                 controller.RefreshVisualSerial();
@@ -561,6 +666,10 @@ namespace StraftatBots
                 // Sync skin + cig to non-host clients via Mycelium (hats disabled).
                 if (nob != null)
                     StartCoroutine(DelaySkinSync((int)nob.ObjectId, controller.VisualSerial, botData.SuitIndex, -1, botData.CigIndex));
+
+                // Hats re-enabled: retry attachment if the first pass didn't stick
+                // (cosmetics can race prefab/animator init on spawn).
+                StartCoroutine(RetryApplyCosmetics(botData, botObj));
 
                 // Ensure graphics are enabled
                 var ph = botObj.GetComponent<PlayerHealth>();
@@ -789,11 +898,12 @@ namespace StraftatBots
         }
 
         /// <summary>Re-apply suit + hat + cig to a bot. Called on respawn and for late joiners.</summary>
-        public void ReapplyCosmetics(BotData botData, GameObject botObj)
+        public void ReapplyCosmetics(BotData botData, GameObject botObj, bool randomize = true)
         {
             if (botObj == null) return;
-            // Randomize cosmetics each round
-            botData.RandomizeCosmetics();
+            // Randomize each round; mid-round (training) respawns keep the same suit so a
+            // reapply can never look like a "glitched" material change.
+            if (randomize) botData.RandomizeCosmetics();
             ApplyAllCosmetics(botObj, botData);
 
             // Sync to non-host via Mycelium
@@ -811,7 +921,7 @@ namespace StraftatBots
                 || b.PlayerObject == controller.gameObject
                 || b.BotId == controller.BotId);
             if (botData == null) return;
-            ReapplyCosmetics(botData, controller.gameObject);
+            ReapplyCosmetics(botData, controller.gameObject, randomize: false);
         }
 
         /// <summary>
@@ -824,15 +934,12 @@ namespace StraftatBots
             try
             {
                 var setup = botObj.GetComponent<PlayerSetup>();
-                if (botData != null)
-                {
-                    botData.HatIndex = -1; // Disable hats entirely.
-                    // Disable cigs too: the instantiated cig prefab rendered as a white untextured
-                    // slab on bots (especially after a training respawn). Bots wear suit-only now.
-                    // The cig block below is gated on CigIndex >= 0, so this skips creation; the
-                    // CleanupOldCosmetics call still removes any cig left over from a prior life.
-                    botData.CigIndex = -1;
-                }
+                // Bots wear a random hat + cig again. The old white-slab bug had two
+                // ingredients, both fixed at the source: (1) the game's ChangeDress racing
+                // in before BotController attached (blocked by prefix via the instance-id
+                // registry), and (2) the death path throwing setup.hat into the world
+                // (we keep setup.hat null and Die() destroys all HatPosition children).
+                // A size sanity guard below discards anything slab-shaped regardless.
 
                 // Suit material
                 if (CosmeticsManager.Instance?.mats != null &&
@@ -867,35 +974,72 @@ namespace StraftatBots
                 }
 
                 Transform hatPos = ResolveHatAnchor(botObj, setup, true);
-                if (hatPos == null) return;
-                // Bots wear suit-only. Keep the cosmetic mount DEACTIVATED so any hat/cig the
-                // game's ChangeDress creates underneath it stays hidden (they render as white
-                // untextured slabs on bots). A ChangeDress postfix also strips them at the source.
-                hatPos.gameObject.SetActive(false);
+                if (hatPos == null)
+                {
+                    Plugin.Log.LogWarning($"[BotCosmetics] {botData?.Name}: no hat anchor found (hatToWearPosition null, no head bone) — skipping cosmetics");
+                    return;
+                }
+                Plugin.Log.LogInfo($"[BotCosmetics] {botData?.Name}: anchor='{hatPos.name}' " +
+                    $"(game pivot: {(setup != null && setup.hatToWearPosition == hatPos)}) hatIdx={botData?.HatIndex} cigIdx={botData?.CigIndex}");
+                // The mount must be ACTIVE for cosmetics to render — the game deactivates
+                // it for the LOCAL player only (you don't see your own hat), and the old
+                // suit-only bot code deactivated it too. ChangeDress stays blocked for
+                // bots, so nothing renegade can spawn under it.
+                hatPos.gameObject.SetActive(true);
                 Transform hatMount = hatPos;
                 if (setup != null) setup.cig = botData.CigIndex;
 
-                // Destroy old hat/cig instances before creating new ones
+                // Destroy old hat/cig instances before creating new ones — sweep the WHOLE
+                // bot, not just the resolved mount: the game's ChangeDress RPC may have
+                // parented cosmetics under a different anchor before BotController existed.
                 CleanupOldCosmetics(hatMount);
+                foreach (var hp in botObj.GetComponentsInChildren<HatPosition>(true))
+                    if (hp != null) Object.Destroy(hp.gameObject);
                 if (setup != null) setup.hat = null;
-
-                // Hats removed: keep suit + cig only.
                 CleanupOrphanedCosmetics();
-                bool usedNativeDress = false;
 
                 int visualLayer = GetBotVisualLayer(botObj);
 
-                // Cig/pipe/cigar — same as ChangeDress
-                if (!usedNativeDress && CosmeticsManager.Instance?.cigs != null
-                    && botData.CigIndex >= 0 && botData.CigIndex < CosmeticsManager.Instance.cigs.Length)
+                // Hat — same construction PlayerSetup.ChangeDress uses, from the same
+                // prefab list players wear. setup.hat stays null ON PURPOSE: the game's
+                // death code throws setup.hat into the world (the old white-slab source);
+                // bot cosmetics are destroyed with the body in Die() instead.
+                if (botData.HatIndex >= 0)
                 {
-                    GameObject cigPrefab = CosmeticsManager.Instance.cigs[botData.CigIndex];
+                    GameObject hatPrefab = ResolveHatPrefab(botData);
+                    if (hatPrefab == null)
+                        Plugin.Log.LogWarning($"[BotCosmetics] {botData?.Name}: no usable hat prefab (hats array: {GetHatPrefabs(CosmeticsManager.Instance)?.Length ?? -1})");
+                    if (hatPrefab != null)
+                    {
+                        var hatInst = Object.Instantiate(hatPrefab, hatMount.position, Quaternion.identity, hatMount);
+                        hatInst.name = "BOT_HAT_" + hatPrefab.name;
+                        hatInst.AddComponent<HatPosition>().reference = hatMount;
+                        PrepareCosmeticInstance(hatInst, hatMount, true, visualLayer);
+                        hatInst.transform.forward = botObj.transform.forward;
+                        hatInst.SetActive(true);
+                        SanityCheckCosmeticSize(hatInst, "hat");
+                        var hatRs = hatInst.GetComponentsInChildren<Renderer>(true);
+                        Plugin.Log.LogInfo($"[BotCosmetics] {botData?.Name}: hat '{hatPrefab.name}' spawned — " +
+                            $"activeInHierarchy={hatInst.activeInHierarchy} renderers={hatRs.Length} " +
+                            $"pivotScale={hatMount.lossyScale.x:F3} pos={hatInst.transform.position} layer={hatInst.layer}");
+                    }
+                }
+
+                // Cig/pipe/cigar — same as ChangeDress, but picked through a filter that
+                // skips placeholder/renderer-less prefabs (the likely old white-slab cig).
+                if (botData.CigIndex >= 0)
+                {
+                    GameObject cigPrefab = ResolveCigPrefab(botData);
+                    if (cigPrefab == null)
+                        Plugin.Log.LogWarning($"[BotCosmetics] {botData?.Name}: no usable cig prefab (cigs array: {CosmeticsManager.Instance?.cigs?.Length ?? -1})");
                     if (cigPrefab != null)
                     {
                         var cigInst = Object.Instantiate(cigPrefab, hatMount.position, Quaternion.identity, hatMount);
+                        cigInst.name = "BOT_CIG_" + cigPrefab.name;
                         cigInst.AddComponent<HatPosition>().reference = hatMount;
                         PrepareCosmeticInstance(cigInst, hatMount, false, visualLayer);
                         cigInst.SetActive(true);
+                        SanityCheckCosmeticSize(cigInst, "cig");
                     }
                 }
 
@@ -966,19 +1110,6 @@ namespace StraftatBots
             return visible;
         }
 
-        private static void InvokeSyncSetter(PlayerSetup setup, string methodName, int value)
-        {
-            try
-            {
-                MethodInfo setter = typeof(PlayerSetup).GetMethod(methodName,
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-                    null, new[] { typeof(int), typeof(bool) }, null);
-                if (setter != null)
-                    setter.Invoke(setup, new object[] { value, true });
-            }
-            catch { }
-        }
-
         private static GameObject ResolveHatPrefab(BotData botData)
         {
             try
@@ -1020,10 +1151,112 @@ namespace StraftatBots
             return null;
         }
 
+        /// <summary>Pick the bot's cig prefab, skipping placeholder entries ("nothing"
+        /// options) and prefabs with no renderers. Advances CigIndex to the used one.</summary>
+        private static GameObject ResolveCigPrefab(BotData botData)
+        {
+            try
+            {
+                var cigs = CosmeticsManager.Instance != null ? CosmeticsManager.Instance.cigs : null;
+                if (cigs == null || cigs.Length == 0 || botData == null) return null;
+
+                int start = Mathf.Clamp(botData.CigIndex, 0, cigs.Length - 1);
+                for (int offset = 0; offset < cigs.Length; offset++)
+                {
+                    int index = (start + offset) % cigs.Length;
+                    GameObject candidate = cigs[index];
+                    if (candidate == null) continue;
+                    string n = candidate.name != null ? candidate.name.ToLowerInvariant() : "";
+                    if (n.Contains("nothing") || n.Contains("none") || n.Contains("empty")) continue;
+                    bool hasRenderer = false;
+                    foreach (var r in candidate.GetComponentsInChildren<Renderer>(true))
+                        if (r != null) { hasRenderer = true; break; }
+                    if (!hasRenderer) continue;
+                    botData.CigIndex = index;
+                    return candidate;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Guard against "giant white slab" cosmetics — but NORMALIZE instead of
+        /// destroy, and only after skinning/transforms settle. The old same-frame destroy
+        /// false-positived on the game's own pipe/cigar prefabs (bounds read 13-21m at
+        /// the instantiation frame) and silently deleted every cig.</summary>
+        private static bool SanityCheckCosmeticSize(GameObject inst, string kind)
+        {
+            if (inst == null) return false;
+            try
+            {
+                var renderers = inst.GetComponentsInChildren<Renderer>(true);
+                if (renderers == null || renderers.Length == 0)
+                {
+                    Plugin.Log.LogWarning($"[BOT] Discarded {kind} cosmetic '{inst.name}' — no renderers");
+                    Object.Destroy(inst);
+                    return false;
+                }
+                if (Instance != null)
+                    Instance.StartCoroutine(NormalizeCosmeticSizeDeferred(inst, kind));
+            }
+            catch { }
+            return true;
+        }
+
+        private static System.Collections.IEnumerator NormalizeCosmeticSizeDeferred(GameObject inst, string kind)
+        {
+            // Two frames: lets SkinnedMeshRenderer bounds and the transform hierarchy
+            // settle before measuring — same-frame bounds are garbage for these prefabs.
+            yield return null;
+            yield return null;
+            if (inst == null) yield break;
+            float budget = kind == "hat" ? 0.9f : 0.55f;
+            try
+            {
+                var renderers = inst.GetComponentsInChildren<Renderer>(true);
+                if (renderers == null || renderers.Length == 0) yield break;
+                Bounds b = renderers[0].bounds;
+                for (int i = 1; i < renderers.Length; i++)
+                    if (renderers[i] != null) b.Encapsulate(renderers[i].bounds);
+                float largest = Mathf.Max(b.size.x, Mathf.Max(b.size.y, b.size.z));
+                if (largest > budget && largest > 0.001f)
+                {
+                    float k = budget / largest;
+                    inst.transform.localScale *= k;
+                    Plugin.Log.LogInfo($"[BotCosmetics] Normalized {kind} '{inst.name}' " +
+                        $"from {b.size.x:F1}x{b.size.y:F1}x{b.size.z:F1} (scale x{k:F3})");
+                }
+            }
+            finally { }
+        }
+
         private static Transform ResolveHatAnchor(GameObject botObj, PlayerSetup setup, bool preferHeadAnchor)
         {
-            if (setup != null && setup.hatToWearPosition != null && setup.hatToWearPosition.gameObject.activeInHierarchy)
-                return setup.hatToWearPosition;
+            // The game's own pivot ("HatPivot" on the IK prefab, hatToWearPosition) is
+            // authoritative — hats/cigs snap to it every frame via HatPosition. It can
+            // ship DEACTIVATED (the game hides the local player's own hat that way), so
+            // accept it inactive and switch it on. Requiring activeInHierarchy here
+            // silently rejected the real pivot and dumped bot cosmetics onto a guessed
+            // head-bone anchor at the wrong offset — buried inside the skull.
+            if (setup != null && setup.hatToWearPosition != null)
+            {
+                var pivot = setup.hatToWearPosition;
+                if (!pivot.gameObject.activeSelf) pivot.gameObject.SetActive(true);
+                // An INACTIVE ANCESTOR still makes everything under the pivot invisible
+                // no matter what we activate here — fall back to the head-bone anchor
+                // (always in the active rig) and say which ancestor was the problem.
+                if (!pivot.gameObject.activeInHierarchy)
+                {
+                    Transform t = pivot.parent;
+                    while (t != null && t.gameObject.activeSelf) t = t.parent;
+                    Plugin.Log.LogWarning($"[BotCosmetics] game pivot '{pivot.name}' is under inactive ancestor " +
+                        $"'{(t != null ? t.name : "?")}' — using head-bone anchor instead");
+                }
+                else
+                {
+                    return pivot;
+                }
+            }
 
             if (botObj != null && preferHeadAnchor)
             {
@@ -1065,7 +1298,9 @@ namespace StraftatBots
                         var go = new GameObject("BotHatAnchor");
                         anchor = go.transform;
                         anchor.SetParent(head, false);
-                        anchor.localPosition = new Vector3(0f, 0.06f, 0f);
+                        // Game's HatPivot local offset on the head bone (PlayerIK.prefab)
+                        // — the old (0, 0.06, 0) sat inside the skull.
+                        anchor.localPosition = new Vector3(-0.0106f, 0.4386f, 0.0407f);
                         anchor.localRotation = Quaternion.identity;
                     }
                     return anchor;
@@ -1433,6 +1668,65 @@ namespace StraftatBots
                 if (botData != null) ReapplyCosmetics(botData, bot.gameObject);
                 idx++;
             }
+        }
+
+        /// <summary>
+        /// Training respawn: replace a dead bot with a FRESH object — the same path the
+        /// round-start / "Spawn Bots Now" flows use, which always produces clean bots.
+        /// In-place resurrection of the dead object kept leaking death state (white
+        /// slabs, animator/material remnants) no matter how much of it we reset.
+        /// </summary>
+        public void RespawnBotFresh(BotController oldBot, Vector3 position)
+        {
+            if (oldBot == null) return;
+            var botData = LobbyBots.Find(b => b.Controller == oldBot
+                || b.PlayerObject == oldBot.gameObject
+                || b.BotId == oldBot.BotId);
+
+            // Tear the old object down exactly like DespawnAllBots does for one bot
+            int pid = oldBot.PlayerId;
+            if (ClientInstance.playerInstances.ContainsKey(pid))
+                ClientInstance.playerInstances.Remove(pid);
+            NetworkObject oldNob = oldBot.GetComponent<NetworkObject>();
+            if (oldNob != null && SteamLobby.Instance != null)
+                SteamLobby.Instance.players.Remove(oldNob);
+            if (GameManager.Instance != null)
+                GameManager.Instance.alivePlayers.Remove(pid);
+            _activeBots.Remove(oldBot);
+            if (oldNob != null && oldNob.IsSpawned)
+            {
+                try { InstanceFinder.ServerManager.Despawn(oldNob); }
+                catch { Destroy(oldBot.gameObject); }
+            }
+            else
+            {
+                Destroy(oldBot.gameObject);
+            }
+
+            if (botData == null)
+            {
+                Plugin.Log.LogWarning("[BOT] RespawnBotFresh: no BotData found for dead bot");
+                return;
+            }
+            botData.Controller = null;
+            botData.PlayerObject = null;
+
+            // Fresh spawn — identical sequence to SpawnAllBots
+            GameObject botObj = CreateBot(botData, position);
+            if (botObj == null) return;
+
+            BotController controller = botObj.GetComponent<BotController>();
+            if (controller == null)
+                controller = botObj.AddComponent<BotController>();
+            controller.BotId = botData.BotId;
+            controller.SkillSlot = botData.SlotIndex;
+            controller.BotName = botData.Name;
+            controller.PlayerId = botData.PlayerId;
+            botData.Controller = controller;
+            botData.PlayerObject = botObj;
+            _activeBots.Add(controller);
+            RegisterBotAsPlayer(botData, botObj);
+            Plugin.Log.LogInfo($"[BOT] Fresh training respawn: {botData.Name} at {position}");
         }
 
         public void DespawnAllBots()

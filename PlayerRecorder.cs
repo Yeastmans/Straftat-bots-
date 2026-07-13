@@ -121,7 +121,11 @@ namespace StraftatBots
             if (NavGraph.Instance.Mode == NavMode.Play && !NavGraph.LearnInPlay) return;
 
             // Feed coverage heatmap from player movement too — player paths compound with bot ones.
-            if (fpc.isGrounded) NavGraph.Instance.TouchCoverage(fpc.transform.position);
+            if (fpc.isGrounded)
+            {
+                NavGraph.Instance.TouchCoverage(fpc.transform.position);
+                BotNavMesh.MarkWalked(fpc.transform.position); // stage-1 walked coverage
+            }
 
             // Get unique ID for this player
             int id = fpc.GetInstanceID();
@@ -300,7 +304,13 @@ namespace StraftatBots
                             }
                         }
 
-                        bool necessaryJump = hasGap || !groundTrace;
+                        // Steep up-jumps: continuous ground under the arc (groundTrace true,
+                        // no gap) but too steep/tall to walk — jumping up a ledge or steep
+                        // slope face. Previously fell through BOTH tests and was never
+                        // recorded. Anything rising past the CC step offset (0.6m) that
+                        // isn't a walkable slope required a real jump — record it.
+                        bool steepUpJump = heightDiff > 0.6f;
+                        bool necessaryJump = hasGap || !groundTrace || steepUpJump;
                         if (necessaryJump)
                         {
                             var jumpEdge = NavGraph.Instance.AddSpecialEdge(track.JumpTakeoffPos, pos, EdgeType.Jump, isPlayer: true);
@@ -383,7 +393,11 @@ namespace StraftatBots
 
             // Feed the coverage heatmap every bot sample. Cheap — one dict lookup.
             // Powers GetLowestVisitReachableCell so Explore can push into under-visited areas.
-            if (grounded) NavGraph.Instance.TouchCoverage(pos);
+            if (grounded)
+            {
+                NavGraph.Instance.TouchCoverage(pos);
+                BotNavMesh.MarkWalked(pos); // stage-1 walked coverage
+            }
 
             if (!_tracks.TryGetValue(botId, out var track))
             {
@@ -482,7 +496,8 @@ namespace StraftatBots
                             { hasGap = true; break; }
                         }
 
-                        if (hasGap || !groundTrace)
+                        // heightDiff > 0.6f: steep up-jump — see the player-path comment.
+                        if (hasGap || !groundTrace || heightDiff > 0.6f)
                         {
                             var botJumpEdge = NavGraph.Instance.AddSpecialEdge(track.JumpTakeoffPos, pos, EdgeType.Jump, isPlayer: false);
                             NavGraph.Instance.AddPosition(pos, isPlayer: false);

@@ -304,7 +304,7 @@ namespace StraftatBots
             // Kill feed
             try
             {
-                WriteExplosiveKillFeed(rootObj, enemyHealth, ResolveExplosiveWeaponName(__instance));
+                WriteExplosiveKillFeed(rootObj, enemyHealth, ResolveExplosiveWeaponName(__instance, rootObj));
             }
             catch { }
 
@@ -528,7 +528,7 @@ namespace StraftatBots
             BotController killerBot = rootObj.GetComponent<BotController>();
             if (killerBot == null) return;
 
-            string weaponName = ResolveExplosiveWeaponName(projectile);
+            string weaponName = ResolveExplosiveWeaponName(projectile, rootObj);
             var handled = new System.Collections.Generic.HashSet<PlayerHealth>();
             foreach (var hit in hits)
             {
@@ -746,7 +746,7 @@ namespace StraftatBots
                     rootObj = ResolveProjectileRoot(__instance, _pgRootField, null);
                 if (__instance is Bubble && rootObj != null && rootObj.GetComponent<BotController>() != null)
                     radius = Mathf.Max(radius, 4.5f);
-                string resolvedWeaponName = ResolveExplosiveWeaponName(__instance);
+                string resolvedWeaponName = ResolveExplosiveWeaponName(__instance, rootObj);
                 bool isGlandGrenade = !string.IsNullOrWhiteSpace(resolvedWeaponName)
                     && resolvedWeaponName.IndexOf("gland", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isStunMine = IsStunMineInstance(__instance);
@@ -830,7 +830,7 @@ namespace StraftatBots
                         }
 
                         // Kill feed
-                        try { WriteExplosiveKillFeed(rootObj, triggerVictim, ResolveExplosiveWeaponName(__instance)); }
+                        try { WriteExplosiveKillFeed(rootObj, triggerVictim, ResolveExplosiveWeaponName(__instance, rootObj)); }
                         catch { }
                     }
                 }
@@ -900,7 +900,10 @@ namespace StraftatBots
 
                     // Kill feed for human victims killed by bot-thrown explosive.
                     // PhysicsGrenade.SendKillLog may be JIT-inlined, bypassing the Harmony prefix.
-                    // This postfix catches those misses. WriteExplosiveKillFeed deduplicates if both fire.
+                    // The old check required isKilled at postfix time, but the game's damage
+                    // on humans can land AFTER this postfix — those kills never got a line.
+                    // Now every human in the blast registers a short pending watch; the sweep
+                    // (BotManager.Update) writes the line when isKilled flips within 1s.
                     try
                     {
                         BotController expKillerBot = rootObj != null ? rootObj.GetComponent<BotController>() : null;
@@ -916,6 +919,8 @@ namespace StraftatBots
                                 humanHandled.Add(hph);
                                 if (hph.isKilled && hph.killer == rootObj.transform)
                                     WriteExplosiveKillFeed(rootObj, hph, expWeaponName);
+                                else if (!hph.isKilled)
+                                    RegisterPendingExplosiveFeed(hph, rootObj, expWeaponName);
                             }
                         }
                     }
@@ -927,9 +932,9 @@ namespace StraftatBots
 
         // Resolve a user-facing weapon name from an explosive MonoBehaviour
         // Used by both Explosion_Postfix (non-instant branch) and ObusExplosion_Postfix for kill feed
-        internal static string ResolveExplosiveWeaponName(MonoBehaviour instance)
+        internal static string ResolveExplosiveWeaponName(MonoBehaviour instance, GameObject rootObj = null)
         {
-            if (instance == null) return "explosive";
+            if (instance == null) return ResolveNameFromThrower(rootObj) ?? "Grenade";
             if (instance is Claymore) return "Claymore";
             if (instance is ProximityMine)
                 return IsApMineInstance(instance) ? "AP Mine" : "Proximity Mine";
@@ -938,9 +943,27 @@ namespace StraftatBots
             if (instance is HandGrenade || instance is HandGrenadeTwo || instance is PhysicsGrenade)
             {
                 string reflectedName = TryResolveWeaponNameFromInstance(instance);
-                return !string.IsNullOrWhiteSpace(reflectedName) ? reflectedName : "grenade";
+                // Projectile clones often lose their ItemBehaviour link mid-flight —
+                // fall back to what the throwing bot is HOLDING (it still has the
+                // launcher in hand), then to "Grenade". Never the old "explosive".
+                return !string.IsNullOrWhiteSpace(reflectedName) ? reflectedName
+                    : ResolveNameFromThrower(rootObj) ?? "Grenade";
             }
-            return TryResolveWeaponNameFromInstance(instance) ?? instance.GetType().Name;
+            return TryResolveWeaponNameFromInstance(instance)
+                ?? ResolveNameFromThrower(rootObj) ?? "Grenade";
+        }
+
+        // The projectile lost its weapon link — but the bot that threw it usually
+        // still holds the launcher, whose ItemBehaviour.weaponName is the real name.
+        private static string ResolveNameFromThrower(GameObject rootObj)
+        {
+            try
+            {
+                var bot = rootObj != null ? rootObj.GetComponent<BotController>() : null;
+                string held = bot != null ? bot.HeldWeaponDisplayName : null;
+                return string.IsNullOrWhiteSpace(held) ? null : CleanWeaponName(held);
+            }
+            catch { return null; }
         }
 
         private static string TryResolveWeaponNameFromInstance(MonoBehaviour instance)
@@ -1135,6 +1158,51 @@ namespace StraftatBots
             BotKillFeed.Write(victim, rootObj, null, weaponName, "killed", true);
         }
 
+        // ---- Deferred explosive kill-feed watch ----
+        // The game's damage to HUMAN victims can be applied after Explosion_Postfix
+        // runs (RPC ordering), so an isKilled check at postfix time misses kills.
+        private struct PendingExplosiveFeed
+        {
+            public PlayerHealth Victim;
+            public GameObject Root;
+            public string Weapon;
+            public float Deadline;
+        }
+        private static readonly System.Collections.Generic.List<PendingExplosiveFeed> _pendingExplosiveFeeds
+            = new System.Collections.Generic.List<PendingExplosiveFeed>();
+
+        private static void RegisterPendingExplosiveFeed(PlayerHealth victim, GameObject rootObj, string weaponName)
+        {
+            if (victim == null || _pendingExplosiveFeeds.Count > 32) return;
+            _pendingExplosiveFeeds.Add(new PendingExplosiveFeed
+            {
+                Victim = victim,
+                Root = rootObj,
+                Weapon = weaponName,
+                Deadline = Time.time + 1f
+            });
+        }
+
+        /// <summary>Called each frame from BotManager.Update (host only).</summary>
+        public static void ProcessPendingExplosiveFeeds()
+        {
+            for (int i = _pendingExplosiveFeeds.Count - 1; i >= 0; i--)
+            {
+                var p = _pendingExplosiveFeeds[i];
+                if (p.Victim == null || Time.time > p.Deadline)
+                {
+                    _pendingExplosiveFeeds.RemoveAt(i);
+                    continue;
+                }
+                if (!p.Victim.isKilled) continue;
+                // Accept killer==root or unset killer (the game sometimes never assigns
+                // it for bot-owned projectiles) — dedup prevents double lines either way.
+                if (p.Root == null || p.Victim.killer == null || p.Victim.killer == p.Root.transform)
+                    try { WriteExplosiveKillFeed(p.Root, p.Victim, p.Weapon); } catch { }
+                _pendingExplosiveFeeds.RemoveAt(i);
+            }
+        }
+
         // Obus (Serac) explosion — takes Vector3 position parameter.
         // The game's Obus.HandleExplosion already runs its OWN damage loop (ChangeKilledState +
         // RemoveHealth + Explode + SetKiller) when isOwner is true, which it is on the host for
@@ -1161,7 +1229,7 @@ namespace StraftatBots
                     rootObj = ResolveProjectileRoot(__instance, _obusRootField, _obusCharField);
 
                 Transform rootTf = rootObj != null ? rootObj.transform : null;
-                string weaponName = ResolveExplosiveWeaponName(__instance);
+                string weaponName = ResolveExplosiveWeaponName(__instance, rootObj);
 
                 Collider[] hits = Physics.OverlapSphere(position, radius, (1 << 11));
                 var seen = new System.Collections.Generic.HashSet<PlayerHealth>();
@@ -1466,7 +1534,7 @@ namespace StraftatBots
             {
                 try
                 {
-                    string weaponName = ResolveExplosiveWeaponName(__instance);
+                    string weaponName = ResolveExplosiveWeaponName(__instance, rootObj);
                     WriteExplosiveKillFeed(rootObj, enemyHealth, weaponName);
                 }
                 catch { }
@@ -1478,7 +1546,7 @@ namespace StraftatBots
             {
                 try
                 {
-                    string weaponName = ResolveExplosiveWeaponName(__instance);
+                    string weaponName = ResolveExplosiveWeaponName(__instance, rootObj);
                     WriteExplosiveKillFeed(rootObj, enemyHealth, weaponName);
                 }
                 catch { }

@@ -47,7 +47,8 @@ namespace StraftatBots
     {
         GraphRoute,
         DirectTacticalRoute,
-        ExploreBuildRoute
+        ExploreBuildRoute,
+        NavMeshRoute
     }
 
     public enum ProgressState
@@ -59,9 +60,15 @@ namespace StraftatBots
 
     public partial class BotController : MonoBehaviour
     {
-        // Const layer masks — avoid recomputation every frame
-        private const int WALL_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 8) | (1 << 9);
-        private const int GROUND_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 8) | (1 << 9) | (1 << 14);
+        // Const layer masks — avoid recomputation every frame.
+        // Game layer table (TagManager): 0 Default, 1 TransparentFX, 4 Water, 7 Interactable,
+        // 10 Ladder, 14 ShootThrough, 19 InteractEnvironment, 24 Glass, 27 InvisibleWall.
+        // Map geometry is spread across MANY of these — the old masks (0,1,2,4,8,9,14) missed
+        // Interactable/InteractEnvironment/Glass entirely and included held-weapon layers,
+        // leaving ledge/jump/ceiling raycasts blind on most maps ("complicated maps are bad").
+        private const int WORLD_MASK = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 7) | (1 << 14) | (1 << 19) | (1 << 24);
+        private const int WALL_MASK = WORLD_MASK | (1 << 27); // InvisibleWall blocks movement
+        private const int GROUND_MASK = WORLD_MASK;
         private const int EXPLOSIVE_MASK = (1 << 0) | (1 << 7) | (1 << 14);
 
         // Pre-allocated physics buffers — shared across all bots (Unity is single-threaded)
@@ -265,6 +272,16 @@ namespace StraftatBots
         private float _gravityCrouch = 40f;
         private float _maxFallSpeed = -40f;
 
+        // Ice surfaces — mirrors the game's SlopeSlide component (tags Footsteps/Ice,
+        // Footsteps/SuperIce). Bots drive their own CharacterController so SlopeSlide's
+        // output never reaches them; UpdateIceState() recreates it with the shipped
+        // PlayerIK.prefab tuning values.
+        private bool _onIce;
+        private bool _onSuperIce;             // Super ice also blocks jumping (FPC L1076)
+        private float _iceSlopeAngle;         // Ground slope under the bot, degrees
+        private Vector3 _iceSlideMove;        // Walk-on-ice downhill push (SlopeSlide.steepSlopeSlideMove)
+        private Vector3 _iceCrouchSlideMove;  // Crouch slide on ice slopes (SlopeSlide.slopeSlideMove)
+
         // Combat
         private float _detectionRange = 40f;
         private float _attackRange = 30f;
@@ -273,6 +290,51 @@ namespace StraftatBots
         private float _fireTimer;
         private float _turnSpeed = 6f;
         private float _aimInaccuracy = 2.5f;
+
+        // ---- Per-bot skill (1-10, from Plugin.BotSkills; 5 = roughly the old tuning) ----
+        public int Difficulty = 5;
+        public int SkillSlot = -1;                // stable config slot 0-7 (lobby position)
+        private int _appliedDifficulty = -1;
+        private float _skillRefreshTimer;
+        private float _skillReactionMin = 0.15f;  // reaction delay range on new target
+        private float _skillReactionMax = 0.4f;
+        private float _skillLockOnRate = 1.5f;    // how fast _aimSmoothing ramps to 1
+        private float _skillAimSlerp = 10f;       // aim rotation slerp speed
+        private float _skillBurstPauseMult = 1f;  // full-auto pause length multiplier
+        private float _skillDodgeChance = 0.02f;  // per-frame dodge roll when hurt
+        private float _skillDriftFloor = 0.35f;   // close-range floor on aim drift (low skill = wobbly even point-blank)
+        private float _skillSemiAutoFloor = 0.55f;// min seconds between semi-auto shots
+        private int _skillBurstMin = 3;           // full-auto shots before a pause
+        private int _skillBurstMax = 6;
+
+        // Piecewise map pinned at skill 5 ≈ the pre-skill-system constants, with the
+        // extremes pushed hard: 1 should feel like target practice, 10 like an aimbot.
+        private static float SkillLerp(int level, float easy, float mid, float hard)
+        {
+            if (level <= 5) return Mathf.Lerp(easy, mid, (level - 1) / 4f);
+            return Mathf.Lerp(mid, hard, (level - 5) / 5f);
+        }
+
+        private void ApplyDifficulty(int level)
+        {
+            level = Mathf.Clamp(level, 1, 10);
+            if (level == _appliedDifficulty) return;
+            _appliedDifficulty = level;
+            Difficulty = level;
+
+            _aimInaccuracy      = SkillLerp(level, 8.0f, 2.5f, 0.3f);
+            _skillDriftFloor    = SkillLerp(level, 0.65f, 0.35f, 0.08f);
+            _skillReactionMin   = SkillLerp(level, 0.55f, 0.15f, 0.04f);
+            _skillReactionMax   = SkillLerp(level, 1.10f, 0.40f, 0.10f);
+            _skillLockOnRate    = SkillLerp(level, 0.5f, 1.5f, 4.5f);
+            _skillAimSlerp      = SkillLerp(level, 4.5f, 10f, 22f);
+            _detectionRange     = SkillLerp(level, 22f, 40f, 60f);
+            _skillBurstPauseMult = SkillLerp(level, 2.2f, 1f, 0.35f);
+            _skillDodgeChance   = SkillLerp(level, 0.002f, 0.02f, 0.08f);
+            _skillSemiAutoFloor = SkillLerp(level, 0.85f, 0.55f, 0.30f);
+            _skillBurstMin      = Mathf.RoundToInt(SkillLerp(level, 2f, 3f, 5f));
+            _skillBurstMax      = Mathf.RoundToInt(SkillLerp(level, 4f, 6f, 9f));
+        }
 
         // Weapon state machine
         private bool _isBurstFiring;
@@ -346,6 +408,12 @@ namespace StraftatBots
         // Launch/force/gravity zones — mirrors player trigger-zone behavior.
         private Vector3 _zoneForce;              // Accumulated external force from zones
         private float _zoneForceDuration;         // Time remaining for zone force (suppresses stuck/steering)
+        // Continuous ForceZone contribution THIS frame (velocity, rebuilt every frame).
+        // Mirrors the player: FPC's moveDirection.xz is rebuilt from input each frame, so
+        // ForceZone's `moveDirection += force*dt` is a per-frame velocity offset for them,
+        // NOT an accumulating impulse. Bots add it on top of normal movement in DoMove.
+        private Vector3 _zoneFrameForce;
+        private bool _zoneVerticalActive;         // A zone pushed us up this frame (skip vertical cap)
         private bool _zoneLaunchInAir;            // True once an impulse launched us — cleared on landing
         private float _gravityZoneMultiplier = 1f;
         private readonly System.Collections.Generic.HashSet<ImpulseZone> _activeImpulseZones
@@ -482,7 +550,7 @@ namespace StraftatBots
             {
                 _cc.stepOffset = 0.6f;  // Higher step — handles uneven terrain better
                 _cc.slopeLimit = 65f;   // Match FPC: slides at 65°+, walks up anything under
-                _cc.skinWidth = 0.08f;  // Slightly thicker skin for smoother collisions
+                _cc.skinWidth = SKIN_STANDING;  // game CC default (0.2); model offset matches in ApplyStance
             }
             _playerHealth = GetComponent<PlayerHealth>();
 
@@ -569,6 +637,39 @@ namespace StraftatBots
         // _jumpAlignTimer removed — alignment pause replaced with speed-matching approach
         private bool _inJumpChain;           // True during consecutive jump edge execution
         private int _chainJumpCount;         // Number of jumps completed in current chain
+        private float _jumpBackoffTimer;     // >0: backing off from a lip to build a run-up
+        private float _jumpBackoffCooldownUntil; // one run-up attempt per few seconds, never ping-pong
+        private Vector3 _smoothedMoveDir;    // low-pass on the commanded move direction (anti-jitter)
+
+        // In-stride reroute tracker: moving but not closing on the objective
+        private Vector3 _softObjLastPos;
+        private float _softObjBest = float.MaxValue;
+        private float _softObjStagnantSince;
+
+        // Hunt: cooldown between attempts to claim a vantage node above the target
+        private float _nextHighGroundBidTime;
+
+        // Top of the ladder collider currently being climbed (tapers the face-pull)
+        private float _ladderTopY = -1f;
+
+        /// <summary>Display name of the held weapon (kill-feed fallback when a thrown
+        /// projectile has lost its ItemBehaviour link — the launcher is still in hand).</summary>
+        public string HeldWeaponDisplayName
+        {
+            get
+            {
+                try
+                {
+                    var ib = _heldWeaponObj != null ? _heldWeaponObj.GetComponent<ItemBehaviour>() : null;
+                    if (ib != null && !string.IsNullOrWhiteSpace(ib.weaponName))
+                        return ib.weaponName.Replace("(Clone)", "").Trim();
+                    if (_heldWeaponObj != null)
+                        return _heldWeaponObj.name.Replace("(Clone)", "").Trim();
+                }
+                catch { }
+                return null;
+            }
+        }
 
         private void OnControllerColliderHit(ControllerColliderHit hit)
         {
@@ -750,11 +851,31 @@ namespace StraftatBots
             HandleTriggerZoneExit(col);
         }
 
+        // Mirrors FirstPersonController.dmgZoneTimer — next time a DamageZone may tick us.
+        private float _nextDmgZoneTickTime;
+
         private void TryEnvironmentKill(Collider col)
         {
             bool isKillZone = col.CompareTag("Killz");
             bool isDamageZone = col.CompareTag("DamageZone");
             if (!isKillZone && !isDamageZone) return;
+
+            if (isDamageZone)
+            {
+                // Mirror FirstPersonController.OnTriggerStay: a DamageZone is damage
+                // over time (shipped prefab: 0.4 HP per 0.1s tick vs 10 max health,
+                // ~2.5s to die), NOT an instant kill. Instant-killing on any touch was
+                // the "bots randomly die on ice" bug — icy maps carry damage volumes
+                // that players survive by crossing quickly.
+                var zone = col.GetComponentInParent<DamageZone>();
+                float amount = zone != null ? zone.damageAmount : 0.4f;
+                float interval = zone != null ? zone.damageInterval : 0.1f;
+                if (Time.time < _nextDmgZoneTickTime) return;
+                _nextDmgZoneTickTime = Time.time + Mathf.Max(0.05f, interval);
+                bool lethalTick = _playerHealth.health - amount <= 0f;
+                try { _playerHealth.RemoveHealth(amount); } catch { }
+                if (!lethalTick) return; // hurt, keep moving — death only on the lethal tick
+            }
 
             // Use game's RPCs so all clients see the death (same as real player)
             try { _playerHealth.RemoveHealth(_playerHealth.health + 10f); } catch { }
@@ -764,7 +885,9 @@ namespace StraftatBots
             DisableBotPhysics(gameObject);
             try { _playerHealth.DisablePlayerObjectWhenKilled(); } catch { }
             Die(null);
-            try { if (PauseManager.Instance != null) PauseManager.Instance.WriteLog($"<b><color=orange>{BotName}</color></b> died to the environment"); } catch { }
+            // Match the game's own wording for these deaths.
+            string envLine = isKillZone ? "fell into the void" : "commited suicide";
+            try { if (PauseManager.Instance != null) PauseManager.Instance.WriteLog($"<b><color=orange>{BotName}</color></b> {envLine}"); } catch { }
         }
 
         private void TryTeleport(Collider col)
@@ -869,6 +992,15 @@ namespace StraftatBots
             _movedThisFrame = false;
             if (IsDead) return;
 
+            // Per-bot skill — re-read from config on a slow cadence so mod-menu
+            // changes apply live to bots already in the match.
+            _skillRefreshTimer -= Time.deltaTime;
+            if (_skillRefreshTimer <= 0f)
+            {
+                _skillRefreshTimer = 2f;
+                ApplyDifficulty(Plugin.GetBotSkill(SkillSlot >= 0 ? SkillSlot : BotId));
+            }
+
             // Death detection
             if (_playerHealth != null && (_playerHealth.isKilled || _playerHealth.health <= 0f))
             {
@@ -879,6 +1011,9 @@ namespace StraftatBots
             // Void death — same flow as real player (FPC checks y < -300, we check -50 since maps vary)
             if (transform.position.y < -50f)
             {
+                // Feed the fall-death heatmap: the mistake happened at the last solid
+                // ground, not down in the void — path scoring avoids that lip now.
+                try { NavGraph.Instance?.ReportFallDeath(_lastGroundedPos); } catch { }
                 if (_playerHealth != null)
                 {
                     // Use the game's RPCs so all clients see the death properly
@@ -931,6 +1066,7 @@ namespace StraftatBots
             }
 
             HandleLadder();
+            UpdateIceState();
             ApplyGravity();
             ScanTriggerZones();        // Fallback when zone trigger callbacks miss CharacterController bots.
             ApplyActiveForceZones();   // Continuous ForceZone force (mirrors game's own ForceZone.Update)
@@ -947,6 +1083,7 @@ namespace StraftatBots
             }
             HandlePropeller();
             HandleWallJump();
+            HandleVaultMantle();
             UpdateOverheadSlide();
             UpdateSlide();
             UpdateAnimator();
@@ -1014,9 +1151,10 @@ namespace StraftatBots
             }
 
             // Apply gravity for frames where no movement method ran its own cc.Move
-            // This prevents floating in non-moving states without double-applying gravity
+            // This prevents floating in non-moving states without double-applying gravity.
+            // Routed through DoMove so the ice slide still pushes a stationary bot.
             if (!_movedThisFrame && _cc != null && _cc.enabled)
-                _cc.Move(new Vector3(0, _verticalVelocity * Time.deltaTime, 0));
+                DoMove(new Vector3(0, _verticalVelocity * Time.deltaTime, 0));
 
             CheckStuck();
 
@@ -1030,7 +1168,7 @@ namespace StraftatBots
                 bool grounded = _cc.isGrounded;
 
                 // Detect unintentional falls while following a path — upgrade edge to Jump
-                if (_wasGroundedLastFrame && !grounded && !_justJumped && !_onLadder
+                if (_wasGroundedLastFrame && !grounded && !_justJumped && !_onLadder && !_onIce
                     && _intentionalJumpTimer <= 0f && _lastReachedNode != null
                     && NavGraph.Instance != null && _graphPath.Count > 0 && _graphPathIndex < _graphPath.Count)
                 {
@@ -1180,21 +1318,20 @@ namespace StraftatBots
                 vertical = pitch / 90f; // Positive = looking up, negative = looking down
             }
 
-            // Auto-crouch under low ceilings: if the bot can't fit standing but could crouched,
-            // crouch-walk instead of jamming its head into the roof and getting stuck (especially
-            // after sliding under something). Uses the SAME clearance ray as the un-crouch check
-            // below (up to full stand height) so it can't flip-flop: crouch when blocked, stand
-            // again only when there's clearance to full height.
-            if (grounded && !_isSliding && !_isCrouching && _cc != null)
+            // Auto-crouch under low ceilings. Two triggers:
+            //  1. Overhead: SphereCast up (capsule-width, not a thin center ray — a thin ray
+            //     misses partial overhangs and lets the bot stand into a jam).
+            //  2. Look-ahead: a head-height bar within 1.1m of travel that is clear at crouch
+            //     height — duck BEFORE hitting the doorway instead of jamming into the lintel.
+            // Ceiling crouches stand back up the moment clearance exists (no timer), and are
+            // tracked separately from combat's timed tactical crouch.
+            if (grounded && !_isSliding && _cc != null)
             {
-                bool standBlockedNow = Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.up, 1.5f,
-                    WALL_MASK, QueryTriggerInteraction.Ignore);
-                if (standBlockedNow)
+                if (!_isCrouching && (OverheadBlocked() || LowCeilingAhead()))
                 {
                     _isCrouching = true;
-                    _crouchTimer = Mathf.Max(_crouchTimer, 0.4f);
-                    _cc.height = 1f;
-                    _cc.center = new Vector3(0, 0.5f, 0);
+                    _ceilingCrouch = true;
+                    ApplyStance(CROUCH_HEIGHT, SKIN_CROUCHED);
                     if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", true);
                     if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", true);
                 }
@@ -1211,23 +1348,19 @@ namespace StraftatBots
             }
             else if (_isCrouching)
             {
-                // Force uncrouch: not sliding, crouch timer expired or CC height wrong
-                if (_crouchTimer <= 0f || (_cc != null && _cc.height < 1.5f && _stuckTimer > 1f))
+                // Ceiling crouch: stand the moment there is room (checked every frame).
+                // Tactical crouch: stand when its timer runs out (old behavior).
+                bool wantsStand = _ceilingCrouch
+                    || _crouchTimer <= 0f
+                    || (_cc != null && _cc.height < 1.5f && _stuckTimer > 1f);
+                if (wantsStand && !OverheadBlocked() && !LowCeilingAhead(0.7f))
                 {
-                    bool standBlocked = Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.up, 1.5f,
-                        WALL_MASK, QueryTriggerInteraction.Ignore);
-                    if (!standBlocked)
-                    {
-                        _isCrouching = false;
-                        _crouchTimer = 0f;
-                        if (_cc != null) { _cc.height = STAND_HEIGHT; _cc.center = new Vector3(0, STAND_CENTER_Y, 0); }
-                        if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
-                        if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
-                    }
-                    else
-                    {
-                        _crouchTimer = 0.2f;
-                    }
+                    _isCrouching = false;
+                    _ceilingCrouch = false;
+                    _crouchTimer = 0f;
+                    ApplyStance(STAND_HEIGHT, SKIN_STANDING);
+                    if (_bodyAnimator != null) TrySet(_bodyAnimator, "Crouch", false);
+                    if (_globalAnimator != null) TrySet(_globalAnimator, "Crouch", false);
                 }
             }
 
@@ -1403,12 +1536,15 @@ namespace StraftatBots
 
             // Don't disable component — coroutines need it active. IsDead blocks all AI logic.
             // Delayed graphics hide — lets ExplodeServer read bone positions for ragdoll
-            StartCoroutine(HideGraphicsDelayed());
+            _hideGraphicsCo = StartCoroutine(HideGraphicsDelayed());
 
             // Training mode: auto-respawn after short delay to keep exploring
             if (NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training)
             {
                 StartCoroutine(TrainingRespawnDelayed());
+                // Diagnostic: name every renderer near the death spot shortly after death.
+                // If a white box ever appears again, the log will say EXACTLY what it is.
+                StartCoroutine(DumpDeathSceneRenderers(transform.position));
             }
 
             // Despawn weapon (destroy it, don't drop for others)
@@ -1435,6 +1571,23 @@ namespace StraftatBots
                 Object.Destroy(_botCam.gameObject);
                 _botCam = null;
             }
+
+            // Strip any cosmetic that slipped past the ChangeDress postfix (RPC can run
+            // before BotController is attached). The game's death code DETACHES the hat
+            // into the world with a rigidbody — on bots it renders as a giant white
+            // untextured slab frozen at the death spot. Never let it throw one.
+            try
+            {
+                var deathSetup = GetComponent<PlayerSetup>();
+                if (deathSetup != null && deathSetup.hat != null)
+                {
+                    Object.Destroy(deathSetup.hat);
+                    deathSetup.hat = null;
+                }
+                foreach (var hp in GetComponentsInChildren<HatPosition>(true))
+                    if (hp != null) Object.Destroy(hp.gameObject);
+            }
+            catch { }
 
             // Always try ragdoll — game's Explode() may have NRE'd on bot data
             if (_playerHealth != null)
@@ -1611,8 +1764,7 @@ namespace StraftatBots
             if (_cc != null)
             {
                 _cc.enabled = true;
-                _cc.height = STAND_HEIGHT;
-                _cc.center = new Vector3(0, STAND_CENTER_Y, 0);
+                ApplyStance(STAND_HEIGHT, SKIN_STANDING);
             }
 
             // Re-enable all child colliders (disabled by DisableBotPhysics)
@@ -1644,13 +1796,68 @@ namespace StraftatBots
                     _playerHealth.graphics.SetActive(true);
             }
 
+            // Cancel a still-pending death graphics hide so it can't blank the fresh body
+            if (_hideGraphicsCo != null)
+            {
+                StopCoroutine(_hideGraphicsCo);
+                _hideGraphicsCo = null;
+            }
+
             SetVisible(true);
+
+            // Death disabled all animators (HideGraphicsDelayed). Without re-enabling them the
+            // respawned bot renders frozen in bind pose — arms straight out, the "big white
+            // cross". Rebind + Update(0) snaps the skeleton back to a valid animated pose.
+            foreach (var anim in GetComponentsInChildren<Animator>(true))
+            {
+                anim.enabled = true;
+                try { anim.Rebind(); anim.Update(0f); } catch { }
+            }
+            foreach (var netAnim in GetComponentsInChildren<FishNet.Component.Animating.NetworkAnimator>(true))
+                netAnim.enabled = true;
+
+            // The game's PlayerHealth only ever spawns one ragdoll per life (private
+            // spawnedRagdoll latch) — reset it so this bot's NEXT death ragdolls too.
+            if (_playerHealth != null)
+            {
+                try
+                {
+                    var srField = typeof(PlayerHealth).GetField("spawnedRagdoll",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    srField?.SetValue(_playerHealth, false);
+                }
+                catch { }
+            }
 
             if (GameManager.Instance != null)
                 GameManager.Instance.alivePlayers.Add(PlayerId);
 
             if (reapplyCosmetics)
                 BotManager.Instance?.ReapplyCosmeticsForBot(this);
+
+            // The game's stun effect writes a "Float2" toggle into body materials and
+            // enables a stun VFX object; bots never run the restore path, so a bot that
+            // died stunned respawns with the glitched stun shader baked in. Clear both.
+            try
+            {
+                foreach (var smr in GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    var mats = smr.materials;
+                    bool changed = false;
+                    foreach (var m in mats)
+                        if (m != null && m.HasProperty("Float2")) { m.SetFloat("Float2", 0f); changed = true; }
+                    if (changed) smr.materials = mats;
+                }
+                var setup = GetComponent<PlayerSetup>();
+                if (setup != null)
+                {
+                    var vfxField = typeof(PlayerSetup).GetField("stunVFX",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var vfx = vfxField?.GetValue(setup) as GameObject;
+                    if (vfx != null) vfx.SetActive(false);
+                }
+            }
+            catch { }
 
             Plugin.Log.LogInfo($"[{BotName}] Respawned at {position}");
         }
@@ -1702,6 +1909,34 @@ namespace StraftatBots
             return pos + Vector3.up * 2f; // Last resort: push up
         }
 
+        private System.Collections.IEnumerator DumpDeathSceneRenderers(Vector3 deathPos)
+        {
+            yield return new WaitForSeconds(1.5f);
+            try
+            {
+                int logged = 0;
+                foreach (var r in Object.FindObjectsOfType<Renderer>())
+                {
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    var b = r.bounds;
+                    if ((b.center - deathPos).sqrMagnitude > 36f) continue; // 6m radius
+                    if (b.size.magnitude > 30f) continue;                    // skip giant static world meshes
+                    if (r.transform.root == transform.root) continue;        // the (hidden) bot itself
+                    string mat = "none";
+                    var sm = r.sharedMaterial;
+                    if (sm != null) mat = $"{sm.name}|{(sm.shader != null ? sm.shader.name : "noshader")}";
+                    string path = r.gameObject.name;
+                    var t = r.transform;
+                    while (t.parent != null) { t = t.parent; path = t.name + "/" + path; }
+                    Plugin.Log.LogInfo($"[DeathScene] {BotName}: '{path}' layer={r.gameObject.layer} tag={r.tag} mat={mat} size={b.size:F1} pos={b.center:F1}");
+                    if (++logged >= 25) break;
+                }
+                if (logged == 0)
+                    Plugin.Log.LogInfo($"[DeathScene] {BotName}: no dynamic renderers within 6m of death spot");
+            }
+            catch (System.Exception e) { Plugin.Log.LogWarning($"[DeathScene] dump failed: {e.Message}"); }
+        }
+
         private IEnumerator TrainingRespawnDelayed()
         {
             yield return new WaitForSeconds(2f);
@@ -1726,8 +1961,21 @@ namespace StraftatBots
                 }
             }
 
-            Respawn(best.transform.position + Vector3.up * 1.5f);
-            Plugin.Log.LogInfo($"[{BotName}] Training auto-respawn at {best.transform.position}");
+            Vector3 spawnPos = best.transform.position + Vector3.up * 1.5f;
+
+            // Fresh object replacement — same as the round-start / "Spawn Bots Now" paths,
+            // which are the ones known to respawn bots cleanly. Resurrecting this dead
+            // object in place kept leaking death state (white slabs). NOTE: this destroys
+            // the current GameObject, so nothing may run after the call.
+            if (BotManager.Instance != null)
+            {
+                BotManager.Instance.RespawnBotFresh(this, spawnPos);
+                yield break;
+            }
+
+            // Fallback if the manager is somehow gone: old in-place respawn
+            Respawn(spawnPos);
+            Plugin.Log.LogInfo($"[{BotName}] Training auto-respawn (in-place fallback) at {best.transform.position}");
         }
 
         // >>> DropWeapon/DestroyHeldWeapon moved to BotController.Weapons.cs
@@ -1969,6 +2217,7 @@ namespace StraftatBots
         /// <summary>
         /// Hide the bot model after a delay so ExplodeServer has time to read bone positions for ragdoll.
         /// </summary>
+        private Coroutine _hideGraphicsCo;
         private System.Collections.IEnumerator HideGraphicsDelayed()
         {
             yield return null; // Wait 1 frame
@@ -1988,6 +2237,33 @@ namespace StraftatBots
                 r.enabled = false;
             foreach (var r in GetComponentsInChildren<MeshRenderer>(true))
                 r.enabled = false;
+        }
+
+        // True while the current crouch is forced by geometry (vs combat's tactical crouch)
+        private bool _ceilingCrouch;
+
+        /// <summary>Capsule-width overhead clearance test — blocked means standing here jams.</summary>
+        private bool OverheadBlocked()
+        {
+            return Physics.SphereCast(transform.position + Vector3.up * 0.55f, 0.33f, Vector3.up,
+                out _, 1.35f, WALL_MASK, QueryTriggerInteraction.Ignore);
+        }
+
+        /// <summary>A head-height bar within travel distance that is passable crouched.</summary>
+        private bool LowCeilingAhead(float dist = 1.1f)
+        {
+            Vector3 dir = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) return false;
+            dir.Normalize();
+            Vector3 feet = transform.position;
+            // Band roughly 1.25–1.85m up: catches doorway lintels/pipes at bot head height
+            if (!Physics.SphereCast(feet + Vector3.up * 1.55f, 0.3f, dir, out _, dist,
+                    WALL_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            // Only duck if the crouch-height band (0.3–0.9m) is actually clear to pass
+            return !Physics.SphereCast(feet + Vector3.up * 0.6f, 0.3f, dir, out _, dist + 0.3f,
+                WALL_MASK, QueryTriggerInteraction.Ignore);
         }
 
         private void SetVisible(bool visible)
@@ -2054,7 +2330,10 @@ namespace StraftatBots
         {
             // Bias toward repeated repath attempts before hard stuck breakout.
             if (Plugin.IsFastRecovery) return (0.5f, 0.95f, 2.3f, 4.5f);
-            if (Plugin.IsMediumRecovery) return (0.7f, 1.3f, 3.0f, 5.2f);
+            // Medium tightened (was 0.7/1.3/3.0/5.2): a bot visibly parked for over a
+            // second reads as broken — nudge fast, repath fast, still leave room between
+            // the later stages so recoveries don't thrash.
+            if (Plugin.IsMediumRecovery) return (0.55f, 1.0f, 2.4f, 4.4f);
             return (0.9f, 1.8f, 3.8f, 6.2f);
         }
 
@@ -2075,8 +2354,59 @@ namespace StraftatBots
             return nodeDist < 2f && objectiveDist > 4f;
         }
 
+        // Pacing detector: samples position every 0.5s over a 6s window. Lots of ground
+        // covered with almost no net displacement = bouncing/pacing, regardless of which
+        // system is steering or how slowly it flips. This is what the player actually sees.
+        private readonly Vector3[] _oscSamples = new Vector3[12];
+        private int _oscIdx;
+        private int _oscCount;
+        private float _oscSampleTimer;
+
+        private void UpdatePacingDetector()
+        {
+            if (IsDead || _frozen || _onLadder) return;
+            // Combat strafing legitimately covers ground without displacement.
+            if (State == BotState.Hunt || _playerTarget != null) return;
+
+            _oscSampleTimer -= Time.deltaTime;
+            if (_oscSampleTimer > 0f) return;
+            _oscSampleTimer = 0.5f;
+
+            _oscSamples[_oscIdx] = transform.position;
+            _oscIdx = (_oscIdx + 1) % _oscSamples.Length;
+            if (_oscCount < _oscSamples.Length) { _oscCount++; return; }
+
+            float walked = 0f;
+            for (int k = 0; k + 1 < _oscSamples.Length; k++)
+            {
+                Vector3 a = _oscSamples[(_oscIdx + k) % _oscSamples.Length];
+                Vector3 b = _oscSamples[(_oscIdx + k + 1) % _oscSamples.Length];
+                walked += Vector3.Distance(a, b);
+            }
+            Vector3 oldest = _oscSamples[_oscIdx % _oscSamples.Length];
+            float net = Vector3.Distance(oldest, transform.position);
+
+            if (walked > 14f && net < 3f)
+            {
+                Plugin.Log.LogInfo($"[{BotName}] Pacing detected (walked {walked:F0}m, net {net:F1}m) — dropping objective and route");
+                _oscCount = 0;
+                _hasWanderTarget = false;
+                _wanderChangeTimer = 0f;
+                _exploreState = ExploreState.None;
+                _graphPath.Clear();
+                _graphPathIndex = 0;
+                _repathTimer = 0f;
+                _lastAcceptedPathScore = float.MinValue;
+                _routeCommitUntil = 0f;
+                _weaponPursuitTimer = 0f;
+                if (_targetItem != null) _blacklistedWeapons[_targetItem] = Time.time;
+                _weaponTarget = null;
+            }
+        }
+
         private void UpdateProgressController(float movedSqr)
         {
+            UpdatePacingDetector();
             Vector3 objective = GetCurrentObjective();
             float objectiveDist = HorizontalDist(transform.position, objective);
             bool objectiveValid = objectiveDist > 0.5f;
@@ -2280,7 +2610,14 @@ namespace StraftatBots
         private void CheckStuck()
         {
             if (State == BotState.Dead) return;
-            if (_onLadder || _ladderDismountTimer > 0f) return;
+            if (_onLadder || _ladderDismountTimer > 0f)
+            {
+                // Climbing IS progress: bleed the timer so the red-X stuck indicator
+                // (and any pending escalation) doesn't fire mid-climb.
+                _stuckTimer = Mathf.Max(0f, _stuckTimer - Time.deltaTime);
+                _progressTimer = 0f;
+                return;
+            }
             if (_zoneForceDuration > 0f) return;
 
             _stuckCheckTimer -= Time.deltaTime;
@@ -2307,7 +2644,11 @@ namespace StraftatBots
                     _didStuckNudge = true;
                     _recoveryStageA++;
                     var obs = CheckObstructions(moveDir);
-                    if (obs.CrouchClear && (obs.FeetBlocked || obs.HeadBlocked) && !_isSliding)
+                    // Crouch FIRST when the blocker is at face height with a passable
+                    // gap below — the cheapest correct move, and it keeps steering.
+                    if (obs.CrouchClear && obs.HeadBlocked && !obs.WaistBlocked && !_isSliding && !_isCrouching)
+                        StartCrouch(1.2f);
+                    else if (obs.CrouchClear && (obs.FeetBlocked || obs.HeadBlocked) && !_isSliding)
                         InitSlide(moveDir, duration: 1.0f);
                     else
                         TryJump(JumpReason.StuckRecovery, moveDir);
@@ -2389,6 +2730,38 @@ namespace StraftatBots
             }
             else
             {
+                // MOVING but not closing on a static objective (circling a waypoint,
+                // sliding along a wall): swap to a fresh route in stride — no stop, no
+                // breakout, and long before the 6s pacing detector has to fire.
+                if (tryingToMove && _playerTarget == null)
+                {
+                    Vector3 softObj = GetCurrentObjective();
+                    float softObjDist = HorizontalDist(transform.position, softObj);
+                    if (HorizontalDist(softObj, _softObjLastPos) > 2f || softObjDist < _softObjBest - 0.35f)
+                    {
+                        _softObjLastPos = softObj;
+                        _softObjBest = softObjDist;
+                        _softObjStagnantSince = Time.time;
+                    }
+                    else if (softObjDist > 1.5f && Time.time - _softObjStagnantSince > 3.5f
+                        && Time.time >= _nextRepathAllowedAt && TryConsumeGlobalRepathBudget())
+                    {
+                        _softObjStagnantSince = Time.time;
+                        _nextRepathAllowedAt = Time.time + 0.7f;
+                        Vector3 headingDir = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+                        if (TryBuildRecoveryPath(softObj, headingDir, out var softPath))
+                        {
+                            _graphPath = softPath;
+                            _graphPathIndex = 0;
+                            _lastReachedNode = null;
+                            _prevReachedNode = null;
+                            _repathTimer = 0f;
+                            SwitchPathSource(PathSource.GraphRoute);
+                            Plugin.Log.LogInfo($"[{BotName}] No headway -> in-stride reroute ({softPath.Count} nodes)");
+                        }
+                    }
+                }
+
                 // Making progress (or not trying to move) — decay timer, clear flags once safely below threshold
                 _stuckTimer = Mathf.Max(0f, _stuckTimer - _stuckCheckInterval);
                 if (_stuckTimer < 0.1f)
@@ -2820,6 +3193,8 @@ namespace StraftatBots
         /// </summary>
         private void ApplyActiveForceZones()
         {
+            _zoneFrameForce = Vector3.zero;
+            _zoneVerticalActive = false;
             if (IsDead) return;
             // Prune destroyed zones
             for (int i = _activeForceZones.Count - 1; i >= 0; i--)
@@ -2828,24 +3203,31 @@ namespace StraftatBots
             }
             if (_activeForceZones.Count == 0) return;
 
+            // Match the player EXACTLY: ForceZone adds force*dt to moveDirection each
+            // frame while the player keeps full control. The old code fed this into
+            // _zoneForce/_zoneForceDuration, which hijacked ALL bot movement while
+            // inside — in an updraft "bounce" zone the bot just yo-yoed in place with
+            // no self-steering, and in horizontal push zones it drifted helplessly.
+            // Now: horizontal is a per-frame additive on top of normal navigation
+            // (consumed in DoMove), vertical accumulates into _verticalVelocity like
+            // the FPC's moveDirection.y.
             float dt = Mathf.Clamp(Time.deltaTime, 0f, 0.2f);
             for (int i = 0; i < _activeForceZones.Count; i++)
             {
                 var fz = _activeForceZones[i];
-                Vector3 force = fz.force;
-                Vector3 frameForce = force * dt;
-                _zoneForce += new Vector3(frameForce.x, 0f, frameForce.z);
+                Vector3 frameForce = fz.force * dt;
+                _zoneFrameForce += new Vector3(frameForce.x, 0f, frameForce.z);
                 if (Mathf.Abs(frameForce.y) > 0.0001f)
                 {
                     _verticalVelocity += frameForce.y;
                     if (frameForce.y > 0f)
                     {
+                        _zoneVerticalActive = true;
+                        // Suppress reactive jump/steer spam while an updraft carries us.
                         _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, 0.5f);
-                        _zoneLaunchInAir = true;
                     }
                 }
             }
-            _zoneForceDuration = Mathf.Max(_zoneForceDuration, 0.25f);
             _stuckTimer = 0f;
             _didStuckNudge = false;
             _didStuckRepath = false;

@@ -23,7 +23,6 @@ namespace StraftatBots
         private static GUIStyle _activeButtonStyle;
         private static GUIStyle _sectionStyle;
         private static GUIStyle _miniButtonStyle;
-        private static GUIStyle _toggleStyle;
         private static Texture2D _darkTex;
         private static Texture2D _accentTex;
         private static Texture2D _activeTex;
@@ -78,19 +77,41 @@ namespace StraftatBots
             _sectionStyle.fontStyle = FontStyle.Bold;
             _sectionStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
 
-            _toggleStyle = new GUIStyle(GUI.skin.toggle);
-            _toggleStyle.fontSize = 12;
-            _toggleStyle.normal.textColor = Color.white;
-            _toggleStyle.onNormal.textColor = Color.white;
-
             _stylesInit = true;
         }
+
+        // Untrained-map popup state (Play mode, per map)
+        private static string _lastSeenMap;
+        private static bool _untrainedWarnDismissed;
+
+        // Stage-1 coverage stall tracking
+        private static int _lastProgressStat = -1;
+        private static float _lastProgressTime;
+        private static bool _coverageStallWarning;
 
         public static void DrawAll()
         {
             InitStyles();
             var liveCert = NavGraph.Instance != null ? NavGraph.Instance.GetCertificationReport() : null;
-            DrawWorldTrainingMarker(liveCert);
+
+            DrawUntrainedMapPopup(liveCert);
+
+            // Stage 2 world markers: every weapon that still has no route gets a label.
+            bool inTraining = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
+            if (inTraining && liveCert != null && liveCert.StageNumber == 2
+                && liveCert.UnconnectedWeaponPositions != null)
+            {
+                Camera cam = Camera.main;
+                if (cam != null)
+                {
+                    int shown = 0;
+                    foreach (var pos in liveCert.UnconnectedWeaponPositions)
+                    {
+                        DrawWorldLabel(cam, pos, "REACH THIS WEAPON", _dangerTex);
+                        if (++shown >= 8) break;
+                    }
+                }
+            }
 
             float x = _panelPos.x;
             float y = _panelPos.y;
@@ -117,7 +138,7 @@ namespace StraftatBots
 
             // Expanded panel
             float panelW = 280f;
-            float panelH = 560f;
+            float panelH = 400f;
             Rect panel = new Rect(x, y, panelW, panelH);
             GUI.Box(panel, "", _boxStyle);
 
@@ -165,50 +186,12 @@ namespace StraftatBots
             // ---- Freecam (top row — quick access while watching bots train) ----
             bool freecam = FreeCam.Active;
             GUIStyle fcStyle = freecam ? _activeButtonStyle : _buttonStyle;
-            string fcLabel = freecam ? "Freecam: ON (click to return)" : "Freecam: OFF (detach & fly)";
+            string fcLabel = freecam ? "Freecam: ON (click to drop in here)" : "Freecam: OFF (detach & fly)";
             if (GUI.Button(new Rect(cx, cy, cw, 24), fcLabel, fcStyle))
                 FreeCam.Toggle();
             cy += 28f;
 
-            // ---- Training control ----
-            // The STAGE panel below (STATUS) is the single source of truth: its button drives
-            // Explore / Validate / Play and tells you WHEN to progress. The old free-floating
-            // None/Explore/Validate buttons here fought that, so they're gone. The one manual
-            // choice that does NOT conflict is pausing the bots so you can walk the map yourself.
-            GUI.Label(new Rect(cx, cy, cw, 18), "TRAINING", _sectionStyle);
-            cy += 20f;
-
-            string curBehavior = Plugin.TrainingBehavior?.Value ?? "Explore";
-            bool botsPaused = curBehavior == "None";
-            string doing = botsPaused ? "PAUSED — you train, bots wait"
-                : curBehavior == "Validate" ? "Bots: validating routes"
-                : "Bots: exploring / building mesh";
-            var doingStyle = new GUIStyle(_labelStyle);
-            doingStyle.normal.textColor = botsPaused ? new Color(1f, 0.78f, 0.25f) : new Color(0.45f, 1f, 0.55f);
-            GUI.Label(new Rect(cx, cy, cw, 18), doing, doingStyle);
-            cy += 20f;
-
-            string pauseLabel = botsPaused ? "Resume bot training" : "Pause bots (I'll walk it myself)";
-            if (GUI.Button(new Rect(cx, cy, cw, 24), pauseLabel, botsPaused ? _activeButtonStyle : _buttonStyle))
-            {
-                if (Plugin.TrainingBehavior != null)
-                {
-                    if (botsPaused)
-                    {
-                        string rec = liveCert?.RecommendedBehavior;
-                        Plugin.TrainingBehavior.Value = (string.IsNullOrWhiteSpace(rec) || rec == "None") ? "Explore" : rec;
-                    }
-                    else Plugin.TrainingBehavior.Value = "None";
-                }
-            }
-            cy += 32f;
-
-            // ---- Bots ----
-            GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
-            cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "BOT COUNT", _sectionStyle);
-            cy += 20f;
-
+            // ---- Bot count ----
             GUI.Label(new Rect(cx, cy, 80, 18), "Bot Count:", _labelStyle);
             int botCount = Plugin.MaxBots?.Value ?? 3;
             GUI.Label(new Rect(cx + cw - 25, cy, 25, 18), botCount.ToString(), _labelStyle);
@@ -218,100 +201,25 @@ namespace StraftatBots
                 Plugin.MaxBots.Value = Mathf.RoundToInt(newBotCount);
             cy += 22f;
 
-            if (GUI.Button(new Rect(cx, cy, cw, 24), "Respawn All Bots", _buttonStyle))
-            {
-                if (BotManager.Instance != null)
-                {
-                    BotManager.Instance.DespawnAllBots();
-                    BotManager.Instance.LobbyBots.Clear();
-                    int count = Plugin.MaxBots?.Value ?? 3;
-                    for (int bi = 0; bi < count; bi++)
-                        BotManager.Instance.AddBot();
-                    BotManager.Instance.SpawnAllBots();
-                }
-            }
-            cy += 28f;
-
-            // ---- Teach (just walk) ----
-            GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
-            cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "TEACH", _sectionStyle);
-            cy += 20f;
-            var teachStyle = new GUIStyle(_labelStyle);
-            teachStyle.wordWrap = true;
-            teachStyle.normal.textColor = new Color(0.8f, 0.85f, 0.9f);
-            GUI.Label(new Rect(cx, cy, cw, 34),
-                "Just walk the map. Every route you take is trusted instantly and bots prefer your paths. No recording button needed.",
-                teachStyle);
-            cy += 38f;
-
-            // ---- Graph Settings ----
-            GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
-            cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "GRAPH", _sectionStyle);
-            cy += 20f;
-
-            cy = DrawToggle(cx, cy, cw, "Freeze Map Data", Plugin.LockGraph);
-
-            // ---- Debug ----
-            GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
-            cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "DEBUG VISUALS", _sectionStyle);
-            cy += 20f;
-
-            cy = DrawToggle(cx, cy, cw, "Show Overlay", Plugin.ShowOverlay);
-
-            // ---- Map Data ----
-            GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
-            cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "MAP DATA", _sectionStyle);
-            cy += 20f;
-
-            // Danger zone
-            var dangerStyle = new GUIStyle(_buttonStyle);
-            dangerStyle.normal.background = _dangerTex;
-            dangerStyle.normal.textColor = Color.white;
-            if (GUI.Button(new Rect(cx, cy, cw, 24), "CLEAR ALL MAP DATA", dangerStyle))
-            {
-                if (NavGraph.Instance != null && !string.IsNullOrEmpty(NavGraph.Instance.CurrentMap))
-                {
-                    string map = NavGraph.Instance.CurrentMap;
-                    string pluginDir = System.IO.Path.GetDirectoryName(
-                        System.Reflection.Assembly.GetExecutingAssembly().Location);
-                    string path = System.IO.Path.Combine(pluginDir, "NavData", $"{map}.bin");
-                    try { if (System.IO.File.Exists(path)) System.IO.File.Delete(path); } catch { }
-                    Plugin.CustomPatrolLocations.Clear();
-                    NavGraph.Instance.LoadForMap(map);
-                    NavGraph.Instance.RegisterMapLocations();
-                    Plugin.Log.LogInfo($"[NavGraph] Cleared all data for {map} — weapon nodes restored");
-                }
-            }
+            // ---- Pause (the one manual control besides the stage button) ----
+            string pauseLabel = Plugin.TrainingPaused ? "Resume bots" : "Pause bots (walk it yourself)";
+            if (GUI.Button(new Rect(cx, cy, cw, 24), pauseLabel,
+                    Plugin.TrainingPaused ? _activeButtonStyle : _buttonStyle))
+                Plugin.TrainingPaused = !Plugin.TrainingPaused;
             cy += 32f;
 
-            // ---- Stats ----
+            // ---- Stage panel ----
             GUI.DrawTexture(new Rect(cx, cy, cw, 1), _accentTex);
             cy += 6f;
-            GUI.Label(new Rect(cx, cy, cw, 18), "STATUS", _sectionStyle);
-            cy += 20f;
             if (NavGraph.Instance != null)
             {
                 string map = NavGraph.Instance.CurrentMap ?? "?";
                 GUI.Label(new Rect(cx, cy, cw, 18), $"Map: {map}", _labelStyle);
                 cy += 20f;
-                string behavior = Plugin.TrainingBehavior?.Value ?? "?";
-                GUI.Label(new Rect(cx, cy, cw, 18), $"Mode: {behavior}", _labelStyle);
+                GUI.Label(new Rect(cx, cy, cw, 18), $"Ground nav: {BotNavMesh.Status}", _labelStyle);
                 cy += 20f;
                 var cert = liveCert ?? NavGraph.Instance.GetCertificationReport();
-                cy = DrawTrainingPlan(cx, cy, cw, cert);
-                if (!string.IsNullOrWhiteSpace(cert.DemoHint))
-                {
-                    var warnStyle = new GUIStyle(_labelStyle);
-                    warnStyle.normal.textColor = new Color(1f, 0.78f, 0.25f);
-                    warnStyle.fontStyle = FontStyle.Bold;
-                    warnStyle.wordWrap = true;
-                    GUI.Label(new Rect(cx, cy, cw, 46), cert.DemoHint, warnStyle);
-                    cy += 50f;
-                }
+                cy = DrawStagePanel(cx, cy, cw, cert);
             }
 
             // Store content height for next frame so scroll area auto-sizes
@@ -320,85 +228,151 @@ namespace StraftatBots
             GUI.EndScrollView();
         }
 
-        private static float DrawTrainingPlan(float x, float y, float w, MapCertificationReport cert)
+        private static float DrawStagePanel(float x, float y, float w, MapCertificationReport cert)
         {
+            bool inPlay = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play;
+
             var titleStyle = new GUIStyle(_labelStyle);
             titleStyle.fontSize = 13;
             titleStyle.fontStyle = FontStyle.Bold;
-            titleStyle.normal.textColor = cert.NeedsTraining ? new Color(1f, 0.82f, 0.35f) : new Color(0.45f, 1f, 0.55f);
-
-            GUI.Label(new Rect(x, y, w, 20), $"{cert.StageName ?? "Training"} - {cert.Score:F0}% certified", titleStyle);
+            titleStyle.normal.textColor = new Color(0.45f, 0.85f, 1f);
+            GUI.Label(new Rect(x, y, w, 20), cert.StageName ?? "Training", titleStyle);
             y += 22f;
-            y = DrawProgressBar(x, y, w, "Current stage", cert.StageProgress, cert.NeedsTraining ? _accentTex : _activeTex);
+
+            y = DrawProgressBar(x, y, w, "Progress", cert.StageProgress,
+                cert.StageProgress >= 0.99f || cert.StageSettled ? _activeTex : _accentTex);
             y += 4f;
 
-            y = DrawProgressBar(x, y, w, "Coverage", cert.CoverageProgress, _accentTex);
-            y = DrawProgressBar(x, y, w, "Area links", cert.ConnectionProgress, _accentTex);
-            y = DrawProgressBar(x, y, w, "Weapon routes", cert.WeaponProgress, _accentTex);
-            y = DrawProgressBar(x, y, w, "Route trust", cert.TrustProgress, _accentTex);
-            y = DrawProgressBar(x, y, w, "Cleanup", cert.CleanupProgress, cert.BadNodeCount > 0 ? _dangerTex : _activeTex);
-            y += 4f;
+            // Metric stopped moving with bots actively training: say so honestly
+            // instead of leaving a bar frozen at an arbitrary percentage.
+            if (cert.StageSettled)
+            {
+                var settled = new GUIStyle(_labelStyle);
+                settled.fontStyle = FontStyle.Bold;
+                settled.normal.textColor = new Color(0.45f, 1f, 0.55f);
+                GUI.Label(new Rect(x, y, w, 18),
+                    "Nothing new being learned — ready to advance.", settled);
+                y += 20f;
+            }
 
             var wrap = new GUIStyle(_labelStyle);
             wrap.wordWrap = true;
             wrap.normal.textColor = new Color(0.9f, 0.9f, 0.9f);
             GUI.Label(new Rect(x, y, w, 34), cert.StageInstruction ?? "", wrap);
-            y += 36f;
+            y += 38f;
 
-            var actionStyle = new GUIStyle(wrap);
-            actionStyle.fontStyle = FontStyle.Bold;
-            actionStyle.normal.textColor = Color.white;
-            GUI.Label(new Rect(x, y, w, 46), "NEXT: " + (cert.PrimaryAction ?? "Keep training."), actionStyle);
-            y += 50f;
-
-            if (cert.HasTargetPosition)
+            // Stage 2: how many weapons still need a route
+            if (cert.StageNumber == 2)
             {
-                var targetStyle = new GUIStyle(_labelStyle);
-                targetStyle.normal.textColor = new Color(1f, 0.78f, 0.25f);
-                targetStyle.fontStyle = FontStyle.Bold;
-                targetStyle.wordWrap = true;
-                GUI.Label(new Rect(x, y, w, 34), $"MARKER: {cert.TargetLabel ?? "training target"}", targetStyle);
-                y += 36f;
-            }
-
-            string buttonLabel = cert.NextButtonLabel ?? "Run Training";
-            GUIStyle buttonStyle = cert.BadNodeCount > 0 ? MakeDangerButtonStyle() : _activeButtonStyle;
-            if (GUI.Button(new Rect(x, y, w, 26), buttonLabel, buttonStyle))
-                ExecuteTrainingStageAction(cert);
-            y += 32f;
-
-            // Spell out the staged flow and WHEN each step unlocks (this panel is the single
-            // control now — there are no separate behavior buttons fighting it).
-            var flowStyle = new GUIStyle(_labelStyle);
-            flowStyle.fontSize = 10;
-            flowStyle.wordWrap = true;
-            flowStyle.normal.textColor = new Color(0.62f, 0.66f, 0.74f);
-            GUI.Label(new Rect(x, y, w, 40),
-                "STEPS:  1 Build mesh  ->  2 Validate  ->  3 Play.\n" +
-                "The button above runs the current step; it advances on its own once the bars fill " +
-                "(Build: coverage + area links; Validate: route trust). You don't pick Explore/Validate manually.",
-                flowStyle);
-            y += 44f;
-
-            if (cert.BadNodeCount > 0)
-            {
+                int unlinked = cert.UnconnectedWeaponPositions?.Count ?? 0;
+                var wStyle = new GUIStyle(_labelStyle);
+                wStyle.normal.textColor = unlinked > 0 ? new Color(1f, 0.7f, 0.3f) : new Color(0.45f, 1f, 0.55f);
                 GUI.Label(new Rect(x, y, w, 18),
-                    $"Bad route points: {cert.BadNodeCount} | worst: {cert.WorstBadNodeStrikes}/3", _labelStyle);
-                y += 20f;
+                    unlinked > 0 ? $"Unlinked weapons: {unlinked} (marked in world)" : "All weapons linked!",
+                    wStyle);
+                y += 22f;
             }
-            GUI.Label(new Rect(x, y, w, 18),
-                $"Weapons ready: {cert.ValidatedWeaponRoutes}/{Mathf.Max(1, cert.WeaponAnchorCount)}", _labelStyle);
-            y += 20f;
-            GUI.Label(new Rect(x, y, w, 18),
-                $"Trusted routes: {cert.BotValidatedEdges} bot + {cert.PlayerProvenEdges} player", _labelStyle);
-            y += 20f;
-            if (cert.NeedsDemoEdges > 0)
+
+            // Stage 1: coverage stall warning + manual cleanup of unreachable junk
+            if (cert.StageNumber == 1 && !inPlay)
             {
-                GUI.Label(new Rect(x, y, w, 18), $"Routes to walk yourself: {cert.NeedsDemoEdges}", _labelStyle);
-                y += 20f;
+                UpdateStallTracking(cert);
+                if (_coverageStallWarning)
+                {
+                    var warn = new GUIStyle(_labelStyle);
+                    warn.wordWrap = true;
+                    warn.fontStyle = FontStyle.Bold;
+                    warn.normal.textColor = new Color(1f, 0.55f, 0.25f);
+                    GUI.Label(new Rect(x, y, w, 34),
+                        "No new ground reached in 30s — the rest may be\nunreachable. Clear unreachable areas or advance.", warn);
+                    y += 38f;
+                }
+                if (GUI.Button(new Rect(x, y, w, 24), "Clear Unreachable Areas", MakeDangerButtonStyle()))
+                {
+                    // Graph side: drop nodes with no route from spawn.
+                    NavGraph.Instance?.PruneDisconnectedFromSpawn();
+                    // Coverage side: drop mesh islands not connected to walked ground,
+                    // graph nodes or spawns by any known means — unwalked-but-legit
+                    // areas (jump platforms etc.) survive. Rebuilds the mesh.
+                    int dropped = BotNavMesh.PruneAllUnwalked();
+                    Plugin.Log.LogInfo($"[Training] Clear Unreachable Areas: {dropped} island cells removed");
+                }
+                y += 30f;
+            }
+
+            if (inPlay)
+            {
+                if (GUI.Button(new Rect(x, y, w, 26), "Back To Training", _buttonStyle))
+                {
+                    if (Plugin.NavGraphMode != null) Plugin.NavGraphMode.Value = "Training";
+                }
+                y += 32f;
+            }
+            else
+            {
+                if (GUI.Button(new Rect(x, y, w, 26), cert.NextButtonLabel ?? "Next Stage", _activeButtonStyle))
+                    NavGraph.Instance?.AdvanceTrainingStage();
+                y += 32f;
             }
 
             return y;
+        }
+
+        /// <summary>Top-center popup when joining a map in Play mode that has no learned
+        /// data. "Start Training" flips to Training mode at stage 1, unpaused — the
+        /// behavior mapper takes it from there.</summary>
+        private static void DrawUntrainedMapPopup(MapCertificationReport cert)
+        {
+            string curMap = NavGraph.Instance != null ? NavGraph.Instance.CurrentMap : null;
+            if (curMap != _lastSeenMap)
+            {
+                _lastSeenMap = curMap;
+                _untrainedWarnDismissed = false;
+            }
+            if (_untrainedWarnDismissed || string.IsNullOrEmpty(curMap) || cert == null) return;
+            if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Play) return;
+            if (cert.ActiveNodes >= 30) return; // has real learned data — not "untrained"
+
+            float w = 430f, h = 100f;
+            float px = (Screen.width - w) * 0.5f, py = 56f;
+            GUI.Box(new Rect(px, py, w, h), "", _boxStyle);
+            GUI.DrawTexture(new Rect(px, py, w, 4), _dangerTex);
+
+            var title = new GUIStyle(_headerStyle);
+            title.normal.textColor = new Color(1f, 0.6f, 0.3f);
+            GUI.Label(new Rect(px + 10, py + 8, w - 20, 20), "UNTRAINED MAP", title);
+
+            var text = new GUIStyle(_labelStyle);
+            text.wordWrap = true;
+            GUI.Label(new Rect(px + 10, py + 27, w - 20, 36),
+                "Bots have no training data for this map. They can walk the ground but " +
+                "won't know jumps, ladders or weapon routes.", text);
+
+            if (GUI.Button(new Rect(px + 10, py + h - 32, 140, 24), "Start Training", _activeButtonStyle))
+            {
+                if (NavGraph.Instance != null) NavGraph.Instance.TrainingStage = 1;
+                Plugin.TrainingPaused = false;
+                if (Plugin.NavGraphMode != null) Plugin.NavGraphMode.Value = "Training";
+                _untrainedWarnDismissed = true;
+                Plugin.Log.LogInfo("[Training] Untrained-map popup: training started at stage 1");
+            }
+            if (GUI.Button(new Rect(px + 160, py + h - 32, 100, 24), "Ignore", _buttonStyle))
+                _untrainedWarnDismissed = true;
+        }
+
+        /// <summary>Stage-1 stall detector: warn when neither walked coverage nor the
+        /// node count has grown for 30 seconds (bots probably can't reach anything new).</summary>
+        private static void UpdateStallTracking(MapCertificationReport cert)
+        {
+            int stat = BotNavMesh.WalkedCellCount + cert.ActiveNodes;
+            if (stat != _lastProgressStat || Plugin.TrainingPaused)
+            {
+                _lastProgressStat = stat;
+                _lastProgressTime = Time.time;
+                _coverageStallWarning = false;
+                return;
+            }
+            _coverageStallWarning = Time.time - _lastProgressTime >= 30f;
         }
 
         private static float DrawProgressBar(float x, float y, float w, string label, float value, Texture2D fill)
@@ -418,53 +392,6 @@ namespace StraftatBots
             style.normal.textColor = Color.white;
             style.fontStyle = FontStyle.Bold;
             return style;
-        }
-
-        private static void ExecuteTrainingStageAction(MapCertificationReport cert)
-        {
-            if (cert == null) return;
-            if (Plugin.NavGraphMode != null && Plugin.NavGraphMode.Value != "Training")
-                Plugin.NavGraphMode.Value = "Training";
-            if (Plugin.ShowOverlay != null) Plugin.ShowOverlay.Value = true;
-
-            if (cert.BadNodeCount > 0)
-            {
-                NavGraph.Instance?.PruneBadNodes(50);
-                if (Plugin.TrainingBehavior != null) Plugin.TrainingBehavior.Value = "Validate";
-                return;
-            }
-
-            if (cert.StageNumber >= 3)
-            {
-                // Ready — hand off to Play (bots keep learning there too).
-                if (Plugin.NavGraphMode != null) Plugin.NavGraphMode.Value = "Play";
-                return;
-            }
-
-            if (Plugin.TrainingBehavior != null)
-                Plugin.TrainingBehavior.Value = string.IsNullOrWhiteSpace(cert.RecommendedBehavior)
-                    ? "Validate"
-                    : cert.RecommendedBehavior;
-        }
-
-        private static void DrawWorldTrainingMarker(MapCertificationReport cert)
-        {
-            if (cert == null || !cert.HasTargetPosition) return;
-            Camera cam = Camera.main;
-            if (cam == null) return;
-
-            if (cert.HasRouteTarget)
-            {
-                DrawWorldLabel(cam, cert.RouteStartPosition, "WALK FROM HERE", _activeTex);
-                DrawWorldLabel(cam, cert.RouteEndPosition, "...TO HERE", _dangerTex);
-                DrawWorldLabel(cam, cert.TargetPosition, "WALK THIS ROUTE", _accentTex);
-                return;
-            }
-
-            string label = cert.BadNodeCount > 0
-                ? "FIX BAD ROUTE POINT"
-                : (cert.TargetLabel ?? "TRAIN HERE");
-            DrawWorldLabel(cam, cert.TargetPosition, label, cert.BadNodeCount > 0 ? _dangerTex : _accentTex);
         }
 
         private static void DrawWorldLabel(Camera cam, Vector3 worldPos, string label, Texture2D background)
@@ -507,115 +434,46 @@ namespace StraftatBots
 
             // Scrollable content
             Rect scrollView = new Rect(cx, cy, cw, h - (cy - y) - 8f);
-            float contentH = 1900f;
+            float contentH = 760f;
             _helpScrollPos = GUI.BeginScrollView(scrollView, _helpScrollPos, new Rect(0, 0, cw - 20, contentH));
 
             float ty = 0f;
             float tw = cw - 24f;
 
-            ty = HelpSection(ty, tw, "BEHAVIOR MODES");
-            ty = HelpEntry(ty, tw, "None",
-                "Bots freeze in place. Use when you want to walk the map\n" +
-                "yourself and train paths manually without bots moving.");
-            ty = HelpEntry(ty, tw, "Explore",
-                "Bots autonomously explore the map. They seek ladders,\n" +
-                "ramps, jump onto ledges, probe gaps, and walk along edges\n" +
-                "to discover routes. All movement is recorded as proven paths.");
-            ty += 6f;
-            ty = HelpSection(ty, tw, "RECORDING OPTIONS");
-            ty = HelpEntry(ty, tw, "Special Edges Only",
-                "Only record jumps, falls, slides, wall jumps, and ladders.\n" +
-                "Walk nodes are NOT created. Use to map trick jumps first.");
-            ty = HelpEntry(ty, tw, "Walk Nodes Only",
-                "Only create walk nodes and edges. No special movement\n" +
-                "recorded. Use to fill in walkable terrain.");
-            ty = HelpEntry(ty, tw, "Player Data Only",
-                "Only YOUR movement creates navigation data. Bots follow\n" +
-                "but don't add nodes. For precise manual training.");
-            ty = HelpEntry(ty, tw, "Pause Recording",
-                "Stop recording your movement. Existing data is kept.\n" +
-                "Walk around without adding more paths.");
-            ty = HelpEntry(ty, tw, "Erase Mode",
-                "Walk around to DELETE nearby nodes instead of creating\n" +
-                "them. Use to clean up bad areas of the graph.");
+            ty = HelpSection(ty, tw, "HOW TRAINING WORKS");
+            ty = HelpEntry(ty, tw, "Walking is automatic",
+                "A ground navigation mesh is generated for every map at load\n" +
+                "(cyan wireframe in the overlay). Bots can walk anywhere\n" +
+                "immediately — training only teaches jumps, ladders and\n" +
+                "special routes the mesh can't walk.");
+            ty = HelpEntry(ty, tw, "Stage 1 — Explore",
+                "Bots and you run around the map. Every area you or the\n" +
+                "bots reach gets connected. Your own routes are trusted\n" +
+                "instantly, so walking tricky jumps yourself teaches fastest.");
+            ty = HelpEntry(ty, tw, "Stage 2 — Weapons",
+                "Pressing Next Stage first deletes every node and path\n" +
+                "that isn't connected to the map. Weapons without a\n" +
+                "working route get a red world marker — bots (and you)\n" +
+                "focus on reaching them until all weapons are linked.");
+            ty = HelpEntry(ty, tw, "Stage 3 — Confirmation",
+                "Bots run routes all over the map and confirm everything\n" +
+                "is walkable. Routes they complete become trusted.\n" +
+                "When it looks good, hit Finish to switch to Play.");
+            ty = HelpEntry(ty, tw, "Next Stage button",
+                "The single control: it advances 1 -> 2 -> 3 -> Play.\n" +
+                "Everything inside a stage runs by itself.");
+            ty = HelpEntry(ty, tw, "Pause bots",
+                "Freezes the bots so you can walk routes yourself\n" +
+                "without them in the way. Resume when done.");
 
             ty += 6f;
-            ty = HelpSection(ty, tw, "SCANNING");
-            ty = HelpEntry(ty, tw, "Player/Bot Ground Scan",
-                "Scan ground in 8 directions around you/bots as you move.\n" +
-                "Adds nodes to nearby walkable surfaces without walking\n" +
-                "directly on them. Range set in mod menu (Graph section).");
-
-            ty += 6f;
-            ty = HelpSection(ty, tw, "BOTS");
-            ty = HelpEntry(ty, tw, "Bot Count",
-                "Number of bots to spawn (0-8). Change and respawn to apply.");
-            ty = HelpEntry(ty, tw, "Respawn All Bots",
-                "Despawn all bots and spawn fresh with the current count.\n" +
-                "Use mid-match to reset stuck bots.");
-            ty += 6f;
-            ty = HelpSection(ty, tw, "DEBUG VISUALS");
-            ty = HelpEntry(ty, tw, "Show Nodes",
-                "Draw colored markers at nav nodes. Green=player,\n" +
-                "yellow/red=bot confidence. Special nodes get unique shapes.");
-            ty = HelpEntry(ty, tw, "Show Edges",
-                "Draw lines between connected nodes. White=walk, blue=jump,\n" +
-                "green=ladder, purple=slide, orange=wall jump, red=fall.");
-            ty = HelpEntry(ty, tw, "Show Bot Paths / Markers / Info",
-                "Yellow path lines, state rings above bots, text overlays\n" +
-                "showing name, state, path progress, and flags.");
-
-            ty += 6f;
-            ty = HelpSection(ty, tw, "GRAPH");
-            ty = HelpEntry(ty, tw, "Player / Bot Density",
-                "How close together nodes are placed (1-10).\n" +
-                "1 = very detailed, many nodes. 10 = sparse, few nodes.\n" +
-                "5 is default. Lower = more accurate paths but more data.");
-            ty = HelpEntry(ty, tw, "Scan Range",
-                "How far ground scanning reaches in meters (2-30).\n" +
-                "Only active when a Ground Scan toggle is on.\n" +
-                "Also controls Erase Mode deletion radius.");
-            ty = HelpEntry(ty, tw, "Max Player / Bot Nodes",
-                "Maximum nodes per map. When exceeded, oldest and\n" +
-                "lowest-confidence nodes are pruned. Bot nodes pruned\n" +
-                "first. Ignored when Freeze Map Data is on.");
-            ty = HelpEntry(ty, tw, "Auto-Save Interval",
-                "How often the graph saves to disk (seconds).\n" +
-                "Lower = safer against crashes but more disk writes.");
-            ty = HelpEntry(ty, tw, "Freeze Map Data",
-                "Completely freeze the navigation graph. Nothing is\n" +
-                "created, deleted, or modified. Use when you're happy\n" +
-                "with trained data and want to preserve it exactly.");
-            ty = HelpEntry(ty, tw, "Auto-Optimize",
-                "Allow graph cleanup in Play mode (merge nearby nodes,\n" +
-                "remove bad edges). Normally Play preserves all data.\n" +
-                "Enable if the graph feels bloated.");
-
-            ty += 6f;
-            ty = HelpSection(ty, tw, "PATROL LOCATIONS");
-            ty = HelpEntry(ty, tw, "Place Patrol Location",
-                "Drop a custom patrol point at your current position.\n" +
-                "Bots in Connect mode will path to it like a weapon spawn.\n" +
-                "Max 20 locations per map.");
-
-            ty += 6f;
-            ty = HelpSection(ty, tw, "MAP DATA");
-            ty = HelpEntry(ty, tw, "Remove Orphan Nodes",
-                "Delete nodes with zero connections. Cleans up stray\n" +
-                "dots that bots can't reach.");
-            ty = HelpEntry(ty, tw, "Clear Player / Bot Nodes",
-                "Delete only player-created or bot-created nodes.\n" +
-                "Useful for selective cleanup without losing all data.");
-            ty = HelpEntry(ty, tw, "Clear Special Edges",
-                "Delete all jump, fall, slide, wall jump, and ladder edges.\n" +
-                "Walk nodes and edges are kept. Resets trick jumps.");
-            ty = HelpEntry(ty, tw, "Keep Connected Routes Only",
-                "Delete everything except proven routes between locations.\n" +
-                "Keeps patrol routes + weapon/spawn nodes. Run after\n" +
-                "Connect mode completes. Clean starting point for training.");
-            ty = HelpEntry(ty, tw, "CLEAR ALL MAP DATA",
-                "Delete ALL navigation data for this map. Cannot undo.\n" +
-                "Starts completely fresh. The button is red for a reason.");
+            ty = HelpSection(ty, tw, "TIPS");
+            ty = HelpEntry(ty, tw, "Freecam",
+                "Detach the camera and fly around to watch bots train.\n" +
+                "Turning it off drops your player at the camera's position.");
+            ty = HelpEntry(ty, tw, "Advanced settings",
+                "Bot count, overlay, freeze/clear map data live in the\n" +
+                "mod menu (F1) — kept out of this panel on purpose.");
 
             GUI.EndScrollView();
         }
@@ -686,16 +544,6 @@ namespace StraftatBots
                     }
                     break;
             }
-        }
-
-        private static float DrawToggle(float x, float y, float w, string label,
-            BepInEx.Configuration.ConfigEntry<bool> config)
-        {
-            bool val = config?.Value ?? false;
-            bool newVal = GUI.Toggle(new Rect(x, y, w, 20), val, " " + label, _toggleStyle);
-            if (newVal != val && config != null)
-                config.Value = newVal;
-            return y + 22f;
         }
 
         private static Texture2D MakeTex(int width, int height, Color color)

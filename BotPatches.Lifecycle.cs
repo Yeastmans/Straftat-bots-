@@ -29,6 +29,7 @@ namespace StraftatBots
             if (sceneName == "MainMenu" || sceneName == "EmptyScene" || sceneName == "EndGame")
             {
                 _lastSpawnedScene = null; // Reset so bots spawn on next map
+                BotNavMesh.Clear();
                 return;
             }
 
@@ -92,6 +93,13 @@ namespace StraftatBots
                 Physics.IgnoreLayerCollision(3, 6, noClip);   // Bot CC vs player CC
                 string mapName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
                 NavGraph.Instance.LoadForMap(mapName);
+
+                // Auto-bake ground navigation for this map — bots can walk anywhere without
+                // training; the learned graph stays in charge of jumps/ladders/teleporters.
+                if (Plugin.UseNavMesh == null || Plugin.UseNavMesh.Value)
+                    BotNavMesh.Bake(mapName);
+                else
+                    BotNavMesh.Clear();
 
                 // Register spawn points and weapon spawners as fixed nodes
                 NavGraph.Instance.RegisterMapLocations();

@@ -84,6 +84,17 @@ namespace StraftatBots
                     for (int i = 0; i < len; i++)
                         w.Write(r.NodeIds[i]);
                 }
+
+                // V6: training stage + walked coverage — no more retraining every
+                // session. Coverage saves as world positions of walked cells so it
+                // survives grid changes between bakes.
+                w.Write(TrainingStage);
+                var walked = BotNavMesh.GetWalkedCellPositionsForSave();
+                w.Write(walked.Count);
+                foreach (var p in walked)
+                {
+                    w.Write(p.x); w.Write(p.y); w.Write(p.z);
+                }
             }
         }
 
@@ -100,7 +111,7 @@ namespace StraftatBots
                     _dirty = true;
                     return;
                 }
-                if (version != 2 && version != 3 && version != 4 && version != 5)
+                if (version < 2 || version > 6)
                 {
                     Plugin.Log.LogWarning($"[NavGraph] File version {version} unknown, skipping");
                     return;
@@ -108,6 +119,7 @@ namespace StraftatBots
                 bool hasTrajectory = (version >= 3);
                 bool hasProvenRoutes = (version >= 4);
                 bool hasTrustState = (version >= 5);
+                bool hasTrainingState = (version >= 6);
 
                 _nextNodeId = r.ReadInt32();
 
@@ -239,6 +251,29 @@ namespace StraftatBots
                         // v4 tag present but truncated — tolerate
                     }
                 }
+                // V6: training stage + walked coverage. Coverage can only be applied
+                // after the navmesh bakes (grid must exist) — stash until then.
+                if (hasTrainingState)
+                {
+                    try
+                    {
+                        int stage = r.ReadInt32();
+                        TrainingStage = stage; // _currentMap is set before load
+                        int walkedCount = r.ReadInt32();
+                        if (walkedCount > 0 && walkedCount < 2_000_000)
+                        {
+                            _pendingWalkedRestore = new List<Vector3>(walkedCount);
+                            for (int i = 0; i < walkedCount; i++)
+                                _pendingWalkedRestore.Add(new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle()));
+                        }
+                        Plugin.Log.LogInfo($"[NavGraph] Restored training stage {stage}, {walkedCount} walked cells pending bake");
+                    }
+                    catch (System.IO.EndOfStreamException)
+                    {
+                        // v6 tag present but truncated — tolerate
+                    }
+                }
+
                 RebuildProvenEdgeSet();
                 RebuildTrustStatesFromLegacy();
 
@@ -248,6 +283,17 @@ namespace StraftatBots
                     _dirty = true;
                 }
             }
+        }
+
+        // Walked-coverage positions loaded from a v6 file, applied once the navmesh
+        // bake creates the grid (BotNavMesh calls this at the end of Bake).
+        private List<Vector3> _pendingWalkedRestore;
+
+        public void ApplyPendingWalkedRestore()
+        {
+            if (_pendingWalkedRestore == null) return;
+            BotNavMesh.RestoreWalked(_pendingWalkedRestore);
+            _pendingWalkedRestore = null;
         }
 
         /// <summary>
