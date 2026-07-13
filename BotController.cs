@@ -998,8 +998,13 @@ namespace StraftatBots
             }
         }
 
+        // Shared across bots — Update calls are sequential on the main thread.
+        private static readonly System.Diagnostics.Stopwatch _perfSw = new System.Diagnostics.Stopwatch();
+
         private void Update()
         {
+            bool timing = BotPerfStats.Enabled;
+            if (timing) _perfSw.Restart();
             try { UpdateInternal(); }
             catch (System.Exception e)
             {
@@ -1008,6 +1013,11 @@ namespace StraftatBots
                     _loggedError = true;
                     Plugin.Log.LogError($"[{BotName}] Update error: {e.Message}\n{e.StackTrace}");
                 }
+            }
+            if (timing)
+            {
+                _perfSw.Stop();
+                BotPerfStats.AddBotUpdate(_perfSw.Elapsed.TotalMilliseconds);
             }
         }
 

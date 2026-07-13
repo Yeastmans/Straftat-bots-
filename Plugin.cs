@@ -60,6 +60,8 @@ namespace StraftatBots
         // ===== Debug =====
         // Single overlay toggle — covers nodes, edges, bot paths, markers, and info text.
         public static ConfigEntry<bool> ShowOverlay;
+        // One-line perf summary every 10s (fps, bot CPU ms/frame, GC pressure).
+        public static ConfigEntry<bool> LogPerfStats;
         // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
         public static ConfigEntry<bool> EnableReliabilityLogs;
 
@@ -189,9 +191,13 @@ namespace StraftatBots
             // ================================================================
             //  DEBUG — Single visual overlay toggle
             // ================================================================
-            ShowOverlay = Config.Bind("Debug", "Show Overlay", true,
+            ShowOverlay = Config.Bind("Debug", "Show Overlay", false,
                 "Draw navigation nodes, edges, bot paths, and bot info text. " +
-                "Turn off for clean gameplay.");
+                "Costs real frame time — leave off except when debugging bots.");
+
+            LogPerfStats = Config.Bind("Debug", "Log Perf Stats", true,
+                "Write a one-line performance summary to the log every 10 seconds " +
+                "(frame rate, bot CPU cost, GC). Cheap to leave on.");
 
             // ================================================================
             //  CUSTOMISE — Bot names and appearance
@@ -234,6 +240,8 @@ namespace StraftatBots
         private float _graphLinkSyncTimer;
         private void Update()
         {
+            BotPerfStats.FrameTick(Time.unscaledDeltaTime);
+
             // Stage-driven behavior: Explore during stages 1-2, Validate during stage 3
             // (confirmation), None in Play mode or while the user paused the bots.
             _behaviorSyncTimer -= Time.deltaTime;

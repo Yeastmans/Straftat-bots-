@@ -52,7 +52,24 @@ namespace StraftatBots
         private float _demoNeededCheckTimer;
         private long _lastDemoNeededLogged = -1L;
 
+        private static readonly System.Diagnostics.Stopwatch _mgrPerfSw = new System.Diagnostics.Stopwatch();
+
         private void Update()
+        {
+            bool timing = BotPerfStats.Enabled;
+            if (timing) _mgrPerfSw.Restart();
+            try { UpdateBody(); }
+            finally
+            {
+                if (timing)
+                {
+                    _mgrPerfSw.Stop();
+                    BotPerfStats.AddManagerUpdate(_mgrPerfSw.Elapsed.TotalMilliseconds);
+                }
+            }
+        }
+
+        private void UpdateBody()
         {
             if (!FishNet.InstanceFinder.IsServer) return;
             if (_activeBots.Count == 0 || GameManager.Instance == null) return;
@@ -670,7 +687,6 @@ namespace StraftatBots
                 // Hats re-enabled: retry attachment if the first pass didn't stick
                 // (cosmetics can race prefab/animator init on spawn).
                 StartCoroutine(RetryApplyCosmetics(botData, botObj));
-                StartCoroutine(HatStateProbe(botData, botObj));
 
                 // Ensure graphics are enabled
                 var ph = botObj.GetComponent<PlayerHealth>();
@@ -759,24 +775,10 @@ namespace StraftatBots
             }
         }
 
-        /// <summary>Runtime hat diagnostics. Every spawn-time line reads healthy while
-        /// hats still don't show in game, so this samples the RENDER-time state the
-        /// spawn log can't capture: renderer.isVisible, world scale, drift from the
-        /// head bone, material/shader. Logs for a window after each dress pass and any
-        /// time something is anomalous.</summary>
-        private System.Collections.IEnumerator HatStateProbe(BotData botData, GameObject botObj)
-        {
-            var wait = new WaitForSeconds(4f);
-            int sample = 0;
-            while (botObj != null)
-            {
-                yield return wait;
-                if (botObj == null) yield break;
-                sample++;
-                try { ProbeHatState(botData, botObj, sample, null); } catch { }
-            }
-        }
-
+        /// <summary>One-shot hat render-state diagnostic (isVisible, scale, drift from
+        /// head bone, material). Ran periodically while hunting the invisible-hat bug
+        /// (root cause: NetworkObject on hat prefabs); now only fired when the retry
+        /// loop's visibility check fails, so a healthy session logs nothing.</summary>
         private static void ProbeHatState(BotData botData, GameObject botObj, int sample, string context)
         {
             if (botObj == null) return;

@@ -71,6 +71,12 @@ namespace StraftatBots
         {
             if (cam == null || _glMat == null) return;
 
+            // Toggle FIRST: this callback fires for every camera every frame, and
+            // Camera.allCameras below allocates — with the overlay off it must cost
+            // nothing.
+            bool showOverlay = Plugin.ShowOverlay?.Value ?? false;
+            if (!showOverlay) return;
+
             if (cam.targetTexture != null) return;
             foreach (var c in Camera.allCameras)
             {
@@ -78,8 +84,6 @@ namespace StraftatBots
                 if (c.depth < cam.depth) return;
             }
 
-            // Single overlay toggle — covers nodes, edges, paths, markers, and bot info text.
-            bool showOverlay = Plugin.ShowOverlay?.Value ?? true;
             bool showText = showOverlay;
             if (showText && (!_textProxyAttached || cam.GetComponent<BotVizTextProxy>() == null))
             {
@@ -218,35 +222,19 @@ namespace StraftatBots
 
                 float alpha = Mathf.Lerp(0.15f, 0.8f, 1f - dist / maxDrawDist);
 
-                // Check if this node is an endpoint of special edges
-                bool isJumpNode = false, isLadderNode = false, isSlideNode = false, isWallJumpNode = false;
-                bool isMapLocation = false;
-                bool isPatrolPoint = false;
-                bool isTeleporter = false;
-                bool isBadNode = false;
-                if (NavGraph.Instance != null)
-                {
-                    isBadNode = NavGraph.Instance.IsBadNode(node.Id);
-                    var edgesFrom = NavGraph.Instance.GetEdgesFrom(node.Id);
-                    foreach (var e in edgesFrom)
-                    {
-                        if (e.Type == EdgeType.Jump) isJumpNode = true;
-                        else if (e.Type == EdgeType.Ladder) isLadderNode = true;
-                        else if (e.Type == EdgeType.Slide) isSlideNode = true;
-                        else if (e.Type == EdgeType.WallJump) isWallJumpNode = true;
-                        else if (e.Type == EdgeType.Teleporter) isTeleporter = true;
-                    }
-                    foreach (var (pos2, label, nodeId) in NavGraph.Instance.MapLocations)
-                    {
-                        if (nodeId == node.Id)
-                        {
-                            isMapLocation = true;
-                            if (label == "PatrolPoint") isPatrolPoint = true;
-                            if (label == "Teleporter") isTeleporter = true;
-                            break;
-                        }
-                    }
-                }
+                // Node type flags come from a cache rebuilt every 2s. Doing
+                // GetEdgesFrom (allocates a List per call) plus a MapLocations scan
+                // for every visible node EVERY FRAME was a major GC/CPU cost while
+                // the overlay was on.
+                NodeVizFlags nf = GetNodeVizFlags(node.Id);
+                bool isJumpNode = (nf & NodeVizFlags.Jump) != 0;
+                bool isLadderNode = (nf & NodeVizFlags.Ladder) != 0;
+                bool isSlideNode = (nf & NodeVizFlags.Slide) != 0;
+                bool isWallJumpNode = (nf & NodeVizFlags.WallJump) != 0;
+                bool isMapLocation = (nf & NodeVizFlags.MapLocation) != 0;
+                bool isPatrolPoint = (nf & NodeVizFlags.PatrolPoint) != 0;
+                bool isTeleporter = (nf & NodeVizFlags.Teleporter) != 0;
+                bool isBadNode = (nf & NodeVizFlags.Bad) != 0;
 
                 // Color by node type — most specific wins
                 Color col;
@@ -670,7 +658,7 @@ namespace StraftatBots
         public static void DrawText(Camera cam)
         {
             if (cam == null) return;
-            if (!(Plugin.ShowOverlay?.Value ?? true)) return;
+            if (!(Plugin.ShowOverlay?.Value ?? false)) return;
 
             var bots = BotManager.ActiveBots;
             if (bots == null || bots.Count == 0) return;
@@ -754,6 +742,56 @@ namespace StraftatBots
             if (id >= 0 && id < nodes.Count && nodes[id].Id == id)
                 return nodes[id];
             return null; // Skip O(N) fallback — stale IDs just return null
+        }
+
+        [System.Flags]
+        enum NodeVizFlags : byte
+        {
+            None = 0, Jump = 1, Ladder = 2, Slide = 4, WallJump = 8,
+            Teleporter = 16, MapLocation = 32, PatrolPoint = 64, Bad = 128
+        }
+
+        static readonly Dictionary<int, NodeVizFlags> _nodeFlags = new Dictionary<int, NodeVizFlags>();
+        static float _nodeFlagsBuiltAt = -999f;
+
+        static NodeVizFlags GetNodeVizFlags(int nodeId)
+        {
+            if (Time.unscaledTime - _nodeFlagsBuiltAt > 2f) RebuildNodeFlags();
+            return _nodeFlags.TryGetValue(nodeId, out var f) ? f : NodeVizFlags.None;
+        }
+
+        static void RebuildNodeFlags()
+        {
+            _nodeFlagsBuiltAt = Time.unscaledTime;
+            _nodeFlags.Clear();
+            var g = NavGraph.Instance;
+            if (g == null || g.Nodes == null) return;
+            foreach (var node in g.Nodes)
+            {
+                if (node == null) continue;
+                NodeVizFlags f = NodeVizFlags.None;
+                if (g.IsBadNode(node.Id)) f |= NodeVizFlags.Bad;
+                foreach (var e in g.GetEdgesFrom(node.Id))
+                {
+                    switch (e.Type)
+                    {
+                        case EdgeType.Jump: f |= NodeVizFlags.Jump; break;
+                        case EdgeType.Ladder: f |= NodeVizFlags.Ladder; break;
+                        case EdgeType.Slide: f |= NodeVizFlags.Slide; break;
+                        case EdgeType.WallJump: f |= NodeVizFlags.WallJump; break;
+                        case EdgeType.Teleporter: f |= NodeVizFlags.Teleporter; break;
+                    }
+                }
+                if (f != NodeVizFlags.None) _nodeFlags[node.Id] = f;
+            }
+            foreach (var (pos, label, nodeId) in g.MapLocations)
+            {
+                _nodeFlags.TryGetValue(nodeId, out var f);
+                f |= NodeVizFlags.MapLocation;
+                if (label == "PatrolPoint") f |= NodeVizFlags.PatrolPoint;
+                if (label == "Teleporter") f |= NodeVizFlags.Teleporter;
+                _nodeFlags[nodeId] = f;
+            }
         }
 
         static void DrawRing(Vector3 center, float radius, int segments)
