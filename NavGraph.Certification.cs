@@ -19,6 +19,7 @@ namespace StraftatBots
         public int SpecialEdges;
         public int TrustedSpecialEdges;
         public int NeedsDemoSpecialEdges;   // special edges bots gave up on — resolved, not pending
+        public int InProgressSpecialEdges;  // ≥1 success, not yet trusted — half credit in stage 3
         public int AnchorCount;
         public int ConnectedAnchors;
         public int ValidatedAnchorRoutes;
@@ -254,6 +255,9 @@ namespace StraftatBots
                     report.TrustedSpecialEdges++;
                 if (edge.TrustState == EdgeTrustState.NeedsDemo && IsSpecialTraversal(edge))
                     report.NeedsDemoSpecialEdges++;
+                if (IsSpecialTraversal(edge) && !IsTrustedForPlay(edge)
+                    && edge.TrustState != EdgeTrustState.NeedsDemo && edge.BotValidationSuccesses > 0)
+                    report.InProgressSpecialEdges++;
             }
 
             report.ConnectedAnchors = CountConnectedAnchors(anchorIds, trustedOnly: false);
@@ -763,13 +767,19 @@ namespace StraftatBots
                     // every key location. NeedsDemo edges count as RESOLVED — bots asked
                     // and answered ("can't do it without a demo"); leaving them in the
                     // denominator stalled the bar forever on maps with junk jump edges.
+                    // Edges with one clean traversal already banked count half — the bar
+                    // visibly moves with every bot attempt instead of only on full trust.
                     float specialProgress = report.SpecialEdges > 0
-                        ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges) / (float)report.SpecialEdges)
+                        ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges
+                            + 0.5f * report.InProgressSpecialEdges) / (float)report.SpecialEdges)
                         : 1f;
                     float anchorProgress = report.AnchorCount > 1
                         ? Mathf.Clamp01(report.ValidatedAnchorRoutes / (float)report.AnchorCount)
                         : 1f;
-                    rawProgress = Mathf.Min(specialProgress, anchorProgress);
+                    // Weighted blend, not min() — min() pinned the whole bar at the most
+                    // stubborn term (anchor routes read 0 on maps whose mesh bake failed,
+                    // so Confirmation NEVER rose regardless of edge work done).
+                    rawProgress = specialProgress * 0.65f + anchorProgress * 0.35f;
                     report.StageInstruction = "Bots confirm jumps, ladders and routes to every key location.";
                     report.NextButtonLabel = "Finish: Switch To Play";
                     report.RecommendedBehavior = "Validate";

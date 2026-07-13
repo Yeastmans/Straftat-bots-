@@ -157,6 +157,11 @@ namespace StraftatBots
                 float bottomY = bounds.min.y - 1f;
                 int rayCount = 0;
 
+                // Column scan as a local pass so a failed standard-mask scan can retry
+                // permissively — some maps put ALL geometry on unexpected layers
+                // (Dragonfly_Cliffs baked 0 cells with the curated mask).
+                void ScanColumns(int scanMask)
+                {
                 for (int ix = 0; ix < nx; ix++)
                 {
                     float x = bounds.min.x + (ix + 0.5f) * cell;
@@ -171,7 +176,7 @@ namespace StraftatBots
                         {
                             rayCount++;
                             if (!Physics.Raycast(new Vector3(x, y, z), Vector3.down, out var hit,
-                                    y - bottomY, SCAN_MASK, QueryTriggerInteraction.Ignore))
+                                    y - bottomY, scanMask, QueryTriggerInteraction.Ignore))
                                 break;
                             y = hit.point.y - 0.12f;
                             bool wasFirst = firstHitInColumn;
@@ -186,7 +191,7 @@ namespace StraftatBots
                                 // Open-sky surface: plain headroom test.
                                 rayCount++;
                                 if (Physics.Raycast(hit.point + Vector3.up * 0.1f, Vector3.up,
-                                        MIN_HEADROOM - 0.1f, SCAN_MASK, QueryTriggerInteraction.Ignore))
+                                        MIN_HEADROOM - 0.1f, scanMask, QueryTriggerInteraction.Ignore))
                                     continue;
                             }
                             else
@@ -198,7 +203,7 @@ namespace StraftatBots
                                 rayCount++;
                                 float maxUp = Mathf.Max(0.5f, roofY - hit.point.y);
                                 if (!Physics.Raycast(hit.point + Vector3.up * 0.05f, Vector3.up,
-                                        out var ceil, maxUp, SCAN_MASK, QueryTriggerInteraction.Ignore))
+                                        out var ceil, maxUp, scanMask, QueryTriggerInteraction.Ignore))
                                     continue;                                   // no ceiling = inside solid geometry
                                 if (ceil.distance < MIN_HEADROOM - 0.05f)
                                     continue;                                   // ceiling too low even to crouch
@@ -226,6 +231,20 @@ namespace StraftatBots
                             _cellSources[cellKey] = cellSource;
                         }
                     }
+                }
+                }
+
+                ScanColumns(SCAN_MASK);
+                if (sources.Count < 16)
+                {
+                    // Everything except actors, cosmetics, ragdolls, invisible walls
+                    // and IgnoreRaycast — strictly better than baking nothing.
+                    Plugin.Log.LogWarning($"[NavMesh] {sceneName}: standard scan found {sources.Count} cells — retrying with permissive layer mask");
+                    sources.Clear();
+                    _allCells.Clear();
+                    _cellSources.Clear();
+                    ScanColumns(~((1 << 2) | (1 << 3) | (1 << 6) | (1 << 11) | (1 << 16)
+                        | (1 << 18) | (1 << 23) | (1 << 27)));
                 }
 
                 if (sources.Count < 16)

@@ -2940,7 +2940,16 @@ namespace StraftatBots
                 if (drop > 0.8f && drop < 25f
                     && flat.magnitude < 14f
                     && (flat.sqrMagnitude < 0.25f || Vector3.Dot(flat.normalized, dir) > 0.5f))
-                    return true;
+                {
+                    // Authorize ONLY if stepping off here actually lands on something.
+                    // A below-waypoint across a chasm means the route wants a JUMP —
+                    // if the jump logic didn't fire, walking off is a void death
+                    // (this exact regression killed bots on jump-y paths).
+                    Vector3 stepProbe = myPos + dir * 1.1f + Vector3.up * 0.4f;
+                    if (Physics.Raycast(stepProbe, Vector3.down, drop + 5f,
+                            GROUND_MASK, QueryTriggerInteraction.Ignore))
+                        return true;
+                }
             }
             return false;
         }
