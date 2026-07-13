@@ -13,6 +13,10 @@ namespace StraftatBots
             try
             {
                 if (NavGraph.Instance == null) return;
+                // No bot UI in the main menu — the Training panel used to linger there
+                // because the mode config persists across scenes. It appears only once
+                // a map is loaded (and training is actually running).
+                if (PauseManager.Instance == null || PauseManager.Instance.inMainMenu) return;
                 if (NavGraph.Instance.Mode != NavMode.Training)
                 {
                     // Play mode still gets the untrained-map popup (Start Training /

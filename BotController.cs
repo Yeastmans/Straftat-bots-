@@ -1017,7 +1017,12 @@ namespace StraftatBots
             if (timing)
             {
                 _perfSw.Stop();
-                BotPerfStats.AddBotUpdate(_perfSw.Elapsed.TotalMilliseconds);
+                double ms = _perfSw.Elapsed.TotalMilliseconds;
+                BotPerfStats.AddBotUpdate(ms);
+                // Context for hitch hunting — [Perf] windows showed single updates in the
+                // tens of ms (worst 3.4s). One line per offender says WHERE it happened.
+                if (ms > 50.0)
+                    Plugin.Log.LogInfo($"[Perf] SLOW bot update {BotName}: {ms:F0} ms (state={State}, src={_pathSource}, onLadder={_onLadder})");
             }
 
             // One line per state change — cheap, and rapid A->B->A cycles in the log

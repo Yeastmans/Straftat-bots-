@@ -1656,7 +1656,7 @@ namespace StraftatBots
             {
                 var slideObs = CheckObstructions(dir);
 
-                if (slideObs.CrouchClear && slideObs.HeadBlocked && !slideObs.WaistBlocked)
+                if (ConfirmLowCeiling(dir))
                 {
                     // Low ceiling corridor: crouch and keep moving instead of head-bumping.
                     if (!_isCrouching)
@@ -2324,7 +2324,8 @@ namespace StraftatBots
                 {
                     float voidLookahead = Mathf.Clamp(horizMove.magnitude * 0.16f, 0.8f, 2.0f);
                     if (!HasGroundFootprintAhead(horizMove, voidLookahead)
-                        && !IsImpulseZoneAhead(horizMove, voidLookahead))
+                        && !IsImpulseZoneAhead(horizMove, voidLookahead)
+                        && !RouteAuthorizesDrop(horizMove))
                     {
                         if (TryGetSafeEdgeEscapeDir(horizMove, out Vector3 escapeDir))
                         {
@@ -2511,10 +2512,38 @@ namespace StraftatBots
         private static bool _mapHasLadders = true;  // Assume true until first scan proves otherwise
         private static bool _mapLadderScanned;
 
+        private static Collider[] _mapLadderColliders = System.Array.Empty<Collider>();
+
+        /// <summary>One full-scene collider sweep per map. The old per-call sweep ran
+        /// EVERY second for every bot standing far from a ladder ([Perf] showed 12-20
+        /// ms/frame windows and a multi-second worst hitch from exactly this).</summary>
+        private static void EnsureLadderCache()
+        {
+            if (_mapLadderScanned) return;
+            _mapLadderScanned = true;
+            var found = new System.Collections.Generic.List<Collider>();
+            foreach (var col in Object.FindObjectsOfType<Collider>())
+            {
+                if (col == null) continue;
+                bool isLadder = col.gameObject.layer == 10; // Ladder layer
+                if (!isLadder)
+                {
+                    string tag = "";
+                    try { tag = col.tag; } catch { }
+                    isLadder = tag == "Ladder/Metal" || tag == "Ladder/Chain"
+                        || col.gameObject.name.IndexOf("ladder", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+                if (isLadder) found.Add(col);
+            }
+            _mapLadderColliders = found.ToArray();
+            _mapHasLadders = _mapLadderColliders.Length > 0;
+            Plugin.Log.LogInfo($"[BOT] Ladder cache: {_mapLadderColliders.Length} collider(s) on this map");
+        }
+
         private Collider FindNearbyLadder(float radius)
         {
-            // Skip entirely if we already scanned and found no ladders on this map
-            if (_mapLadderScanned && !_mapHasLadders) return null;
+            EnsureLadderCache();
+            if (!_mapHasLadders) return null;
 
             // Rate limit — don't search every frame
             _ladderSearchTimer -= Time.deltaTime;
@@ -2541,39 +2570,26 @@ namespace StraftatBots
                 }
             }
 
-            // Method 2: search by name — ladder objects often have "ladder" in their name
+            // Method 2: nearest from the per-map cache (tag/name ladders off the layer)
             if (best == null)
             {
-                foreach (var col in Object.FindObjectsOfType<Collider>())
+                for (int i = 0; i < _mapLadderColliders.Length; i++)
                 {
+                    var col = _mapLadderColliders[i];
                     if (col == null) continue;
-                    string name = col.gameObject.name.ToLower();
-                    string tag = "";
-                    try { tag = col.tag; } catch { }
-
-                    bool isLadder = tag == "Ladder/Metal" || tag == "Ladder/Chain"
-                        || name.Contains("ladder");
-
-                    if (!isLadder) continue;
-
                     float d = Vector3.Distance(transform.position, col.ClosestPoint(transform.position));
                     if (d < radius && d < bestDist) { bestDist = d; best = col; }
                 }
             }
 
-            if (best != null)
+            if (best != null && best != _cachedLadder)
             {
                 _cachedLadder = best;
-                _mapHasLadders = true;
-                _mapLadderScanned = true;
                 Plugin.Log.LogInfo($"[{BotName}] Found ladder: {best.gameObject.name} tag={best.tag} layer={best.gameObject.layer} dist={bestDist:F1}");
             }
-            else if (radius >= 50f)
+            else if (best != null)
             {
-                // Large radius search found nothing — mark map as ladderless
-                _mapHasLadders = false;
-                _mapLadderScanned = true;
-                Plugin.Log.LogInfo($"[{BotName}] No ladders found on this map");
+                _cachedLadder = best;
             }
 
             return best;
@@ -2585,6 +2601,7 @@ namespace StraftatBots
             _mapHasLadders = true;
             _mapLadderScanned = false;
             _cachedLadder = null;
+            _mapLadderColliders = System.Array.Empty<Collider>();
         }
 
         private Vector3 TryAngledDirections(Vector3 dir, int wallMask)
@@ -2899,6 +2916,54 @@ namespace StraftatBots
             public bool CrouchClear;   // 0.4m — passable while crouching
         }
 
+        /// <summary>The chosen route wants this descent: the current or next waypoint is
+        /// a REAL node meaningfully below the bot, roughly in the step direction. The
+        /// void-lip FINAL SAFETY refusing these made bots ping-pong at every lip their
+        /// own path crossed (block -> clear path -> repath to the same route -> block).
+        /// Waypoints are actual ground positions, so stepping off toward one is not a
+        /// void fall — the game has no fall damage.</summary>
+        private bool RouteAuthorizesDrop(Vector3 horizMove)
+        {
+            if (_graphPath == null || _graphPathIndex >= _graphPath.Count) return false;
+            Vector3 myPos = transform.position;
+            Vector3 dir = new Vector3(horizMove.x, 0f, horizMove.z);
+            if (dir.sqrMagnitude < 0.0001f) return false;
+            dir.Normalize();
+            int last = Mathf.Min(_graphPathIndex + 1, _graphPath.Count - 1);
+            for (int i = _graphPathIndex; i <= last; i++)
+            {
+                var node = _graphPath[i];
+                if (node == null) continue;
+                Vector3 to = node.Position - myPos;
+                float drop = -to.y;
+                Vector3 flat = new Vector3(to.x, 0f, to.z);
+                if (drop > 0.8f && drop < 25f
+                    && flat.magnitude < 14f
+                    && (flat.sqrMagnitude < 0.25f || Vector3.Dot(flat.normalized, dir) > 0.5f))
+                    return true;
+            }
+            return false;
+        }
+
+        private float _lowCeilingConfirmTimer;
+
+        /// <summary>True only for a REAL low ceiling just ahead: the head ray blocked
+        /// close-in (0.9m, not the default 1.5m probe), a second ray near the actual
+        /// head top ALSO blocked (a chest-height railing/bar/prop only blocks one),
+        /// and the condition held for ~0.2s (kills one-frame flickers). Bots were
+        /// crouch-walking through normal play off railings probed 1.5m out.</summary>
+        private bool ConfirmLowCeiling(Vector3 dir)
+        {
+            var obs = CheckObstructions(dir, 0.9f);
+            bool candidate = obs.CrouchClear && obs.HeadBlocked && !obs.WaistBlocked
+                && Physics.Raycast(transform.position + Vector3.up * 1.85f, dir, 0.9f,
+                    WALL_MASK, QueryTriggerInteraction.Ignore);
+            if (!candidate) { _lowCeilingConfirmTimer = 0f; return false; }
+            if (_isCrouching) return true; // already committed — keep holding through the passage
+            _lowCeilingConfirmTimer += Time.deltaTime;
+            return _lowCeilingConfirmTimer >= 0.2f;
+        }
+
         private ObstructionResult CheckObstructions(Vector3 dir, float dist = 1.5f)
         {
             var r = new ObstructionResult();
@@ -2974,7 +3039,7 @@ namespace StraftatBots
                 && _intentionalJumpTimer <= 0f)
             {
                 var obs = CheckObstructions(dir);
-                if (obs.CrouchClear && obs.HeadBlocked && !obs.WaistBlocked)
+                if (ConfirmLowCeiling(dir))
                 {
                     if (!_isCrouching) StartCrouch(0.9f);
                     else _crouchTimer = Mathf.Max(_crouchTimer, 0.4f); // keep it held while still blocked

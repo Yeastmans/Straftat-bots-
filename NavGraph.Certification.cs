@@ -59,7 +59,10 @@ namespace StraftatBots
 
     public partial class NavGraph
     {
-        private const int BOT_VALIDATION_SUCCESSES_TO_TRUST = 3;
+        // 2 clean traversals trust an edge (was 3 — the single biggest reason the
+        // Confirmation bar crawled). Learn-in-play keeps counting traversals in Play
+        // mode, so marginal edges still accumulate evidence after training ends.
+        private const int BOT_VALIDATION_SUCCESSES_TO_TRUST = 2;
         private const int BOT_VALIDATION_FAILURES_TO_DEMO = 3;
         private const int MIN_PLAY_NODES = 200;
         private MapCertificationReport _cachedCertification;
@@ -587,7 +590,8 @@ namespace StraftatBots
                 if (candidate == null || candidate.Count <= 1) return;
                 if (PathHasBadEdges(candidate)) return;
                 float score = ScoreValidationPath(candidate, pos);
-                if (IsWeaponLocationLabel(routeLabel)) score += 25f;
+                if (routeLabel == "PendingEdge") score += 30f; // stage-3 work itself — beats everything while any remain
+                else if (IsWeaponLocationLabel(routeLabel)) score += 25f;
                 else if (routeLabel == "Spawn") score += 4f;
                 float endDist = Vector3.Distance(candidate[candidate.Count - 1].Position, pos);
                 if (requireTargetClose && endDist > 6f) return;
@@ -624,6 +628,37 @@ namespace StraftatBots
                 if (node == null) continue;
                 Consider(node.Position, loc.label, requireTargetClose: true);
                 considered++;
+            }
+
+            // Target PENDING SPECIAL EDGES directly — they are the actual stage-3 work.
+            // The old flow only routed to weapons/spawns and hoped the path happened to
+            // cross candidates, which is why Confirmation crawled on maps whose pending
+            // jumps sit off the weapon routes. Nearest few, start offset by botId so
+            // eight bots spread across different edges instead of piling onto one.
+            var pending = new List<KeyValuePair<float, int>>();
+            for (int ei = 0; ei < Edges.Count; ei++)
+            {
+                var edge = Edges[ei];
+                if (edge == null || edge.Confidence <= 0f) continue;
+                if (!IsSpecialTraversal(edge) || IsTrustedForPlay(edge) || IsBadForPlay(edge)) continue;
+                var toNode = GetNodeById(edge.To);
+                if (toNode == null || toNode.Confidence <= 0f) continue;
+                float d2 = (toNode.Position - startPos).sqrMagnitude;
+                if (d2 > 100f * 100f) continue;
+                pending.Add(new KeyValuePair<float, int>(d2, ei));
+            }
+            if (pending.Count > 0)
+            {
+                pending.Sort((a, b) => a.Key.CompareTo(b.Key));
+                int spread = Mathf.Min(pending.Count, 4);
+                int start = Mathf.Abs(botId) % spread;
+                int tried = 0;
+                for (int i = start; i < pending.Count && tried < 3; i++, tried++)
+                {
+                    var toNode = GetNodeById(Edges[pending[i].Value].To);
+                    if (toNode != null)
+                        Consider(toNode.Position, "PendingEdge", requireTargetClose: true);
+                }
             }
 
             var frontier = FindFrontierNode(startPos, 8f);
