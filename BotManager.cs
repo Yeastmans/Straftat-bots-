@@ -1567,6 +1567,14 @@ namespace StraftatBots
         private static void PrepareCosmeticInstance(GameObject obj, Transform hatPos, bool isHat, int visualLayer)
         {
             if (obj == null || hatPos == null) return;
+            // ROOT CAUSE of invisible hats: hat prefabs carry a FishNet NetworkObject
+            // (verified in PF_BeerHat_00.prefab); FishNet deactivates an instantiated
+            // but never-spawned NetworkObject moments later — the probe showed every
+            // hat flip to activeInHierarchy=False within 0.35s of each dress while
+            // NetworkObject-less cigs on the same pivot survived. The game's own
+            // preview does exactly this (AboubiPreview.ChangeDress).
+            var netObj = obj.GetComponent<FishNet.Object.NetworkObject>();
+            if (netObj != null) Object.Destroy(netObj);
             if (obj.transform.parent != hatPos)
                 obj.transform.SetParent(hatPos, false);
             // Keep authored prefab local offsets/rotation/scale — many hats rely on these.

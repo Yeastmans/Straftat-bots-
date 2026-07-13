@@ -854,6 +854,30 @@ namespace StraftatBots
         // Mirrors FirstPersonController.dmgZoneTimer — next time a DamageZone may tick us.
         private float _nextDmgZoneTickTime;
 
+        private float _envZonePollTimer;
+        private static readonly Collider[] _envZoneHits = new Collider[32];
+
+        /// <summary>Overlap the CC capsule against trigger volumes and feed the same
+        /// TryEnvironmentKill the callbacks use. A CharacterController only generates
+        /// trigger callbacks while it MOVES, and OnTriggerEnter never fires when the
+        /// bot spawns or comes to rest inside a volume — a bot standing in kill water
+        /// took no damage. Polling closes that gap on every map.</summary>
+        private void PollEnvironmentZones()
+        {
+            if (IsDead || _playerHealth == null || _playerHealth.isKilled || _cc == null || !_cc.enabled) return;
+            Vector3 center = transform.position + _cc.center;
+            float half = Mathf.Max(0f, _cc.height * 0.5f - _cc.radius);
+            int n = Physics.OverlapCapsuleNonAlloc(center + Vector3.up * half, center - Vector3.up * half,
+                _cc.radius, _envZoneHits, ~0, QueryTriggerInteraction.Collide);
+            for (int i = 0; i < n; i++)
+            {
+                var col = _envZoneHits[i];
+                if (col == null || !col.isTrigger) continue;
+                TryEnvironmentKill(col);
+                if (IsDead || _playerHealth == null || _playerHealth.isKilled) return;
+            }
+        }
+
         private void TryEnvironmentKill(Collider col)
         {
             bool isKillZone = col.CompareTag("Killz");
@@ -1032,6 +1056,15 @@ namespace StraftatBots
                 Die(null);
                 return;
             }
+            // Kill-zone poll — CC trigger callbacks miss stationary bots (see PollEnvironmentZones)
+            _envZonePollTimer -= Time.deltaTime;
+            if (_envZonePollTimer <= 0f)
+            {
+                _envZonePollTimer = 0.15f;
+                PollEnvironmentZones();
+                if (IsDead) return;
+            }
+
             // Hard kill — if somehow still alive past -100, force disable
             if (transform.position.y < -100f && State != BotState.Dead)
             {
