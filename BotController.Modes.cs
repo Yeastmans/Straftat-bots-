@@ -247,6 +247,11 @@ namespace StraftatBots
             return true;
         }
 
+        // Closest the bot has been to its current wander target — lets the change
+        // timer extend while genuine progress continues instead of re-picking
+        // (and often reversing) mid-route.
+        private float _wanderBestDist = float.MaxValue;
+
         private bool TryAssignExploreTarget(Vector3 target, float commitment, bool requireRoute)
         {
             if (target == Vector3.zero) return false;
@@ -256,6 +261,7 @@ namespace StraftatBots
                 _wanderTarget = routeEnd;
                 _hasWanderTarget = true;
                 _wanderChangeTimer = commitment;
+                _wanderBestDist = HorizontalDist(transform.position, routeEnd);
                 return true;
             }
 
@@ -272,6 +278,7 @@ namespace StraftatBots
             _wanderTarget = target;
             _hasWanderTarget = true;
             _wanderChangeTimer = commitment;
+            _wanderBestDist = flatDist;
             SwitchPathSource(PathSource.ExploreBuildRoute);
             return true;
         }
@@ -864,6 +871,19 @@ namespace StraftatBots
                 _repathTimer = 0f;
             }
 
+            // Timer expiry must not abandon a run that is WORKING — re-picking mid-route
+            // is a direction flip the player sees as ping-pong. While the bot keeps
+            // setting new closest-distance records toward the target, extend.
+            if (_hasWanderTarget && _wanderChangeTimer <= 0f && _wanderTarget != Vector3.zero)
+            {
+                float distNow = HorizontalDist(transform.position, _wanderTarget);
+                if (distNow < _wanderBestDist - 2f && _stuckTimer < 1f)
+                {
+                    _wanderBestDist = distNow;
+                    _wanderChangeTimer = 6f;
+                }
+            }
+
             if (!_hasWanderTarget || HorizontalDist(transform.position, _wanderTarget) < 3f
                 || _wanderChangeTimer <= 0f || _wanderTarget == Vector3.zero)
             {
@@ -911,7 +931,8 @@ namespace StraftatBots
                     // by the picker again, so bots physically cannot re-cover old ground.
                     // Recently visited/assigned spots are rejected for 45s as retry backoff.
                     if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 1
-                        && BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1Cell, out Vector3 unwalked))
+                        && BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1Cell, out Vector3 unwalked,
+                            heading: _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward))
                     {
                         if (TryAssignExploreTarget(unwalked, Random.Range(10f, 16f) * commitmentMultiplier, requireRoute: false))
                         {

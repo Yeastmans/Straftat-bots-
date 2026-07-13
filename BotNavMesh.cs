@@ -866,14 +866,23 @@ namespace StraftatBots
         /// A walked cell can never be returned again, so bots physically cannot loop
         /// over ground they already covered. False when coverage is (near-)complete.
         /// </summary>
-        public static bool TryGetUnwalkedCellTarget(Vector3 nearPos, System.Func<Vector3, bool> reject, out Vector3 target)
+        public static bool TryGetUnwalkedCellTarget(Vector3 nearPos, System.Func<Vector3, bool> reject, out Vector3 target,
+            Vector3 heading = default)
         {
             target = Vector3.zero;
             if (!_baked || _reachableList.Count == 0) return false;
             if (_walkedCells.Count >= _reachableCells.Count) return false;
 
-            Vector3 best = Vector3.zero;
-            float bestDistSqr = float.MaxValue;
+            // Heading bias: prefer the nearest unwalked cell roughly AHEAD of the bot.
+            // Pure nearest-of-random-sample made consecutive picks alternate direction
+            // freely — the visible stage-1 ping-pong. Falling back to nearest-any only
+            // when the forward cone has nothing keeps coverage complete.
+            Vector3 fwd = new Vector3(heading.x, 0f, heading.z);
+            bool hasHeading = fwd.sqrMagnitude > 0.01f;
+            if (hasHeading) fwd.Normalize();
+
+            Vector3 best = Vector3.zero, bestAligned = Vector3.zero;
+            float bestDistSqr = float.MaxValue, bestAlignedSqr = float.MaxValue;
             int found = 0;
             int attempts = Mathf.Min(150, _reachableList.Count);
             for (int i = 0; i < attempts && found < 16; i++)
@@ -887,9 +896,18 @@ namespace StraftatBots
                 if (reject != null && reject(pos)) continue;
                 found++;
                 if (distSqr < bestDistSqr) { bestDistSqr = distSqr; best = pos; }
+                if (hasHeading && distSqr < bestAlignedSqr)
+                {
+                    float inv = 1f / Mathf.Max(0.001f, Mathf.Sqrt(distSqr));
+                    if (d.x * inv * fwd.x + d.z * inv * fwd.z > 0.25f)
+                    {
+                        bestAlignedSqr = distSqr;
+                        bestAligned = pos;
+                    }
+                }
             }
             if (found == 0) return false;
-            target = best;
+            target = bestAlignedSqr < float.MaxValue ? bestAligned : best;
             return true;
         }
 
