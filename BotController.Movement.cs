@@ -634,14 +634,20 @@ namespace StraftatBots
 
                     Vector3 zoneMove = _zoneForce;
                     zoneMove.y = _verticalVelocity;
-                    // Decay horizontal zone force slightly — matches player's moveDirection friction
-                    _zoneForce *= Mathf.Max(0f, 1f - 2f * Time.deltaTime);
-                    _zoneForceDuration -= Time.deltaTime;
-                    if (_zoneForceDuration <= 0f)
+                    // FPC's moveDirection has NO air friction — a launched player carries full
+                    // horizontal momentum until landing. Decaying mid-flight made bots undershoot
+                    // pads, fall back, and re-trigger them. Friction + countdown tick on ground only;
+                    // the landedAfterLaunch check above ends the ride.
+                    if (_cc.isGrounded)
                     {
-                        _zoneForce = Vector3.zero;
-                        _zoneForceDuration = 0f;
-                        _zoneLaunchInAir = false;
+                        _zoneForce *= Mathf.Max(0f, 1f - 2f * Time.deltaTime);
+                        _zoneForceDuration -= Time.deltaTime;
+                        if (_zoneForceDuration <= 0f)
+                        {
+                            _zoneForce = Vector3.zero;
+                            _zoneForceDuration = 0f;
+                            _zoneLaunchInAir = false;
+                        }
                     }
                     float zmSqr = zoneMove.x * zoneMove.x + zoneMove.z * zoneMove.z;
                     if (zmSqr > 0.0001f)
@@ -2317,7 +2323,8 @@ namespace StraftatBots
                 if (horizMove.sqrMagnitude > 0.01f)
                 {
                     float voidLookahead = Mathf.Clamp(horizMove.magnitude * 0.16f, 0.8f, 2.0f);
-                    if (!HasGroundFootprintAhead(horizMove, voidLookahead))
+                    if (!HasGroundFootprintAhead(horizMove, voidLookahead)
+                        && !IsImpulseZoneAhead(horizMove, voidLookahead))
                     {
                         if (TryGetSafeEdgeEscapeDir(horizMove, out Vector3 escapeDir))
                         {
@@ -2442,7 +2449,7 @@ namespace StraftatBots
                 Vector3 hm = new Vector3(move.x, 0, move.z);
                 if (hm.sqrMagnitude > 0.01f)
                 {
-                    if (!HasGroundFootprintAhead(hm, 0.8f))
+                    if (!HasGroundFootprintAhead(hm, 0.8f) && !IsImpulseZoneAhead(hm, 0.8f))
                     {
                         if (TryGetSafeEdgeEscapeDir(hm, out Vector3 escapeDir))
                         {

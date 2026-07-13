@@ -1019,7 +1019,26 @@ namespace StraftatBots
                 _perfSw.Stop();
                 BotPerfStats.AddBotUpdate(_perfSw.Elapsed.TotalMilliseconds);
             }
+
+            // One line per state change — cheap, and rapid A->B->A cycles in the log
+            // are exactly the signature needed to diagnose reported ping-ponging
+            // (e.g. after running out of ammo).
+            if (State != _lastLoggedState)
+            {
+                try
+                {
+                    string held = _heldWeapon != null
+                        ? $"{(_heldBehaviour != null ? _heldBehaviour.weaponName : "?")} ammo={_heldWeapon.currentAmmo}"
+                        : "none";
+                    string target = _targetItem != null ? $" target={_targetItem.weaponName}" : "";
+                    Plugin.Log.LogInfo($"[{BotName}] state {_lastLoggedState}->{State} held={held}{target}");
+                }
+                catch { }
+                _lastLoggedState = State;
+            }
         }
+
+        private BotState _lastLoggedState = BotState.FindWeapon;
 
         private void UpdateInternal()
         {
@@ -1047,7 +1066,10 @@ namespace StraftatBots
             {
                 // Feed the fall-death heatmap: the mistake happened at the last solid
                 // ground, not down in the void — path scoring avoids that lip now.
-                try { NavGraph.Instance?.ReportFallDeath(_lastGroundedPos); } catch { }
+                // EXCEPT zone launches: the last ground is the PAD itself, and blaming it
+                // taught the graph to route around impulse zones entirely.
+                if (!_zoneLaunchInAir)
+                    try { NavGraph.Instance?.ReportFallDeath(_lastGroundedPos); } catch { }
                 if (_playerHealth != null)
                 {
                     // Use the game's RPCs so all clients see the death properly
@@ -2918,6 +2940,49 @@ namespace StraftatBots
             return zone != null ? zone : col.GetComponentInParent<T>();
         }
 
+        // Map impulse-zone colliders, shared by all bots, rescanned per map / every 30s.
+        private static Collider[] _mapImpulseZones = System.Array.Empty<Collider>();
+        private static string _impulseZoneScene;
+        private static float _impulseZoneScanTime = -999f;
+
+        private static void RefreshImpulseZoneCache()
+        {
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            if (scene == _impulseZoneScene && Time.time - _impulseZoneScanTime < 30f) return;
+            _impulseZoneScene = scene;
+            _impulseZoneScanTime = Time.time;
+            var zones = Object.FindObjectsOfType<ImpulseZone>();
+            var cols = new System.Collections.Generic.List<Collider>(zones.Length);
+            foreach (var z in zones)
+            {
+                if (z == null) continue;
+                var c = z.GetComponent<Collider>();
+                if (c != null) cols.Add(c);
+            }
+            _mapImpulseZones = cols.ToArray();
+        }
+
+        /// <summary>A pad/launch zone sits at or just past the bot's next step. Walking
+        /// "off the lip" here is intended — the zone flings. The void safety uses this
+        /// to allow pad approaches it would otherwise refuse (pads live on ledges, so
+        /// bots visibly avoided every impulse zone).</summary>
+        private bool IsImpulseZoneAhead(Vector3 horizDir, float dist)
+        {
+            RefreshImpulseZoneCache();
+            if (_mapImpulseZones.Length == 0) return false;
+            Vector3 pos = transform.position;
+            Vector3 flat = new Vector3(horizDir.x, 0f, horizDir.z);
+            Vector3 probe = flat.sqrMagnitude > 0.0001f ? pos + flat.normalized * (dist + 0.6f) : pos;
+            for (int i = 0; i < _mapImpulseZones.Length; i++)
+            {
+                var c = _mapImpulseZones[i];
+                if (c == null) continue;
+                if ((c.ClosestPoint(probe) - probe).sqrMagnitude < 1.44f) return true;
+                if ((c.ClosestPoint(pos) - pos).sqrMagnitude < 1.44f) return true;
+            }
+            return false;
+        }
+
         private static float ReadGravityZoneMultiplier(GravityZone zone)
         {
             if (zone == null) return 1f;
@@ -3072,28 +3137,23 @@ namespace StraftatBots
 
             if (!_cc.isGrounded) _zoneLaunchInAir = true;
 
-            // Air-steer toward the current path target while the pad/zone carries us, so a
-            // vertical jump-pad actually moves the bot toward where it's going instead of
-            // launching straight up and dropping back onto the pad. Pad force still dominates;
-            // this only adds the bot's normal air-control on top.
-            Vector3 steer = Vector3.zero;
-            if (!_cc.isGrounded && _graphPath != null && _graphPath.Count > 0 && _graphPathIndex < _graphPath.Count)
-            {
-                Vector3 toTarget = _graphPath[_graphPathIndex].Position - transform.position;
-                toTarget.y = 0f;
-                if (toTarget.sqrMagnitude > 0.25f)
-                    steer = toTarget.normalized * _airSpeed;
-            }
-
-            Vector3 zoneMove = _zoneForce + steer;
+            // NO air-steer during the launch — the pad's force is the whole trajectory,
+            // exactly like a launched player who isn't touching the keys. Bots visibly
+            // air-strafing out of pads (fighting the arc) was the complaint this fixes.
+            Vector3 zoneMove = _zoneForce;
             zoneMove.y = _verticalVelocity;
-            _zoneForce *= Mathf.Max(0f, 1f - 2f * Time.deltaTime);
-            _zoneForceDuration -= Time.deltaTime;
-            if (_zoneForceDuration <= 0f)
+            // No air friction on launch momentum (matches FPC.moveDirection); friction and
+            // the countdown tick on ground only — landedAfterLaunch above ends the ride.
+            if (_cc.isGrounded)
             {
-                _zoneForce = Vector3.zero;
-                _zoneForceDuration = 0f;
-                _zoneLaunchInAir = false;
+                _zoneForce *= Mathf.Max(0f, 1f - 2f * Time.deltaTime);
+                _zoneForceDuration -= Time.deltaTime;
+                if (_zoneForceDuration <= 0f)
+                {
+                    _zoneForce = Vector3.zero;
+                    _zoneForceDuration = 0f;
+                    _zoneLaunchInAir = false;
+                }
             }
 
             float zmSqr = zoneMove.x * zoneMove.x + zoneMove.z * zoneMove.z;

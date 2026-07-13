@@ -89,6 +89,20 @@ namespace StraftatBots
         private static float _lastProgressTime;
         private static bool _coverageStallWarning;
 
+        /// <summary>Play-mode overlay: ONLY the untrained-map popup. DrawAll is gated
+        /// to Training mode by TrainingUIBehaviour, which made the popup unreachable —
+        /// it internally requires Mode == Play (it warns players heading into a match
+        /// on a map with no learned data).</summary>
+        public static void DrawPlayModePopups()
+        {
+            if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Play) return;
+            // Skip all work (incl. the certification report) once the popup is
+            // resolved for the current map.
+            if (NavGraph.Instance.CurrentMap == _lastSeenMap && _untrainedWarnDismissed) return;
+            InitStyles();
+            DrawUntrainedMapPopup(NavGraph.Instance.GetCertificationReport());
+        }
+
         public static void DrawAll()
         {
             InitStyles();
@@ -331,7 +345,7 @@ namespace StraftatBots
             }
             if (_untrainedWarnDismissed || string.IsNullOrEmpty(curMap) || cert == null) return;
             if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Play) return;
-            if (cert.ActiveNodes >= 30) return; // has real learned data — not "untrained"
+            if (cert.ActiveNodes >= 30) { _untrainedWarnDismissed = true; return; } // trained — settle so Play mode stops re-checking
 
             float w = 430f, h = 100f;
             float px = (Screen.width - w) * 0.5f, py = 56f;
@@ -356,7 +370,7 @@ namespace StraftatBots
                 _untrainedWarnDismissed = true;
                 Plugin.Log.LogInfo("[Training] Untrained-map popup: training started at stage 1");
             }
-            if (GUI.Button(new Rect(px + 160, py + h - 32, 100, 24), "Ignore", _buttonStyle))
+            if (GUI.Button(new Rect(px + 160, py + h - 32, 100, 24), "Keep Playing", _buttonStyle))
                 _untrainedWarnDismissed = true;
         }
 

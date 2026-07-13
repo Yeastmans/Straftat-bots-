@@ -12,8 +12,14 @@ namespace StraftatBots
         {
             try
             {
-                // Only show in Training mode
-                if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Training) return;
+                if (NavGraph.Instance == null) return;
+                if (NavGraph.Instance.Mode != NavMode.Training)
+                {
+                    // Play mode still gets the untrained-map popup (Start Training /
+                    // Keep Playing) — it was unreachable behind the Training-only gate.
+                    TrainingUI.DrawPlayModePopups();
+                    return;
+                }
                 TrainingUI.DrawAll();
             }
             catch (System.Exception e)
