@@ -83,6 +83,7 @@ namespace StraftatBots
         // Untrained-map popup state (Play mode, per map)
         private static string _lastSeenMap;
         private static bool _untrainedWarnDismissed;
+        private static bool _untrainedEvaluated;
 
         // Stage-1 coverage stall tracking
         private static int _lastProgressStat = -1;
@@ -342,10 +343,20 @@ namespace StraftatBots
             {
                 _lastSeenMap = curMap;
                 _untrainedWarnDismissed = false;
+                _untrainedEvaluated = false;
             }
             if (_untrainedWarnDismissed || string.IsNullOrEmpty(curMap) || cert == null) return;
             if (NavGraph.Instance == null || NavGraph.Instance.Mode != NavMode.Play) return;
-            if (cert.ActiveNodes >= 30) { _untrainedWarnDismissed = true; return; } // trained — settle so Play mode stops re-checking
+            // Trained-or-not is decided ONCE per map, right after its data loads
+            // (CurrentMap is set by LoadForMap, so cert reflects this map's data).
+            // A map that STARTS play untrained keeps the prompt up until the user
+            // answers — bots learning nodes during play used to auto-dismiss it
+            // mid-round before anyone could click.
+            if (!_untrainedEvaluated)
+            {
+                _untrainedEvaluated = true;
+                if (cert.ActiveNodes >= 30) { _untrainedWarnDismissed = true; return; }
+            }
 
             float w = 430f, h = 100f;
             float px = (Screen.width - w) * 0.5f, py = 56f;
