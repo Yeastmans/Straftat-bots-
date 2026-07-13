@@ -234,18 +234,13 @@ namespace StraftatBots
                 bool isMapLocation = (nf & NodeVizFlags.MapLocation) != 0;
                 bool isPatrolPoint = (nf & NodeVizFlags.PatrolPoint) != 0;
                 bool isTeleporter = (nf & NodeVizFlags.Teleporter) != 0;
-                bool isBadNode = (nf & NodeVizFlags.Bad) != 0;
+                // (Bad nodes used to draw pulsing red X markers — removed as noise;
+                // they now render as whatever node type they otherwise are.)
 
                 // Color by node type — most specific wins
                 Color col;
                 float s;
-                if (isBadNode)
-                {
-                    float pulse = 0.65f + 0.35f * Mathf.Sin(Time.time * 5f);
-                    col = new Color(1f, 0.05f, 0.02f, Mathf.Min(alpha * 2f * pulse, 1f));
-                    s = 0.55f;
-                }
-                else if (isTeleporter)
+                if (isTeleporter)
                 {
                     col = new Color(1f, 0.4f, 0.9f, Mathf.Min(alpha * 1.8f, 1f)); // PINK = teleporter
                     s = 0.5f;
@@ -305,14 +300,7 @@ namespace StraftatBots
                 Vector3 p = node.Position + Vector3.up * 0.1f;
 
                 // Special nodes: 3D shapes to stand out from walk nodes
-                if (isBadNode)
-                {
-                    GL.Vertex3(p.x - s, p.y, p.z - s); GL.Vertex3(p.x + s, p.y, p.z + s);
-                    GL.Vertex3(p.x + s, p.y, p.z - s); GL.Vertex3(p.x - s, p.y, p.z + s);
-                    GL.Vertex3(p.x, p.y, p.z); GL.Vertex3(p.x, p.y + 1.4f, p.z);
-                    GL.Vertex3(p.x - s * 0.6f, p.y + 1.1f, p.z); GL.Vertex3(p.x + s * 0.6f, p.y + 1.1f, p.z);
-                }
-                else if (isTeleporter)
+                if (isTeleporter)
                 {
                     // Pink circle at ground level + vertical ring
                     float r = 0.6f;
@@ -639,17 +627,8 @@ namespace StraftatBots
                     GL.End();
                 }
 
-                // Stuck (never while climbing — ladder progress isn't stuck)
-                if (bot.DbgStuckTimer > 1f && !bot.DbgOnLadder)
-                {
-                    GL.Begin(GL.LINES);
-                    float pulse = Mathf.PingPong(Time.time * 3f, 1f);
-                    GL.Color(new Color(1f, 0f, 0f, 0.5f + pulse * 0.5f));
-                    float xs = 0.5f; Vector3 xp = headPos + Vector3.up * 0.5f;
-                    GL.Vertex3(xp.x - xs, xp.y - xs, xp.z); GL.Vertex3(xp.x + xs, xp.y + xs, xp.z);
-                    GL.Vertex3(xp.x + xs, xp.y - xs, xp.z); GL.Vertex3(xp.x - xs, xp.y + xs, xp.z);
-                    GL.End();
-                }
+                // (Stuck used to draw a red X here — removed as noise; the [STUCK] text
+                // tag on the bot label carries the same information.)
             }
         }
 
