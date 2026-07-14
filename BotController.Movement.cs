@@ -2495,13 +2495,16 @@ namespace StraftatBots
             Vector3 move = dir * targetSpeed * _currentHorizInput;
             move.y = _verticalVelocity;
 
-            // FINAL SAFETY: void check before move
+            // FINAL SAFETY: void check before move. Lookahead scales with speed like
+            // MoveToward's — the old fixed 0.8m gave a sprinting bot ~0.07s of margin,
+            // which is how DirectTacticalRoute bots still ran off map edges.
             if (grounded && _intentionalJumpTimer <= 0f && !_onLadder)
             {
                 Vector3 hm = new Vector3(move.x, 0, move.z);
                 if (hm.sqrMagnitude > 0.01f)
                 {
-                    if (!HasGroundFootprintAhead(hm, 0.8f) && !IsImpulseZoneAhead(hm, 0.8f))
+                    float voidLookahead = Mathf.Clamp(hm.magnitude * 0.16f, 0.8f, 2.0f);
+                    if (!HasGroundFootprintAhead(hm, voidLookahead) && !IsImpulseZoneAhead(hm, voidLookahead))
                     {
                         if (TryGetSafeEdgeEscapeDir(hm, out Vector3 escapeDir))
                         {
@@ -3127,8 +3130,27 @@ namespace StraftatBots
                     float hDist = new Vector3(toTarget.x, 0, toTarget.z).magnitude;
                     if (hDist > 1f && hDist < Plugin.GetMaxJumpDist())
                     {
+                        // Far-side landing probe: a gap is only jumpable if ground exists
+                        // near where the jump comes down. The old check only confirmed the
+                        // MIDDLE was empty, so bots gap-jumped map rims into the void — and
+                        // the >5m sprint-approach below suppresses the lip safety while
+                        // doing it. Falling short of a real landing stays possible (that's
+                        // how training discovers jump edges); pure void dives don't.
+                        Vector3 far = transform.position + dir * hDist;
+                        bool landingExists =
+                            (Physics.Raycast(far + Vector3.up * 1.5f, Vector3.down, out RaycastHit landHit, 28f,
+                                GROUND_MASK, QueryTriggerInteraction.Ignore)
+                             && landHit.point.y > transform.position.y - 25f)
+                            || (Physics.Raycast(target + Vector3.up * 1.5f, Vector3.down, out RaycastHit tgtHit, 28f,
+                                GROUND_MASK, QueryTriggerInteraction.Ignore)
+                             && tgtHit.point.y > transform.position.y - 25f);
+
                         Vector3 mid = transform.position + dir * (hDist * 0.5f) + Vector3.up * 0.5f;
-                        if (!Physics.Raycast(mid, Vector3.down, 3f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                        if (!landingExists)
+                        {
+                            dir = TryAngledDirections(dir, wallMask);
+                        }
+                        else if (!Physics.Raycast(mid, Vector3.down, 3f, GROUND_MASK, QueryTriggerInteraction.Ignore))
                         {
                             // Long jumps (>5m): build sprint speed before jumping
                             if (hDist > 5f && _currentHorizInput < 0.8f)

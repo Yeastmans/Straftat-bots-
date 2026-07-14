@@ -881,8 +881,12 @@ namespace StraftatBots
             bool hasHeading = fwd.sqrMagnitude > 0.01f;
             if (hasHeading) fwd.Normalize();
 
-            Vector3 best = Vector3.zero, bestAligned = Vector3.zero;
-            float bestDistSqr = float.MaxValue, bestAlignedSqr = float.MaxValue;
+            // Three preference tiers: roughly AHEAD (dot>0.25) beats any SIDE turn
+            // (dot>-0.35) beats a hard REVERSAL. The old two-tier version fell back
+            // from "ahead" straight to nearest-any — usually a cell directly behind
+            // the bot, so an empty forward cone meant an instant 180 (ping-pong).
+            Vector3 best = Vector3.zero, bestAligned = Vector3.zero, bestSide = Vector3.zero;
+            float bestDistSqr = float.MaxValue, bestAlignedSqr = float.MaxValue, bestSideSqr = float.MaxValue;
             int found = 0;
             int attempts = Mathf.Min(150, _reachableList.Count);
             for (int i = 0; i < attempts && found < 16; i++)
@@ -896,18 +900,26 @@ namespace StraftatBots
                 if (reject != null && reject(pos)) continue;
                 found++;
                 if (distSqr < bestDistSqr) { bestDistSqr = distSqr; best = pos; }
-                if (hasHeading && distSqr < bestAlignedSqr)
+                if (hasHeading)
                 {
                     float inv = 1f / Mathf.Max(0.001f, Mathf.Sqrt(distSqr));
-                    if (d.x * inv * fwd.x + d.z * inv * fwd.z > 0.25f)
+                    float dot = d.x * inv * fwd.x + d.z * inv * fwd.z;
+                    if (dot > 0.25f && distSqr < bestAlignedSqr)
                     {
                         bestAlignedSqr = distSqr;
                         bestAligned = pos;
                     }
+                    else if (dot > -0.35f && distSqr < bestSideSqr)
+                    {
+                        bestSideSqr = distSqr;
+                        bestSide = pos;
+                    }
                 }
             }
             if (found == 0) return false;
-            target = bestAlignedSqr < float.MaxValue ? bestAligned : best;
+            target = bestAlignedSqr < float.MaxValue ? bestAligned
+                : bestSideSqr < float.MaxValue ? bestSide
+                : best;
             return true;
         }
 

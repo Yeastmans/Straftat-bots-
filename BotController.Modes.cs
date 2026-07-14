@@ -50,6 +50,42 @@ namespace StraftatBots
             => IsRecentlyVisited(pos) || IsOtherBotTargetingNear(pos)
             || (NavGraph.Instance != null && NavGraph.Instance.FallDeathPenalty(pos) >= 1.6f);
 
+        // Breadcrumb trail: the GROUND the bot actually walked, sampled every 0.5s.
+        // RememberVisit only covers assigned TARGETS — the corridor walked between
+        // targets was unprotected, so the picker's nearest-unwalked fallback kept
+        // sending bots straight back down the lane they just swept (the visible
+        // stage-1 ping-pong). Cells near a fresh breadcrumb are rejected on the
+        // first pick pass; a second pass without the trail filter keeps dead-end
+        // corridors walkable back out.
+        private readonly List<Vector4> _walkTrail = new List<Vector4>(48);
+        private float _trailSampleTimer;
+
+        private void SampleWalkTrail()
+        {
+            _trailSampleTimer -= Time.deltaTime;
+            if (_trailSampleTimer > 0f || _cc == null || !_cc.isGrounded) return;
+            _trailSampleTimer = 0.5f;
+            Vector3 p = transform.position;
+            _walkTrail.Add(new Vector4(p.x, p.y, p.z, Time.time));
+            if (_walkTrail.Count > 48) _walkTrail.RemoveAt(0);
+        }
+
+        private bool IsOnRecentTrail(Vector3 pos)
+        {
+            float now = Time.time;
+            for (int i = _walkTrail.Count - 1; i >= 0; i--)
+            {
+                Vector4 v = _walkTrail[i];
+                if (now - v.w > 18f) { _walkTrail.RemoveAt(i); continue; }
+                float dx = pos.x - v.x, dz = pos.z - v.z;
+                if (dx * dx + dz * dz < 9f && Mathf.Abs(pos.y - v.y) < 3f) return true;
+            }
+            return false;
+        }
+
+        private bool RejectStage1CellOrTrail(Vector3 pos)
+            => RejectStage1Cell(pos) || IsOnRecentTrail(pos);
+
         // SmartExplore state machine — replaces random explore
         private ExploreState _exploreState = ExploreState.None;
         private float _exploreStateTimer;          // Time remaining in current state
@@ -803,6 +839,7 @@ namespace StraftatBots
         private void Wander()
         {
             _wanderChangeTimer -= Time.deltaTime;
+            SampleWalkTrail();
 
             // Track explored areas — record current grid cell every 2s
             _exploredCellTimer -= Time.deltaTime;
@@ -930,14 +967,22 @@ namespace StraftatBots
                     // target unwalked coverage cells; a walked cell can never be returned
                     // by the picker again, so bots physically cannot re-cover old ground.
                     // Recently visited/assigned spots are rejected for 45s as retry backoff.
-                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 1
-                        && BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1Cell, out Vector3 unwalked,
-                            heading: _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward))
+                    // Two passes: first also rejects cells on the bot's own recent walk
+                    // trail (no U-turn back down the lane just swept); if that starves the
+                    // pick (dead-end corridor), the plain pass lets the bot walk back out.
+                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 1)
                     {
-                        if (TryAssignExploreTarget(unwalked, Random.Range(10f, 16f) * commitmentMultiplier, requireRoute: false))
+                        Vector3 pickHeading = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+                        if (BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1CellOrTrail, out Vector3 unwalked,
+                                heading: pickHeading)
+                            || BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1Cell, out unwalked,
+                                heading: pickHeading))
                         {
-                            RememberVisit(unwalked); // backoff even if the run gets abandoned
-                            goto doneWanderPick;
+                            if (TryAssignExploreTarget(unwalked, Random.Range(10f, 16f) * commitmentMultiplier, requireRoute: false))
+                            {
+                                RememberVisit(unwalked); // backoff even if the run gets abandoned
+                                goto doneWanderPick;
+                            }
                         }
                     }
 
