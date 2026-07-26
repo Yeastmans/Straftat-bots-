@@ -1350,6 +1350,30 @@ namespace StraftatBots
             // Weapons only — 1 node each
             // First check if a node already exists nearby (from loaded graph), reuse it.
             // Only force-create if nothing exists within 3m.
+            //
+            // DEDUPE: a pickup spot carries BOTH an ItemBehaviour (the weapon) and the
+            // ItemSpawner that spawns it, at the same position — registering both gave
+            // two map locations per physical weapon (two "REACH THIS WEAPON" markers,
+            // and a doubled weapons-left count). One entry per spot: same graph node,
+            // or within 2m, means it's already registered.
+            var weaponNodeIds = new HashSet<int>();
+            var weaponSpots = new List<Vector3>();
+            bool AlreadyRegistered(NavNode n, Vector3 p)
+            {
+                if (n != null && weaponNodeIds.Contains(n.Id)) return true;
+                for (int i = 0; i < weaponSpots.Count; i++)
+                    if ((weaponSpots[i] - p).sqrMagnitude < 4f) return true;
+                return false;
+            }
+            void RegisterWeaponSpot(NavNode n, Vector3 p, string label)
+            {
+                n.Confidence = 1f;
+                n.VisitCount = Mathf.Max(n.VisitCount, 10);
+                weaponNodeIds.Add(n.Id);
+                weaponSpots.Add(p);
+                MapLocations.Add((p, label, n.Id));
+            }
+
             var items = UnityEngine.Object.FindObjectsOfType<ItemBehaviour>();
             foreach (var item in items)
             {
@@ -1359,12 +1383,9 @@ namespace StraftatBots
                 var node = FindNearestNode(wpos, 3f);
                 if (node == null)
                     node = AddPosition(wpos, isPlayer: true, force: true);
-                if (node != null)
-                {
-                    node.Confidence = 1f;
-                    node.VisitCount = Mathf.Max(node.VisitCount, 10);
-                    MapLocations.Add((item.transform.position, item.weaponName ?? item.name, node.Id));
-                }
+                if (node == null) continue;
+                if (AlreadyRegistered(node, item.transform.position)) continue;
+                RegisterWeaponSpot(node, item.transform.position, item.weaponName ?? item.name);
             }
 
             var spawners = UnityEngine.Object.FindObjectsOfType<ItemSpawner>();
@@ -1376,13 +1397,11 @@ namespace StraftatBots
                 var node = FindNearestNode(spos, 3f);
                 if (node == null)
                     node = AddPosition(spos, isPlayer: true, force: true);
-                if (node != null)
-                {
-                    node.Confidence = 1f;
-                    node.VisitCount = Mathf.Max(node.VisitCount, 10);
-                    MapLocations.Add((spawner.transform.position, "Spawner", node.Id));
-                }
+                if (node == null) continue;
+                if (AlreadyRegistered(node, spawner.transform.position)) continue;
+                RegisterWeaponSpot(node, spawner.transform.position, "Spawner");
             }
+            int weaponLocCount = weaponSpots.Count;
 
             // Item dispensers (slot machines) — count as weapon spawns
             var dispensers = UnityEngine.Object.FindObjectsOfType<ItemDispenser>();
@@ -1508,7 +1527,7 @@ namespace StraftatBots
             }
             if (staleTeleporterCount > 0) _dirty = true;
 
-            Plugin.Log.LogInfo($"[NavGraph] Registered {MapLocations.Count} map locations ({spawns.Length} spawns, {items.Length + spawners.Length} weapons, {dispenserCount} dispensers, {ladderNodeCount} ladders, {teleporterCount} teleporters, {staleTeleporterCount} stale teleporter edges removed)");
+            Plugin.Log.LogInfo($"[NavGraph] Registered {MapLocations.Count} map locations ({spawns.Length} spawns, {weaponLocCount} weapons from {items.Length} items + {spawners.Length} spawners, {dispenserCount} dispensers, {ladderNodeCount} ladders, {teleporterCount} teleporters, {staleTeleporterCount} stale teleporter edges removed)");
         }
 
 
