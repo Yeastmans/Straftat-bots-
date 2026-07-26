@@ -2868,6 +2868,83 @@ namespace StraftatBots
                 && Physics.Raycast(center - side + Vector3.up * 2.5f, Vector3.down, 5.5f, GROUND_MASK, QueryTriggerInteraction.Ignore);
         }
 
+        /// <summary>Would the bot's standing capsule intersect solid geometry at this
+        /// foot position? Radius is shrunk by the skin width so resting against a wall
+        /// (a legitimate CC contact) doesn't read as blocked.</summary>
+        private bool IsCapsuleBlockedAt(Vector3 footPos)
+        {
+            float r = _cc != null ? Mathf.Max(0.1f, _cc.radius - _cc.skinWidth) : 0.3f;
+            float h = _cc != null ? Mathf.Max(_cc.height, r * 2f) : STAND_HEIGHT;
+            Vector3 p1 = footPos + Vector3.up * r;
+            Vector3 p2 = footPos + Vector3.up * Mathf.Max(r, h - r);
+            return Physics.CheckCapsule(p1, p2, r, WALL_MASK, QueryTriggerInteraction.Ignore);
+        }
+
+        // ---- Wall-embed recovery ----
+        // Anything that can bury a bot in geometry ends here: a mistimed ladder
+        // reposition, a spawn inside a prop, or a PLAYER body-checking a bot into a
+        // wall (Unity depenetrates overlapping controllers by shoving one of them,
+        // and the bot is the one that loses). Without this a buried bot is stuck for
+        // the rest of the round — its own movement can't resolve a penetration.
+        private static readonly Collider[] _embedHits = new Collider[8];
+        private float _embedCheckTimer;
+        private float _embedStuckSince;
+
+        private void ResolveWallEmbed()
+        {
+            if (_cc == null || !_cc.enabled || IsDead || _onLadder) return;
+            _embedCheckTimer -= Time.deltaTime;
+            if (_embedCheckTimer > 0f) return;
+            _embedCheckTimer = 0.2f;
+
+            float r = Mathf.Max(0.1f, _cc.radius - _cc.skinWidth);
+            float half = Mathf.Max(_cc.height * 0.5f, r);
+            Vector3 c = transform.position + _cc.center;
+            Vector3 p1 = c + Vector3.up * (half - r);
+            Vector3 p2 = c - Vector3.up * (half - r);
+
+            int n = Physics.OverlapCapsuleNonAlloc(p1, p2, r, _embedHits, WALL_MASK,
+                QueryTriggerInteraction.Ignore);
+            if (n == 0) { _embedStuckSince = 0f; return; }
+
+            Vector3 push = Vector3.zero;
+            for (int i = 0; i < n; i++)
+            {
+                var col = _embedHits[i];
+                if (col == null || col.transform.IsChildOf(transform)) continue;
+                if (Physics.ComputePenetration(_cc, transform.position, transform.rotation,
+                        col, col.transform.position, col.transform.rotation,
+                        out Vector3 dir, out float dist))
+                {
+                    if (dist > _cc.skinWidth) push += dir * (dist + 0.02f);
+                }
+            }
+
+            if (push.sqrMagnitude < 0.0001f) { _embedStuckSince = 0f; return; }
+
+            if (_embedStuckSince <= 0f) _embedStuckSince = Time.time;
+            _cc.Move(push);
+            _movedThisFrame = true;
+
+            // Still buried after 2s of nudging — the capsule is fully inside geometry,
+            // where penetration vectors get unreliable. Fall back to the last ground
+            // the bot actually stood on.
+            if (Time.time - _embedStuckSince > 2f)
+            {
+                _embedStuckSince = 0f;
+                if (_lastGroundedPos != Vector3.zero && !IsCapsuleBlockedAt(_lastGroundedPos))
+                {
+                    _cc.enabled = false;
+                    transform.position = _lastGroundedPos;
+                    _cc.enabled = true;
+                    _graphPath.Clear();
+                    _graphPathIndex = 0;
+                    _repathTimer = 0f;
+                    Plugin.Log.LogInfo($"[{BotName}] Freed from geometry — restored to last ground {_lastGroundedPos}");
+                }
+            }
+        }
+
         private bool IsPlayerProvenJumpEdge(NavEdge edge)
         {
             if (edge == null || NavGraph.Instance == null) return false;
@@ -3672,7 +3749,19 @@ namespace StraftatBots
                             // Check if front side has head clearance
                             bool frontClear = !Physics.Raycast(frontPos + Vector3.up * 1.8f,
                                 Vector3.up, 0.5f, WALL_MASK, QueryTriggerInteraction.Ignore);
-                            if (frontClear)
+                            // The head-clearance ray alone was not enough: _ladderFaceDir
+                            // can point INTO the wall a ladder is bolted to (the
+                            // double-sided-collider fallback just reuses the approach
+                            // direction), and this teleport disables the CC — so the bot
+                            // landed embedded in the wall with no collision to stop it.
+                            // The destination capsule must be empty AND reachable in a
+                            // straight line, or we don't move at all.
+                            bool destFree = !IsCapsuleBlockedAt(frontPos);
+                            bool pathClear = !Physics.Linecast(
+                                transform.position + Vector3.up * 1.0f,
+                                frontPos + Vector3.up * 1.0f,
+                                WALL_MASK, QueryTriggerInteraction.Ignore);
+                            if (frontClear && destFree && pathClear)
                             {
                                 // Teleport to front side and continue climbing
                                 if (_cc != null && _cc.enabled)

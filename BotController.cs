@@ -1060,6 +1060,10 @@ namespace StraftatBots
             SampleWalkTrail();
             UpdateZoneDwell();
 
+            // Never stay buried in geometry — see ResolveWallEmbed (ladder repositions,
+            // bad spawns, and players shoving bots into walls all land here).
+            ResolveWallEmbed();
+
             // Training stages 2-3 measure locations bots have PHYSICALLY stood at —
             // report standing near one on a slow cadence (training only, Play pays nothing).
             if (NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training)
