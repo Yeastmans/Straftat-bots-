@@ -73,13 +73,17 @@ namespace StraftatBots
 
             // Toggles FIRST: this callback fires for every camera every frame, and
             // Camera.allCameras below allocates — with everything off it must cost
-            // nothing. The coverage tint is independent of the debug overlay: it is
-            // a TRAINING aid (walked vs unwalked ground), not a debugging view.
+            // nothing. Three independent layers:
+            //   coverage tint — TRAINING aid (walked vs unwalked ground)
+            //   mesh debug    — just the baked navmesh wireframe
+            //   full overlay  — nodes, edges, paths, bot text (the heavy one)
             bool showOverlay = Plugin.ShowOverlay?.Value ?? false;
             bool showCoverage = (Plugin.ShowCoverageMap?.Value ?? false)
                 && NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training
                 && BotNavMesh.Ready;
-            if (!showOverlay && !showCoverage) return;
+            bool showMesh = ((Plugin.ShowMeshDebug?.Value ?? false) || showOverlay)
+                && BotNavMesh.Ready;
+            if (!showOverlay && !showCoverage && !showMesh) return;
 
             if (cam.targetTexture != null) return;
             foreach (var c in Camera.allCameras)
@@ -88,35 +92,13 @@ namespace StraftatBots
                 if (c.depth < cam.depth) return;
             }
 
-            if (showCoverage && !showOverlay)
-            {
-                _glMat.SetPass(0);
-                GL.PushMatrix();
-                try
-                {
-                    GL.LoadProjectionMatrix(GL.GetGPUProjectionMatrix(cam.projectionMatrix, false));
-                    GL.modelview = cam.worldToCameraMatrix;
-                    DrawCoverageMap(cam);
-                }
-                finally { GL.PopMatrix(); }
-                return;
-            }
-
-            bool showText = showOverlay;
-            if (showText && (!_textProxyAttached || cam.GetComponent<BotVizTextProxy>() == null))
+            if (showOverlay && (!_textProxyAttached || cam.GetComponent<BotVizTextProxy>() == null))
             {
                 foreach (var old in Object.FindObjectsOfType<BotVizTextProxy>())
                     Object.Destroy(old);
                 cam.gameObject.AddComponent<BotVizTextProxy>();
                 _textProxyAttached = true;
             }
-
-            bool showNodes = showOverlay;
-            bool showEdges = showOverlay;
-            bool showPaths = showOverlay;
-            bool showIndicators = showOverlay;
-
-            if (!showOverlay) return;
 
             _glMat.SetPass(0);
             GL.PushMatrix();
@@ -126,15 +108,18 @@ namespace StraftatBots
                 GL.modelview = cam.worldToCameraMatrix;
 
                 if (showCoverage) DrawCoverageMap(cam);
-                if (showEdges) DrawNavMesh(cam);
-                if (showNodes) DrawGraphNodes(cam);
-                if (showEdges) DrawGraphEdges(cam);
-                if (showPaths) DrawBotPaths();
-                if (showIndicators) DrawBotIndicators();
+                if (showMesh) DrawNavMesh(cam);
+                if (showOverlay)
+                {
+                    DrawGraphNodes(cam);
+                    DrawGraphEdges(cam);
+                    DrawBotPaths();
+                    DrawBotIndicators();
 
-                // Draw red orbs on blacklisted weapons
-                if (Plugin.BlacklistedWeaponNodes.Count > 0 && NavGraph.Instance != null)
-                    DrawBlacklistedWeapons();
+                    // Draw red orbs on blacklisted weapons
+                    if (Plugin.BlacklistedWeaponNodes.Count > 0 && NavGraph.Instance != null)
+                        DrawBlacklistedWeapons();
+                }
             }
             finally
             {

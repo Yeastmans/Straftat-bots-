@@ -133,8 +133,11 @@ namespace StraftatBots
             DrawUntrainedMapPopup(liveCert);
 
             // World markers: every weapon no bot has visited yet gets a label.
+            // Gated behind the Coverage Map toggle — one switch controls all the
+            // "what's left to train" world drawing.
             bool inTraining = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
             if (inTraining && liveCert != null
+                && (Plugin.ShowCoverageMap?.Value ?? false)
                 && liveCert.UnconnectedWeaponPositions != null)
             {
                 Camera cam = GetViewCamera();
@@ -345,7 +348,8 @@ namespace StraftatBots
                     NavGraph.Instance?.AdvanceTrainingStage();
                 y += 32f;
 
-                // Coverage tint toggle — green walked / orange unwalked ground.
+                // Coverage tint toggle — green walked / orange unwalked ground,
+                // plus the REACH THIS WEAPON markers.
                 bool covOn = Plugin.ShowCoverageMap != null && Plugin.ShowCoverageMap.Value;
                 if (GUI.Button(new Rect(x, y, w, 24), covOn ? "Coverage Map: ON" : "Coverage Map: OFF",
                         covOn ? _activeButtonStyle : _buttonStyle))
@@ -354,9 +358,19 @@ namespace StraftatBots
                 }
                 y += 30f;
 
+                // Navmesh wireframe only — lighter than the full bot overlay.
+                bool meshOn = Plugin.ShowMeshDebug != null && Plugin.ShowMeshDebug.Value;
+                if (GUI.Button(new Rect(x, y, w, 24), meshOn ? "Mesh Debug: ON" : "Mesh Debug: OFF",
+                        meshOn ? _activeButtonStyle : _buttonStyle))
+                {
+                    if (Plugin.ShowMeshDebug != null) Plugin.ShowMeshDebug.Value = !meshOn;
+                }
+                y += 30f;
+
                 // Debug overlay toggle — same setting as the lobby Bots box button.
                 bool overlayOn = Plugin.ShowOverlay != null && Plugin.ShowOverlay.Value;
-                if (GUI.Button(new Rect(x, y, w, 24), overlayOn ? "Debug: ON" : "Debug: OFF", _buttonStyle))
+                if (GUI.Button(new Rect(x, y, w, 24), overlayOn ? "Debug: ON" : "Debug: OFF",
+                        overlayOn ? _activeButtonStyle : _buttonStyle))
                 {
                     if (Plugin.ShowOverlay != null) Plugin.ShowOverlay.Value = !overlayOn;
                 }

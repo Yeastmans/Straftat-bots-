@@ -61,6 +61,7 @@ namespace StraftatBots
         // Single overlay toggle — covers nodes, edges, bot paths, markers, and info text.
         public static ConfigEntry<bool> ShowOverlay;
         public static ConfigEntry<bool> ShowCoverageMap;
+        public static ConfigEntry<bool> ShowMeshDebug;
         // One-line perf summary every 10s (fps, bot CPU ms/frame, GC pressure).
         public static ConfigEntry<bool> LogPerfStats;
         // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
@@ -205,7 +206,11 @@ namespace StraftatBots
 
             ShowCoverageMap = Config.Bind("Debug", "Coverage Map", true,
                 "During training: tint walked ground green and unwalked ground orange " +
-                "so you can see exactly what the bots still have to cover.");
+                "so you can see exactly what the bots still have to cover. " +
+                "Also gates the REACH THIS WEAPON world markers.");
+
+            ShowMeshDebug = Config.Bind("Debug", "Mesh Debug", false,
+                "Draw just the baked navmesh wireframe (without the full bot overlay).");
 
             LogPerfStats = Config.Bind("Debug", "Log Perf Stats", true,
                 "Write a one-line performance summary to the log every 10 seconds " +
