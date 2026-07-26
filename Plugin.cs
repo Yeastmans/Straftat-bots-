@@ -123,9 +123,9 @@ namespace StraftatBots
                 }
                 else if (TrainingBehavior != null && TrainingBehavior.Value == "None")
                 {
-                    // Training is automatic: entering it always starts bots exploring
+                    // Training is automatic: entering it always starts bots working
                     // (the old flow left them frozen on "None" after a Play round-trip).
-                    TrainingBehavior.Value = "Explore";
+                    TrainingBehavior.Value = "Validate";
                 }
             };
 
@@ -249,8 +249,10 @@ namespace StraftatBots
         {
             BotPerfStats.FrameTick(Time.unscaledDeltaTime);
 
-            // Stage-driven behavior: Explore during stages 1-2, Validate during stage 3
-            // (confirmation), None in Play mode or while the user paused the bots.
+            // Single-stage training: bots always run the Validate handler — it takes
+            // pending special-edge routes when they exist and falls back to the
+            // unified wander (coverage → weapons → player paths) otherwise.
+            // None in Play mode or while the user paused the bots.
             _behaviorSyncTimer -= Time.deltaTime;
             if (_behaviorSyncTimer <= 0f)
             {
@@ -259,8 +261,7 @@ namespace StraftatBots
                 if (NavGraphMode == null || NavGraphMode.Value == "Play" || TrainingPaused)
                     want = "None";
                 else
-                    want = (NavGraph.Instance != null && NavGraph.Instance.TrainingStage >= 3)
-                        ? "Validate" : "Explore";
+                    want = "Validate";
                 if (TrainingBehavior.Value != want) TrainingBehavior.Value = want;
 
                 // Keep trusted jump/fall/teleporter edges mirrored as NavMesh links.

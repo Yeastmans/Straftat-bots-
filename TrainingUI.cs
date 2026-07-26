@@ -111,9 +111,9 @@ namespace StraftatBots
 
             DrawUntrainedMapPopup(liveCert);
 
-            // Stage 2 world markers: every weapon that still has no route gets a label.
+            // World markers: every weapon no bot has visited yet gets a label.
             bool inTraining = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
-            if (inTraining && liveCert != null && liveCert.StageNumber == 2
+            if (inTraining && liveCert != null
                 && liveCert.UnconnectedWeaponPositions != null)
             {
                 Camera cam = Camera.main;
@@ -266,7 +266,7 @@ namespace StraftatBots
                 settled.fontStyle = FontStyle.Bold;
                 settled.normal.textColor = new Color(0.45f, 1f, 0.55f);
                 GUI.Label(new Rect(x, y, w, 18),
-                    "Nothing new being learned — ready to advance.", settled);
+                    "Nothing new being learned — ready to finish.", settled);
                 y += 20f;
             }
 
@@ -276,20 +276,19 @@ namespace StraftatBots
             GUI.Label(new Rect(x, y, w, 34), cert.StageInstruction ?? "", wrap);
             y += 38f;
 
-            // Stage 2: how many weapons still need a route
-            if (cert.StageNumber == 2)
+            // Weapons no bot has stood at yet (marked in the world too)
             {
-                int unlinked = cert.UnconnectedWeaponPositions?.Count ?? 0;
+                int unvisited = cert.UnconnectedWeaponPositions?.Count ?? 0;
                 var wStyle = new GUIStyle(_labelStyle);
-                wStyle.normal.textColor = unlinked > 0 ? new Color(1f, 0.7f, 0.3f) : new Color(0.45f, 1f, 0.55f);
+                wStyle.normal.textColor = unvisited > 0 ? new Color(1f, 0.7f, 0.3f) : new Color(0.45f, 1f, 0.55f);
                 GUI.Label(new Rect(x, y, w, 18),
-                    unlinked > 0 ? $"Unlinked weapons: {unlinked} (marked in world)" : "All weapons linked!",
+                    unvisited > 0 ? $"Weapons left to visit: {unvisited} (marked in world)" : "All weapons visited!",
                     wStyle);
                 y += 22f;
             }
 
-            // Stage 1: coverage stall warning + manual cleanup of unreachable junk
-            if (cert.StageNumber == 1 && !inPlay)
+            // Coverage stall warning + manual cleanup of unreachable junk
+            if (!inPlay)
             {
                 UpdateStallTracking(cert);
                 if (_coverageStallWarning)
@@ -325,9 +324,17 @@ namespace StraftatBots
             }
             else
             {
-                if (GUI.Button(new Rect(x, y, w, 26), cert.NextButtonLabel ?? "Next Stage", _activeButtonStyle))
+                if (GUI.Button(new Rect(x, y, w, 26), cert.NextButtonLabel ?? "Finish: Switch To Play", _activeButtonStyle))
                     NavGraph.Instance?.AdvanceTrainingStage();
                 y += 32f;
+
+                // Debug overlay toggle — same setting as the lobby Bots box button.
+                bool overlayOn = Plugin.ShowOverlay != null && Plugin.ShowOverlay.Value;
+                if (GUI.Button(new Rect(x, y, w, 24), overlayOn ? "Debug: ON" : "Debug: OFF", _buttonStyle))
+                {
+                    if (Plugin.ShowOverlay != null) Plugin.ShowOverlay.Value = !overlayOn;
+                }
+                y += 30f;
             }
 
             return y;

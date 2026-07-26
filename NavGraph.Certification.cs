@@ -78,11 +78,11 @@ namespace StraftatBots
                 : EdgeTrustState.Candidate;
         }
 
-        // ---- Manual 3-stage training progression (per map, session-persistent) ----
-        // Stage 1: Explore — bots & player roam, connect areas.
-        // Stage 2: Weapons — disconnected junk pruned on entry; unlinked weapons marked,
-        //          bots & player reach them.
-        // Stage 3: Confirmation — bots run routes across the map to confirm walkability.
+        // ---- Single-stage training (per map, session-persistent) ----
+        // ONE stage: bots walk every area (coverage), every weapon, and every path
+        // the player has recorded; pending special edges get validated throughout.
+        // The bar blends those terms; the one button finishes and switches to Play.
+        // TrainingStage is kept for save-data compat but no behavior branches on it.
         private static readonly Dictionary<string, int> _stageByMap = new Dictionary<string, int>();
 
         public int TrainingStage
@@ -99,25 +99,14 @@ namespace StraftatBots
             }
         }
 
-        /// <summary>The one training button. 1→2 prunes disconnected data; 3→ hands off to Play.</summary>
+        /// <summary>The one training button: finish training, hand off to Play.
+        /// (The Play mode setter kills bots, starts a fresh round, saves.)</summary>
         public void AdvanceTrainingStage()
         {
-            int stage = TrainingStage;
-            if (stage == 1)
-            {
-                PruneDisconnectedFromSpawn();
-                TrainingStage = 2;
-                Plugin.Log.LogInfo("[NavGraph] Training advanced to Stage 2: Weapons");
-            }
-            else if (stage == 2)
-            {
-                TrainingStage = 3;
-                Plugin.Log.LogInfo("[NavGraph] Training advanced to Stage 3: Confirmation");
-            }
-            else if (Plugin.NavGraphMode != null)
+            if (Plugin.NavGraphMode != null)
             {
                 Plugin.NavGraphMode.Value = "Play";
-                Plugin.Log.LogInfo("[NavGraph] Training complete — switched to Play");
+                Plugin.Log.LogInfo("[NavGraph] Training finished — switched to Play");
             }
             _cachedCertification = null;
         }
@@ -725,6 +714,7 @@ namespace StraftatBots
         private string _botVisitMap;
         private readonly HashSet<int> _botVisitedWeaponLocs = new HashSet<int>();
         private readonly HashSet<int> _botWalkedAnchorLocs = new HashSet<int>();
+        private readonly HashSet<int> _botWalkedPlayerNodeIds = new HashSet<int>();
 
         private void EnsureBotVisitMap()
         {
@@ -732,11 +722,15 @@ namespace StraftatBots
             _botVisitMap = CurrentMap;
             _botVisitedWeaponLocs.Clear();
             _botWalkedAnchorLocs.Clear();
+            _botWalkedPlayerNodeIds.Clear();
         }
 
         /// <summary>Called ~2Hz per bot (and for the player recorder) during Training.
-        /// Marks any map location within 2.5m as physically visited.</summary>
-        public void MarkBotAtPosition(Vector3 pos)
+        /// Marks any map location within 2.5m as physically visited. Bots additionally
+        /// mark player-recorded nodes as re-walked — that is the "walk every path the
+        /// player has made" training objective; the player walking their OWN fresh
+        /// trail must not self-complete it, hence isPlayer.</summary>
+        public void MarkBotAtPosition(Vector3 pos, bool isPlayer = false)
         {
             EnsureBotVisitMap();
             for (int i = 0; i < MapLocations.Count; i++)
@@ -748,6 +742,54 @@ namespace StraftatBots
                 _botWalkedAnchorLocs.Add(i);
                 if (IsWeaponLocationLabel(label)) _botVisitedWeaponLocs.Add(i);
             }
+            if (isPlayer) return;
+            for (int i = 0; i < Nodes.Count; i++)
+            {
+                var n = Nodes[i];
+                if (n == null || !n.PlayerSourced || n.Confidence <= 0f) continue;
+                if (_botWalkedPlayerNodeIds.Contains(n.Id)) continue;
+                float dx = pos.x - n.Position.x, dz = pos.z - n.Position.z;
+                if (dx * dx + dz * dz > 6.25f || Mathf.Abs(pos.y - n.Position.y) > 2.5f) continue;
+                _botWalkedPlayerNodeIds.Add(n.Id);
+            }
+        }
+
+        /// <summary>Fraction of player-recorded nodes a BOT has re-walked this session.
+        /// 1 when the player hasn't recorded anything on this map.</summary>
+        public float PlayerPathWalkProgress
+        {
+            get
+            {
+                EnsureBotVisitMap();
+                int total = 0, walked = 0;
+                for (int i = 0; i < Nodes.Count; i++)
+                {
+                    var n = Nodes[i];
+                    if (n == null || !n.PlayerSourced || n.Confidence <= 0f) continue;
+                    total++;
+                    if (_botWalkedPlayerNodeIds.Contains(n.Id)) walked++;
+                }
+                return total > 0 ? Mathf.Clamp01(walked / (float)total) : 1f;
+            }
+        }
+
+        /// <summary>Nearest player-recorded node no bot has re-walked this session.</summary>
+        public Vector3 FindNearestUnwalkedPlayerNode(Vector3 fromPos, System.Func<Vector3, bool> reject = null)
+        {
+            EnsureBotVisitMap();
+            float best = float.MaxValue;
+            Vector3 bestPos = Vector3.zero;
+            for (int i = 0; i < Nodes.Count; i++)
+            {
+                var n = Nodes[i];
+                if (n == null || !n.PlayerSourced || n.Confidence <= 0f) continue;
+                if (_botWalkedPlayerNodeIds.Contains(n.Id)) continue;
+                if (IsBlacklisted(n.Id)) continue;
+                if (reject != null && reject(n.Position)) continue;
+                float d = Vector3.Distance(fromPos, n.Position);
+                if (d < best) { best = d; bestPos = n.Position; }
+            }
+            return bestPos;
         }
 
         public float BotWeaponVisitProgress
@@ -839,64 +881,32 @@ namespace StraftatBots
                 catch { }
             }
 
-            // Manual 3-stage flow — the user advances stages with ONE button; everything
-            // inside a stage runs automatically.
-            int stage = TrainingStage;
-            report.StageNumber = stage;
-            float rawProgress;
-            switch (stage)
-            {
-                case 1:
-                    report.StageName = "STAGE 1/3 — EXPLORE";
-                    // Coverage-led: stage 1 is about walking the map. Anchor connection
-                    // contributes but can't hard-cap the bar the way the old min() did
-                    // (jump-only anchors belong to stages 2-3, not here).
-                    rawProgress = report.CoverageProgress * 0.7f + report.ConnectionProgress * 0.3f;
-                    report.StageInstruction = "Bots and you run around the map — coverage fills as the ground actually gets walked.";
-                    report.NextButtonLabel = "Next Stage: Weapons";
-                    report.RecommendedBehavior = "Explore";
-                    break;
-                case 2:
-                    report.StageName = "STAGE 2/3 — WEAPONS";
-                    // Bar = weapons a bot has PHYSICALLY stood at this session. The old
-                    // metric (mesh-connectivity from spawn) was satisfied by the bake
-                    // alone, so the stage opened at 100% with nothing to do. Bots now
-                    // run the full weapon circuit, banking nodes/edges along the way.
-                    rawProgress = BotWeaponVisitProgress;
-                    report.UnconnectedWeaponPositions = GetUnvisitedWeaponPositions();
-                    report.StageInstruction = "Unvisited weapons are marked in the world — bots run the circuit until every weapon has been reached.";
-                    report.NextButtonLabel = "Next Stage: Confirmation";
-                    report.RecommendedBehavior = "Explore";
-                    break;
-                default:
-                    report.StageName = "STAGE 3/3 — CONFIRMATION";
-                    // Progress measures what stage 3 actually exists to confirm: special
-                    // traversal (jumps/falls/ladders/teleporters) and a working route to
-                    // every key location. NeedsDemo edges count as RESOLVED — bots asked
-                    // and answered ("can't do it without a demo"); leaving them in the
-                    // denominator stalled the bar forever on maps with junk jump edges.
-                    // Edges with one clean traversal already banked count half — the bar
-                    // visibly moves with every bot attempt instead of only on full trust.
-                    float specialProgress = report.SpecialEdges > 0
-                        ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges
-                            + 0.5f * report.InProgressSpecialEdges) / (float)report.SpecialEdges)
-                        : 1f;
-                    // Anchor term = anchors bots have PHYSICALLY walked to this session
-                    // (the old mesh-validated count was pre-filled by the bake, which
-                    // made stage 3 look like it did nothing). With no special edges to
-                    // confirm, the circuit IS the whole stage.
-                    float anchorProgress = BotAnchorCircuitProgress;
-                    rawProgress = report.SpecialEdges > 0
-                        ? specialProgress * 0.65f + anchorProgress * 0.35f
-                        : anchorProgress;
-                    report.StageInstruction = "Bots confirm jumps, ladders and a walked route to every key location.";
-                    report.NextButtonLabel = "Finish: Switch To Play";
-                    report.RecommendedBehavior = "Validate";
-                    break;
-            }
-            TrackStageProgress(report, stage, rawProgress);
+            // SINGLE-STAGE training. The bar blends everything bots must physically
+            // do before the map counts as trained:
+            //   coverage      — every reachable area walked
+            //   weapons       — a bot stood at every weapon
+            //   player paths  — bots re-walked every node the player recorded
+            //   special edges — pending jumps/falls/ladders confirmed (NeedsDemo counts
+            //                   as resolved; half-credit for one banked traversal)
+            // Terms with nothing to do read 1, so empty maps don't stall the bar.
+            report.StageNumber = 1;
+            report.StageName = "TRAINING";
+            float specialProgress = report.SpecialEdges > 0
+                ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges
+                    + 0.5f * report.InProgressSpecialEdges) / (float)report.SpecialEdges)
+                : 1f;
+            float coverage = report.CoverageProgress;
+            float weapons = BotWeaponVisitProgress;
+            float playerPaths = PlayerPathWalkProgress;
+            float rawProgress = coverage * 0.35f + weapons * 0.25f
+                + playerPaths * 0.25f + specialProgress * 0.15f;
+            report.UnconnectedWeaponPositions = GetUnvisitedWeaponPositions();
+            report.StageInstruction = "Bots walk every area, every weapon, and every path you've made. Finish when the bar fills.";
+            report.NextButtonLabel = "Finish: Switch To Play";
+            report.RecommendedBehavior = "Validate";
+            TrackStageProgress(report, 1, rawProgress);
             report.PrimaryAction = null;
-            report.NeedsTraining = stage < 3;
+            report.NeedsTraining = report.StageProgress < 0.95f;
         }
 
         // ---- Stage progress high-water + settle detection ----

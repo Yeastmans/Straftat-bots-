@@ -1076,14 +1076,16 @@ namespace StraftatBots
                         Plugin.Log.LogInfo($"[{BotName}] Explore stale — forcing distant target");
                     }
 
-                    // STAGE 1 — EXPLORE: unwalked ground IS the objective. Relentlessly
-                    // target unwalked coverage cells; a walked cell can never be returned
+                    // SINGLE-STAGE training objectives, in priority order. Each maps to
+                    // a term of the training bar, so the bar only moves on real work.
+
+                    // 1. COVERAGE: unwalked ground. A walked cell can never be returned
                     // by the picker again, so bots physically cannot re-cover old ground.
                     // Recently visited/assigned spots are rejected for 45s as retry backoff.
                     // Two passes: first also rejects cells on the bot's own recent walk
                     // trail (no U-turn back down the lane just swept); if that starves the
                     // pick (dead-end corridor), the plain pass lets the bot walk back out.
-                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 1)
+                    if (NavGraph.Instance != null)
                     {
                         Vector3 pickHeading = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
                         if (BotNavMesh.TryGetUnwalkedCellTarget(transform.position, RejectStage1CellOrTrail, out Vector3 unwalked,
@@ -1099,17 +1101,26 @@ namespace StraftatBots
                         }
                     }
 
-                    // STAGE 2 — WEAPONS: every weapon must be PHYSICALLY visited by a
-                    // bot this session — that's what the stage bar measures now. (The
-                    // old objective, mesh-unlinked weapons, was empty the moment the
-                    // bake finished, so stage 2 read 100% and bots had nothing to do.)
-                    if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 2 && Random.value < 0.75f)
+                    // 2. WEAPONS: every weapon must be PHYSICALLY visited by a bot.
+                    if (NavGraph.Instance != null && Random.value < 0.75f)
                     {
                         var (wPos, wLabel) = NavGraph.Instance.FindNearestUnvisitedWeapon(transform.position, IsRecentlyVisited);
                         if (wPos != Vector3.zero
                             && TryAssignExploreTarget(wPos, Random.Range(14f, 22f) * commitmentMultiplier, requireRoute: false))
                         {
-                            Plugin.Log.LogInfo($"[{BotName}] Stage 2: visiting weapon '{wLabel}'");
+                            Plugin.Log.LogInfo($"[{BotName}] Training: visiting weapon '{wLabel}'");
+                            goto doneWanderPick;
+                        }
+                    }
+
+                    // 3. PLAYER PATHS: re-walk every node the player has recorded, so
+                    // the routes the player demonstrated are proven bot-walkable.
+                    if (NavGraph.Instance != null && Random.value < 0.75f)
+                    {
+                        Vector3 pn = NavGraph.Instance.FindNearestUnwalkedPlayerNode(transform.position, IsRecentlyVisited);
+                        if (pn != Vector3.zero
+                            && TryAssignExploreTarget(pn, Random.Range(10f, 16f) * commitmentMultiplier, requireRoute: false))
+                        {
                             goto doneWanderPick;
                         }
                     }

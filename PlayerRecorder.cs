@@ -176,9 +176,10 @@ namespace StraftatBots
                     track.LastRecordedPos = pos;
                     track.LastSampleTime = Time.time;
 
-                    // The player walking to a weapon/anchor counts for the stage 2-3
-                    // bars exactly like a bot doing it ("bots and you").
-                    if (training) NavGraph.Instance.MarkBotAtPosition(pos);
+                    // The player walking to a weapon/anchor counts for the training bar
+                    // ("bots and you") — but NOT for the player-path re-walk term, or
+                    // recording a route would instantly mark it walked (isPlayer: true).
+                    if (training) NavGraph.Instance.MarkBotAtPosition(pos, isPlayer: true);
 
                     // Track node traversal — report success when player moves between nodes
                     // This rehabilitates bad nodes that players prove are walkable
