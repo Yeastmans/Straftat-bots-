@@ -1564,43 +1564,39 @@ namespace StraftatBots
         /// </summary>
         public (Vector3 pos, string label, List<NavNode> path) FindReachableMapLocation(Vector3 fromPos)
         {
-            NavNode bestNode = null;
-            string bestLabel = "";
-            List<NavNode> bestPath = null;
-            float bestScore = float.MinValue;
+            // The score depends only on distance + label, never on the path — so
+            // evaluate best-score-first and STOP at the first location that routes.
+            // The old loop ran a full A* per location (30+ per pick on weapon-heavy
+            // maps, in ONE frame): that was a prime [Perf] SLOW src=GraphRoute spike.
+            var fromNode = FindNearestNode(fromPos, 10f); // was re-run per location
+            if (fromNode == null) return (Vector3.zero, "", new List<NavNode>());
 
-            foreach (var (pos, label, nodeId) in MapLocations)
+            var order = new List<KeyValuePair<float, int>>(MapLocations.Count);
+            for (int i = 0; i < MapLocations.Count; i++)
             {
-                // Try cached route first
-                var fromNode = FindNearestNode(fromPos, 10f);
-                if (fromNode == null) continue;
+                var (pos, label, _) = MapLocations[i];
+                float score = -Vector3.Distance(fromPos, pos);
+                if (label != "Spawn" && label != "Spawner") score += 20f; // Weapons preferred
+                order.Add(new KeyValuePair<float, int>(-score, i));      // ascending = best first
+            }
+            order.Sort((a, b) => a.Key.CompareTo(b.Key));
 
-                var key = (fromNode.Id, nodeId);
-                List<NavNode> path = null;
-
-                if (_routeCache.TryGetValue(key, out var cached))
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int oi = 0; oi < order.Count; oi++)
+            {
+                var (pos, label, nodeId) = MapLocations[order[oi].Value];
+                List<NavNode> path;
+                if (_routeCache.TryGetValue((fromNode.Id, nodeId), out var cached))
                     path = new List<NavNode>(cached);
                 else
-                    path = FindPath(fromPos, pos, jitter: 0f);
-
-                if (path.Count == 0) continue;
-
-                // Score: prefer weapons over spawns, closer is better
-                float dist = Vector3.Distance(fromPos, pos);
-                float score = -dist;
-                if (label != "Spawn" && label != "Spawner") score += 20f; // Weapons preferred
-
-                if (score > bestScore)
                 {
-                    bestScore = score;
-                    bestNode = GetNodeById(nodeId);
-                    bestLabel = label;
-                    bestPath = path;
+                    if (sw.ElapsedMilliseconds > 3) break; // frame budget — give up quietly
+                    path = FindPath(fromPos, pos, jitter: 0f);
                 }
+                if (path.Count == 0) continue;
+                var node = GetNodeById(nodeId);
+                if (node != null) return (node.Position, label, path);
             }
-
-            if (bestPath != null && bestNode != null)
-                return (bestNode.Position, bestLabel, bestPath);
             return (Vector3.zero, "", new List<NavNode>());
         }
 
@@ -1609,18 +1605,34 @@ namespace StraftatBots
         /// A location reachable only via one-way falls (no return path) counts as unreachable.
         /// Returns the nearest disconnected location, or Vector3.zero if all are properly connected.
         /// </summary>
+        private float _allLocationsConnectedUntil; // negative-result cooldown
+
         public (Vector3 pos, string label) FindUnreachableMapLocation(Vector3 fromPos)
         {
-            float bestDist = float.MaxValue;
-            Vector3 bestPos = Vector3.zero;
-            string bestLabel = "";
+            // Nearest-first with early exit: the first UNconnected location in
+            // distance order IS the answer, so connected locations past it never
+            // pay their 2 pathfinds. The old loop ran up to 2 A* per location per
+            // pick (60+ searches in one frame on weapon-heavy maps — a prime
+            // [Perf] SLOW spike source). A full clean scan also arms a short
+            // cooldown so back-to-back picks don't rescan a fully-connected map.
+            if (Time.time < _allLocationsConnectedUntil) return (Vector3.zero, "");
 
             var fromNode = FindNearestNode(fromPos, 10f);
 
-            foreach (var (pos, label, nodeId) in MapLocations)
+            var order = new List<KeyValuePair<float, int>>(MapLocations.Count);
+            for (int i = 0; i < MapLocations.Count; i++)
             {
+                var (pos, label, nodeId) = MapLocations[i];
                 if (label == "Spawn") continue;
                 if (Plugin.BlacklistedWeaponNodes.Contains(nodeId)) continue;
+                order.Add(new KeyValuePair<float, int>(Vector3.Distance(fromPos, pos), i));
+            }
+            order.Sort((a, b) => a.Key.CompareTo(b.Key));
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            foreach (var entry in order)
+            {
+                var (pos, label, _) = MapLocations[entry.Value];
 
                 bool connected = false;
                 if (fromNode != null)
@@ -1635,19 +1647,14 @@ namespace StraftatBots
                     }
                 }
 
-                if (!connected)
-                {
-                    float dist = Vector3.Distance(fromPos, pos);
-                    if (dist < bestDist)
-                    {
-                        bestDist = dist;
-                        bestPos = pos;
-                        bestLabel = label;
-                    }
-                }
+                if (!connected) return (pos, label); // nearest unconnected — done
+
+                if (sw.ElapsedMilliseconds > 4)
+                    return (Vector3.zero, ""); // frame budget — incomplete scan, no cooldown
             }
 
-            return (bestPos, bestLabel);
+            _allLocationsConnectedUntil = Time.time + 3f;
+            return (Vector3.zero, "");
         }
 
         // ========== ROUTE CACHE ==========

@@ -317,7 +317,7 @@ namespace StraftatBots
                     foreach (int aid in anchorIds)
                     {
                         var an = GetNodeById(aid);
-                        if (an != null && NavMeshRouteExists(spawnPos, an.Position))
+                        if (an != null && NavMeshRouteExistsCached(aid, spawnPos, an.Position))
                             nmRouted.Add(aid);
                     }
                     int nmWeapons = 0;
@@ -949,6 +949,27 @@ namespace StraftatBots
             if (!BotNavMesh.Ready) return false;
             var path = BotNavMesh.FindCornerPath(from, to, out bool complete);
             return path != null && complete;
+        }
+
+        // Per-anchor mesh-route results, 20s TTL. The report build ran a native
+        // navmesh path query per anchor every 3s — 30+ queries in one frame on
+        // weapon-heavy maps for answers that essentially never change mid-round.
+        private readonly Dictionary<int, KeyValuePair<float, bool>> _nmRouteCache
+            = new Dictionary<int, KeyValuePair<float, bool>>();
+        private string _nmRouteCacheMap;
+
+        private bool NavMeshRouteExistsCached(int anchorId, Vector3 from, Vector3 to)
+        {
+            if (_nmRouteCacheMap != CurrentMap)
+            {
+                _nmRouteCache.Clear();
+                _nmRouteCacheMap = CurrentMap;
+            }
+            if (_nmRouteCache.TryGetValue(anchorId, out var e) && Time.time - e.Key < 20f)
+                return e.Value;
+            bool ok = NavMeshRouteExists(from, to);
+            _nmRouteCache[anchorId] = new KeyValuePair<float, bool>(Time.time, ok);
+            return ok;
         }
 
         /// <summary>Complete baked-mesh route from any spawn to pos — distinguishes

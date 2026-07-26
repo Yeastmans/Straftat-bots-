@@ -899,6 +899,7 @@ namespace StraftatBots
             if (NavGraph.Instance.TryGetValidationRoute(transform.position, BotId,
                 out Vector3 target, out List<NavNode> route, out string label))
             {
+                _validationSearchFails = 0;
                 _graphPath = route;
                 _graphPathIndex = 0;
                 _lastReachedNode = null;
@@ -922,12 +923,17 @@ namespace StraftatBots
             // location once. This is what the stage-3 anchor bar now measures — bots
             // visibly working the map instead of milling around — and reaching the
             // anchor marks it walked via the passive location-visit tracker.
-            _validationSearchTimer = 2f + Random.value * 1.5f;
+            // Consecutive empty searches back off (each one costs up to ~10 pathfinds,
+            // and Validate now runs for the WHOLE training session, not just stage 3).
+            _validationSearchFails = Mathf.Min(_validationSearchFails + 1, 4);
+            _validationSearchTimer = (2f + Random.value * 1.5f) * (1 + _validationSearchFails);
             Vector3 circuit = NavGraph.Instance.FindNextCircuitAnchor(transform.position, BotId, IsRecentlyVisited);
             if (circuit != Vector3.zero)
                 TryAssignExploreTarget(circuit, 18f, requireRoute: false);
             Wander();
         }
+
+        private int _validationSearchFails; // consecutive empty validation searches
 
         private void Wander()
         {

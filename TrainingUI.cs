@@ -76,8 +76,72 @@ namespace StraftatBots
             _sectionStyle.fontStyle = FontStyle.Bold;
             _sectionStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
 
+            // ---- Cached per-frame styles ----
+            // Every one of these used to be `new GUIStyle(...)` inside the draw path.
+            // OnGUI runs several times per frame, so that was steady GC churn — the
+            // known "TrainingUI GC churn" perf item. Styles whose color varies get
+            // mutated in place (alloc-free) instead of recreated.
+            _minLabelStyle = new GUIStyle(_headerStyle) { fontSize = 11 };
+
+            _dotStyle = new GUIStyle(_labelStyle);
+            _dotStyle.fontSize = 10;
+            _dotStyle.normal.textColor = new Color(0.4f, 0.4f, 0.5f);
+            _dotStyle.alignment = TextAnchor.MiddleCenter;
+
+            _titleStyle = new GUIStyle(_labelStyle);
+            _titleStyle.fontSize = 13;
+            _titleStyle.fontStyle = FontStyle.Bold;
+            _titleStyle.normal.textColor = new Color(0.45f, 0.85f, 1f);
+
+            _settledStyle = new GUIStyle(_labelStyle);
+            _settledStyle.fontStyle = FontStyle.Bold;
+            _settledStyle.normal.textColor = new Color(0.45f, 1f, 0.55f);
+
+            _wrapStyle = new GUIStyle(_labelStyle);
+            _wrapStyle.wordWrap = true;
+            _wrapStyle.normal.textColor = new Color(0.9f, 0.9f, 0.9f);
+
+            _counterStyle = new GUIStyle(_labelStyle);
+
+            _warnStyle = new GUIStyle(_labelStyle);
+            _warnStyle.wordWrap = true;
+            _warnStyle.fontStyle = FontStyle.Bold;
+            _warnStyle.normal.textColor = new Color(1f, 0.55f, 0.25f);
+
+            _dangerBtnStyle = new GUIStyle(_buttonStyle);
+            _dangerBtnStyle.normal.background = _dangerTex;
+            _dangerBtnStyle.normal.textColor = Color.white;
+            _dangerBtnStyle.fontStyle = FontStyle.Bold;
+
+            _popupTitleStyle = new GUIStyle(_headerStyle);
+            _popupTitleStyle.normal.textColor = new Color(1f, 0.6f, 0.3f);
+
+            _popupTextStyle = new GUIStyle(_labelStyle) { wordWrap = true };
+
+            _worldLabelStyle = new GUIStyle(GUI.skin.box);
+            _worldLabelStyle.normal.textColor = Color.white;
+            _worldLabelStyle.fontStyle = FontStyle.Bold;
+            _worldLabelStyle.fontSize = 12;
+            _worldLabelStyle.alignment = TextAnchor.MiddleCenter;
+            _worldLabelStyle.wordWrap = true;
+
+            _helpNameStyle = new GUIStyle(_labelStyle);
+            _helpNameStyle.fontSize = 13;
+            _helpNameStyle.fontStyle = FontStyle.Bold;
+            _helpNameStyle.normal.textColor = new Color(0.5f, 0.9f, 1f);
+
+            _helpDescStyle = new GUIStyle(_labelStyle);
+            _helpDescStyle.fontSize = 11;
+            _helpDescStyle.normal.textColor = new Color(0.8f, 0.8f, 0.8f);
+            _helpDescStyle.wordWrap = true;
+
             _stylesInit = true;
         }
+
+        private static GUIStyle _minLabelStyle, _dotStyle, _titleStyle, _settledStyle,
+            _wrapStyle, _counterStyle, _warnStyle, _dangerBtnStyle,
+            _popupTitleStyle, _popupTextStyle, _worldLabelStyle,
+            _helpNameStyle, _helpDescStyle;
 
         // Untrained-map popup state (Play mode, per map)
         private static string _lastSeenMap;
@@ -167,9 +231,7 @@ namespace StraftatBots
                 Rect dragArea = new Rect(x, y, minW - 26, minH);
                 HandleDrag(dragArea);
 
-                var minLabel = new GUIStyle(_headerStyle);
-                minLabel.fontSize = 11;
-                GUI.Label(new Rect(x + 4, y + 3, minW - 30, 20), "BOTS", minLabel);
+                GUI.Label(new Rect(x + 4, y + 3, minW - 30, 20), "BOTS", _minLabelStyle);
                 if (GUI.Button(new Rect(x + minW - 24, y + 3, 22, 20), "+", _miniButtonStyle))
                     _expanded = true;
                 return;
@@ -189,11 +251,7 @@ namespace StraftatBots
             HandleDrag(dragBar);
 
             // Drag hint dots
-            var dotStyle = new GUIStyle(_labelStyle);
-            dotStyle.fontSize = 10;
-            dotStyle.normal.textColor = new Color(0.4f, 0.4f, 0.5f);
-            dotStyle.alignment = TextAnchor.MiddleCenter;
-            GUI.Label(dragBar, ". . . . .", dotStyle);
+            GUI.Label(dragBar, ". . . . .", _dotStyle);
 
             float cw = panelW - 16f;
             float headerY = y + dragBarH + 2f;
@@ -267,11 +325,7 @@ namespace StraftatBots
         {
             bool inPlay = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Play;
 
-            var titleStyle = new GUIStyle(_labelStyle);
-            titleStyle.fontSize = 13;
-            titleStyle.fontStyle = FontStyle.Bold;
-            titleStyle.normal.textColor = new Color(0.45f, 0.85f, 1f);
-            GUI.Label(new Rect(x, y, w, 20), cert.StageName ?? "Training", titleStyle);
+            GUI.Label(new Rect(x, y, w, 20), cert.StageName ?? "Training", _titleStyle);
             y += 22f;
 
             y = DrawProgressBar(x, y, w, "Progress", cert.StageProgress,
@@ -282,28 +336,21 @@ namespace StraftatBots
             // instead of leaving a bar frozen at an arbitrary percentage.
             if (cert.StageSettled)
             {
-                var settled = new GUIStyle(_labelStyle);
-                settled.fontStyle = FontStyle.Bold;
-                settled.normal.textColor = new Color(0.45f, 1f, 0.55f);
                 GUI.Label(new Rect(x, y, w, 18),
-                    "Nothing new being learned — ready to finish.", settled);
+                    "Nothing new being learned — ready to finish.", _settledStyle);
                 y += 20f;
             }
 
-            var wrap = new GUIStyle(_labelStyle);
-            wrap.wordWrap = true;
-            wrap.normal.textColor = new Color(0.9f, 0.9f, 0.9f);
-            GUI.Label(new Rect(x, y, w, 34), cert.StageInstruction ?? "", wrap);
+            GUI.Label(new Rect(x, y, w, 34), cert.StageInstruction ?? "", _wrapStyle);
             y += 38f;
 
             // Weapons no bot has stood at yet (marked in the world too)
             {
                 int unvisited = cert.UnconnectedWeaponPositions?.Count ?? 0;
-                var wStyle = new GUIStyle(_labelStyle);
-                wStyle.normal.textColor = unvisited > 0 ? new Color(1f, 0.7f, 0.3f) : new Color(0.45f, 1f, 0.55f);
+                _counterStyle.normal.textColor = unvisited > 0 ? new Color(1f, 0.7f, 0.3f) : new Color(0.45f, 1f, 0.55f);
                 GUI.Label(new Rect(x, y, w, 18),
                     unvisited > 0 ? $"Weapons left to visit: {unvisited} (marked in world)" : "All weapons visited!",
-                    wStyle);
+                    _counterStyle);
                 y += 22f;
             }
 
@@ -313,15 +360,11 @@ namespace StraftatBots
                 UpdateStallTracking(cert);
                 if (_coverageStallWarning)
                 {
-                    var warn = new GUIStyle(_labelStyle);
-                    warn.wordWrap = true;
-                    warn.fontStyle = FontStyle.Bold;
-                    warn.normal.textColor = new Color(1f, 0.55f, 0.25f);
                     GUI.Label(new Rect(x, y, w, 34),
-                        "No new ground reached in 30s — the rest may be\nunreachable. Clear unreachable areas or advance.", warn);
+                        "No new ground reached in 30s — the rest may be\nunreachable. Clear unreachable areas or advance.", _warnStyle);
                     y += 38f;
                 }
-                if (GUI.Button(new Rect(x, y, w, 24), "Clear Unreachable Areas", MakeDangerButtonStyle()))
+                if (GUI.Button(new Rect(x, y, w, 24), "Clear Unreachable Areas", _dangerBtnStyle))
                 {
                     // Graph side: drop nodes with no route from spawn.
                     NavGraph.Instance?.PruneDisconnectedFromSpawn();
@@ -410,15 +453,11 @@ namespace StraftatBots
             GUI.Box(new Rect(px, py, w, h), "", _boxStyle);
             GUI.DrawTexture(new Rect(px, py, w, 4), _dangerTex);
 
-            var title = new GUIStyle(_headerStyle);
-            title.normal.textColor = new Color(1f, 0.6f, 0.3f);
-            GUI.Label(new Rect(px + 10, py + 8, w - 20, 20), "UNTRAINED MAP", title);
+            GUI.Label(new Rect(px + 10, py + 8, w - 20, 20), "UNTRAINED MAP", _popupTitleStyle);
 
-            var text = new GUIStyle(_labelStyle);
-            text.wordWrap = true;
             GUI.Label(new Rect(px + 10, py + 27, w - 20, 36),
                 "Bots have no training data for this map. They can walk the ground but " +
-                "won't know jumps, ladders or weapon routes.", text);
+                "won't know jumps, ladders or weapon routes.", _popupTextStyle);
 
             if (GUI.Button(new Rect(px + 10, py + h - 32, 140, 24), "Start Training", _activeButtonStyle))
             {
@@ -457,15 +496,6 @@ namespace StraftatBots
             return y + 14f;
         }
 
-        private static GUIStyle MakeDangerButtonStyle()
-        {
-            var style = new GUIStyle(_buttonStyle);
-            style.normal.background = _dangerTex;
-            style.normal.textColor = Color.white;
-            style.fontStyle = FontStyle.Bold;
-            return style;
-        }
-
         private static void DrawWorldLabel(Camera cam, Vector3 worldPos, string label, Texture2D background)
         {
             Vector3 screen = cam.WorldToScreenPoint(worldPos + Vector3.up * 1.4f);
@@ -473,16 +503,10 @@ namespace StraftatBots
 
             float x = screen.x;
             float y = Screen.height - screen.y;
-            var box = new GUIStyle(GUI.skin.box);
-            box.normal.background = background;
-            box.normal.textColor = Color.white;
-            box.fontStyle = FontStyle.Bold;
-            box.fontSize = 12;
-            box.alignment = TextAnchor.MiddleCenter;
-            box.wordWrap = true;
+            _worldLabelStyle.normal.background = background; // mutate, don't allocate
 
-            GUI.Box(new Rect(x - 85f, y - 26f, 170f, 38f), label, box);
-            GUI.Label(new Rect(x - 10f, y + 9f, 20f, 22f), "v", box);
+            GUI.Box(new Rect(x - 85f, y - 26f, 170f, 38f), label, _worldLabelStyle);
+            GUI.Label(new Rect(x - 10f, y + 9f, 20f, 22f), "v", _worldLabelStyle);
         }
 
         private static void DrawHelpPage(float x, float y)
@@ -561,21 +585,12 @@ namespace StraftatBots
 
         private static float HelpEntry(float y, float w, string name, string desc)
         {
-            var nameStyle = new GUIStyle(_labelStyle);
-            nameStyle.fontSize = 13;
-            nameStyle.fontStyle = FontStyle.Bold;
-            nameStyle.normal.textColor = new Color(0.5f, 0.9f, 1f);
-            GUI.Label(new Rect(8, y, w, 20), name, nameStyle);
+            GUI.Label(new Rect(8, y, w, 20), name, _helpNameStyle);
             y += 22f;
-
-            var descStyle = new GUIStyle(_labelStyle);
-            descStyle.fontSize = 11;
-            descStyle.normal.textColor = new Color(0.8f, 0.8f, 0.8f);
-            descStyle.wordWrap = true;
 
             int lines = desc.Split('\n').Length;
             float descH = lines * 15f + 6f;
-            GUI.Label(new Rect(12, y, w - 8, descH), desc, descStyle);
+            GUI.Label(new Rect(12, y, w - 8, descH), desc, _helpDescStyle);
             return y + descH + 8f;
         }
 
