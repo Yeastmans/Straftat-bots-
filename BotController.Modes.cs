@@ -964,6 +964,25 @@ namespace StraftatBots
             return _localPlayerTf;
         }
 
+        // Re-applied on a slow poll rather than once: the local player object is
+        // replaced on respawn/scene change, and a stale ignore-pair silently stops
+        // applying to the new controller.
+        private float _ignorePlayerCollTimer;
+
+        private void EnsurePlayerCollisionIgnored()
+        {
+            _ignorePlayerCollTimer -= Time.deltaTime;
+            if (_ignorePlayerCollTimer > 0f) return;
+            _ignorePlayerCollTimer = 2f;
+            if (_cc == null || !_cc.enabled) return;
+            var playerTf = GetLocalPlayerTransform();
+            if (playerTf == null) return;
+            var pcc = playerTf.GetComponent<CharacterController>();
+            if (pcc == null) pcc = playerTf.GetComponentInParent<CharacterController>();
+            if (pcc == null || pcc == _cc) return;
+            try { Physics.IgnoreCollision(_cc, pcc, true); } catch { }
+        }
+
         private void HandleGetToMe()
         {
             var playerTf = GetLocalPlayerTransform();

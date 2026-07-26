@@ -304,6 +304,7 @@ namespace StraftatBots
         private float _skillBurstPauseMult = 1f;  // full-auto pause length multiplier
         private float _skillDodgeChance = 0.02f;  // per-frame dodge roll when hurt
         private float _skillDriftFloor = 0.35f;   // close-range floor on aim drift (low skill = wobbly even point-blank)
+        private float _skillMovePenalty = 1f;     // how much running degrades aim (1 = full, 0 = none)
         private float _skillSemiAutoFloor = 0.55f;// min seconds between semi-auto shots
         private int _skillBurstMin = 3;           // full-auto shots before a pause
         private int _skillBurstMax = 6;
@@ -323,18 +324,24 @@ namespace StraftatBots
             _appliedDifficulty = level;
             Difficulty = level;
 
-            _aimInaccuracy      = SkillLerp(level, 8.0f, 2.5f, 0.3f);
-            _skillDriftFloor    = SkillLerp(level, 0.65f, 0.35f, 0.08f);
-            _skillReactionMin   = SkillLerp(level, 0.55f, 0.15f, 0.04f);
-            _skillReactionMax   = SkillLerp(level, 1.10f, 0.40f, 0.10f);
-            _skillLockOnRate    = SkillLerp(level, 0.5f, 1.5f, 4.5f);
-            _skillAimSlerp      = SkillLerp(level, 4.5f, 10f, 22f);
-            _detectionRange     = SkillLerp(level, 22f, 40f, 60f);
-            _skillBurstPauseMult = SkillLerp(level, 2.2f, 1f, 0.35f);
-            _skillDodgeChance   = SkillLerp(level, 0.002f, 0.02f, 0.08f);
-            _skillSemiAutoFloor = SkillLerp(level, 0.85f, 0.55f, 0.30f);
-            _skillBurstMin      = Mathf.RoundToInt(SkillLerp(level, 2f, 3f, 5f));
-            _skillBurstMax      = Mathf.RoundToInt(SkillLerp(level, 4f, 6f, 9f));
+            _aimInaccuracy      = SkillLerp(level, 8.0f, 2.5f, 0.10f);
+            _skillDriftFloor    = SkillLerp(level, 0.65f, 0.35f, 0.03f);
+            _skillReactionMin   = SkillLerp(level, 0.55f, 0.15f, 0.02f);
+            _skillReactionMax   = SkillLerp(level, 1.10f, 0.40f, 0.06f);
+            _skillLockOnRate    = SkillLerp(level, 0.5f, 1.5f, 9f);
+            // Tracking speed was the real ceiling on high-skill lethality: at 22 the
+            // camera lerps ~37%/frame toward the target, so a strafing player sat in a
+            // permanent lag error the aim never closed no matter how small the drift.
+            // 55 converges within a frame or two — the "almost aimbot" the slider promises.
+            _skillAimSlerp      = SkillLerp(level, 4.5f, 10f, 55f);
+            _detectionRange     = SkillLerp(level, 22f, 40f, 70f);
+            _skillBurstPauseMult = SkillLerp(level, 2.2f, 1f, 0.15f);
+            _skillDodgeChance   = SkillLerp(level, 0.002f, 0.02f, 0.10f);
+            _skillSemiAutoFloor = SkillLerp(level, 0.85f, 0.55f, 0.16f);
+            // Running ruins a low-skill bot's aim and barely touches an expert's.
+            _skillMovePenalty   = SkillLerp(level, 1f, 1f, 0.1f);
+            _skillBurstMin      = Mathf.RoundToInt(SkillLerp(level, 2f, 3f, 7f));
+            _skillBurstMax      = Mathf.RoundToInt(SkillLerp(level, 4f, 6f, 12f));
         }
 
         // Weapon state machine
@@ -1060,9 +1067,14 @@ namespace StraftatBots
             SampleWalkTrail();
             UpdateZoneDwell();
 
-            // Never stay buried in geometry — see ResolveWallEmbed (ladder repositions,
-            // bad spawns, and players shoving bots into walls all land here).
+            // Never stay buried in geometry — see ResolveWallEmbed (ladder repositions
+            // and bad spawns land here).
             ResolveWallEmbed();
+
+            // Bots and the player pass through each other, so a player walking into a
+            // bot can't shove it anywhere (Unity depenetrates overlapping controllers by
+            // displacing one, and the bot always lost — often into a wall).
+            EnsurePlayerCollisionIgnored();
 
             // Training stages 2-3 measure locations bots have PHYSICALLY stood at —
             // report standing near one on a slow cadence (training only, Play pays nothing).

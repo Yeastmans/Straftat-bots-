@@ -1106,8 +1106,8 @@ namespace StraftatBots
                 float inaccuracy = _aimInaccuracy * Mathf.Clamp(dist / _attackRange, _skillDriftFloor, 1f);
                 // Less accurate when bot is moving
                 float moveSpeed = _cc != null ? Mathf.Sqrt(_cc.velocity.x * _cc.velocity.x + _cc.velocity.z * _cc.velocity.z) : 0f;
-                if (moveSpeed > _walkSpeed * 0.5f) inaccuracy *= 1.5f;
-                if (moveSpeed > _sprintSpeed * 0.5f) inaccuracy *= 2f;
+                if (moveSpeed > _walkSpeed * 0.5f) inaccuracy *= Mathf.Lerp(1f, 1.5f, _skillMovePenalty);
+                if (moveSpeed > _sprintSpeed * 0.5f) inaccuracy *= Mathf.Lerp(1f, 2f, _skillMovePenalty);
                 // Reduce inaccuracy as aim locks on
                 inaccuracy *= Mathf.Lerp(2f, 0.5f, _aimSmoothing);
 

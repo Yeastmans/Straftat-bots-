@@ -475,6 +475,28 @@ namespace StraftatBots
             _lastAcceptedPathScore = score;
             _routeCommitTarget = target;
 
+            // Drop leading waypoints that sit BEHIND the bot. A* starts its path at the
+            // node nearest the bot — frequently the one it just walked away from — so the
+            // bot turned around to touch it before heading off, and the repath after that
+            // picked the node it had just left. That round trip IS the two-point
+            // oscillation. Only plain walking legs are skipped: jump and ladder takeoff
+            // nodes have to be hit exactly or the launch misses.
+            Vector3 me = transform.position;
+            while (_graphPathIndex + 1 < _graphPath.Count)
+            {
+                var cur = _graphPath[_graphPathIndex];
+                var nxt = _graphPath[_graphPathIndex + 1];
+                if (cur == null || nxt == null) break;
+                Vector3 toCur = cur.Position - me; toCur.y = 0f;
+                if (toCur.magnitude > 4f) break;                  // genuinely ahead of us
+                Vector3 curToNext = nxt.Position - cur.Position; curToNext.y = 0f;
+                if (toCur.sqrMagnitude < 0.01f || curToNext.sqrMagnitude < 0.01f) break;
+                if (Vector3.Dot(toCur.normalized, curToNext.normalized) > -0.2f) break;
+                var e = NavGraph.Instance != null ? NavGraph.Instance.GetEdgeBetween(cur.Id, nxt.Id) : null;
+                if (e != null && e.Type != EdgeType.Walk) break;
+                _graphPathIndex++;
+            }
+
             int specialEdges = CountRouteSpecialEdges(_graphPath);
             // Stickier commits = bots stop re-deciding their route every couple seconds (smoother,
             // less direction-thrashing). Safe now that A* is deterministic, so the committed route
@@ -1007,7 +1029,11 @@ namespace StraftatBots
                             }
                             else
                             {
-                                _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
+                                // Capped at 3s (was 7s): long nodeless stretches are where
+                                // bots have no map knowledge and start wall-oscillating,
+                                // so a route bounce must not exile them from the graph for
+                                // most of a fight.
+                                _nodelessLockTimer = Mathf.Min(3f, 1.75f + 1.25f * _nodelessBounceCount);
                                 SwitchPathSource(PathSource.DirectTacticalRoute);
                                 Plugin.Log.LogInfo($"[{BotName}] Nodeless lock engaged for {_nodelessLockTimer:F1}s (bounce #{_nodelessBounceCount})");
                                 if (_nodelessBounceCount >= 3)
@@ -2566,20 +2592,42 @@ namespace StraftatBots
                     if (_dirFlipCount >= 4)
                     {
                         _dirFlipCount = 0;
-                        _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
                         _lastBounceTime = Time.time;
+
+                        // Flip-flopping while NODELESS means direct movement is the
+                        // problem — the bot has no map knowledge here, so it walks at a
+                        // wall, reverses, turns back, repeat. The old handler answered by
+                        // EXTENDING the nodeless lock (up to 7s), which fed the very loop
+                        // it was detecting: one session logged 146 of these bursts at 146
+                        // DIFFERENT targets. Get back onto a real route instead.
+                        _nodelessLockTimer = 0f;
                         _graphPath.Clear();
                         _graphPathIndex = 0;
                         _repathTimer = 0f;
-                        _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
-                        SwitchPathSource(PathSource.DirectTacticalRoute);
-                        if (_nodelessBounceCount >= 2)
+                        _nextRepathAllowedAt = 0f;
+                        SwitchPathSource(PathSource.GraphRoute);
+
+                        // Sidestep and hold it, so the next frame doesn't just resume the
+                        // same head-on standoff while the new route is being built.
+                        Vector3 from = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+                        Vector3 side = Vector3.Cross(Vector3.up, from).normalized;
+                        if ((BotId & 1) == 0) side = -side;
+                        if (!HasGroundFootprintAhead(side, 0.8f) || IsKillZoneAhead(side, 0.8f))
+                            side = -side;
+                        if (HasGroundFootprintAhead(side, 0.8f) && !IsKillZoneAhead(side, 0.8f))
                         {
-                            // Bouncing AGAIN before the count decayed = the TARGET is the
-                            // problem, not the steering. Field logs showed breakout bursts
-                            // (#1..#5 back-to-back) because this handler reset counters and
-                            // re-drove at the same unreachable point forever. Burn every
-                            // reference to it and leave the area committed.
+                            _commitDir = side;
+                            _commitTimer = 1f;
+                        }
+
+                        // Only blame the OBJECTIVE after several bursts. Burning one per
+                        // flip marked targets all over the map as visited, which starved
+                        // the pickers and sent bots wandering to random distant spots.
+                        if (Time.time - _lastFlipBurstTime > 20f) _flipBurstCount = 0;
+                        _lastFlipBurstTime = Time.time;
+                        if (++_flipBurstCount >= 3)
+                        {
+                            _flipBurstCount = 0;
                             RememberVisit(target);
                             RememberVisit(transform.position);
                             if (_targetItem != null) { _blacklistedWeapons[_targetItem] = Time.time; _targetItem = null; }
@@ -2587,16 +2635,8 @@ namespace StraftatBots
                             _hasWanderTarget = false;
                             _wanderChangeTimer = 0f;
                             _exploredStaleCount = 11; // training pickers: force distant
-                            Plugin.Log.LogInfo($"[{BotName}] Oscillation repeat — burning target {target}");
-                            Vector3 escFrom = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
-                            if (TryGetSafeEdgeEscapeDir(escFrom, out Vector3 esc))
-                            { _commitDir = esc; _commitTimer = 1.5f; }
-                            else
-                            { _commitDir = -escFrom; _commitTimer = 1.2f; }
-                            return;
+                            Plugin.Log.LogInfo($"[{BotName}] Oscillation persists — burning target {target}");
                         }
-                        Plugin.Log.LogInfo($"[{BotName}] Direction oscillation — breaking out (bounce #{_nodelessBounceCount})");
-                        MoveTowardNodeless(target, speed);
                         return;
                     }
                 }
@@ -2751,6 +2791,8 @@ namespace StraftatBots
 
         private int _wallReverseCount;
         private float _lastWallReverseTime = -999f;
+        private int _flipBurstCount;              // nodeless oscillation bursts, decays after 20s
+        private float _lastFlipBurstTime = -999f;
 
         // ---- Mid-air void-fall watchdog ----
         private bool _voidRescueActive;
