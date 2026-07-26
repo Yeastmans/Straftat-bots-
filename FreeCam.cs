@@ -34,6 +34,11 @@ namespace StraftatBots
         private const float MOUSE_SENS_Y = 2.0f;
         private const float PITCH_LIMIT  = 89f;
 
+        /// <summary>The camera freecam is currently flying, or null when inactive.
+        /// World-space UI (weapon markers) projects through it while detached.</summary>
+        public static Camera CurrentCamera
+            => _instance != null && Active ? _instance._cam : null;
+
         /// <summary>Toggle freecam on/off. Called from TrainingUI button.</summary>
         public static void Toggle()
         {

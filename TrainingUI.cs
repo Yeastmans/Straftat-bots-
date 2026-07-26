@@ -6,9 +6,8 @@ namespace StraftatBots
     {
         private static bool _expanded = true;
         private static bool _helpOpen = false;
-        private static Vector2 _scrollPos = Vector2.zero;
         private static Vector2 _helpScrollPos = Vector2.zero;
-        private static float _lastContentH = 800f; // auto-sized from previous frame
+        private static float _lastContentH = 430f; // measured each frame; sizes the panel
 
         // Dragging state
         private static Vector2 _panelPos = new Vector2(10f, 10f);
@@ -104,6 +103,28 @@ namespace StraftatBots
             DrawUntrainedMapPopup(NavGraph.Instance.GetCertificationReport());
         }
 
+        /// <summary>The camera the player is actually looking through. While ALIVE the
+        /// first-person camera is a child of the local FPC and is NOT tagged
+        /// MainCamera — Camera.main only resolves once the death/spectator camera
+        /// takes over, which is why world markers used to appear only when dead.</summary>
+        private static Camera GetViewCamera()
+        {
+            var fcCam = FreeCam.CurrentCamera;
+            if (fcCam != null && fcCam.isActiveAndEnabled) return fcCam;
+            try
+            {
+                var ci = ClientInstance.Instance;
+                var fpc = ci != null && ci.PlayerSpawner != null ? ci.PlayerSpawner.player : null;
+                if (fpc != null)
+                {
+                    var cam = fpc.GetComponentInChildren<Camera>();
+                    if (cam != null && cam.isActiveAndEnabled) return cam;
+                }
+            }
+            catch { }
+            return Camera.main;
+        }
+
         public static void DrawAll()
         {
             InitStyles();
@@ -116,7 +137,7 @@ namespace StraftatBots
             if (inTraining && liveCert != null
                 && liveCert.UnconnectedWeaponPositions != null)
             {
-                Camera cam = Camera.main;
+                Camera cam = GetViewCamera();
                 if (cam != null)
                 {
                     int shown = 0;
@@ -151,9 +172,10 @@ namespace StraftatBots
                 return;
             }
 
-            // Expanded panel
+            // Expanded panel — height fits the content exactly (measured last frame,
+            // the standard IMGUI one-frame lag); no scroll view, no scroll bar.
             float panelW = 280f;
-            float panelH = 400f;
+            float panelH = Mathf.Min(22f + 26f + _lastContentH + 8f, Screen.height - y - 8f);
             Rect panel = new Rect(x, y, panelW, panelH);
             GUI.Box(panel, "", _boxStyle);
 
@@ -190,13 +212,10 @@ namespace StraftatBots
                 return;
             }
 
-            // Scrollable content area — height auto-sized from previous frame
-            float scrollTop = y + dragBarH + 26f;
-            Rect scrollViewRect = new Rect(x, scrollTop, panelW, panelH - dragBarH - 26f);
-            _scrollPos = GUI.BeginScrollView(scrollViewRect, _scrollPos, new Rect(0, 0, panelW - 20, _lastContentH));
-
-            float cx = 8f;
-            float cy = 4f;
+            // Content drawn directly on the panel (no scroll view)
+            float contentTop = y + dragBarH + 26f;
+            float cx = x + 8f;
+            float cy = contentTop + 4f;
 
             // ---- Freecam (top row — quick access while watching bots train) ----
             bool freecam = FreeCam.Active;
@@ -237,10 +256,8 @@ namespace StraftatBots
                 cy = DrawStagePanel(cx, cy, cw, cert);
             }
 
-            // Store content height for next frame so scroll area auto-sizes
-            _lastContentH = cy + 40f;
-
-            GUI.EndScrollView();
+            // Content height for next frame's panel sizing
+            _lastContentH = cy - contentTop + 10f;
         }
 
         private static float DrawStagePanel(float x, float y, float w, MapCertificationReport cert)
