@@ -62,6 +62,7 @@ namespace StraftatBots
         public static ConfigEntry<bool> ShowOverlay;
         public static ConfigEntry<bool> ShowCoverageMap;
         public static ConfigEntry<bool> ShowMeshDebug;
+        public static ConfigEntry<bool> GetToMe;
         // One-line perf summary every 10s (fps, bot CPU ms/frame, GC pressure).
         public static ConfigEntry<bool> LogPerfStats;
         // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
@@ -211,6 +212,11 @@ namespace StraftatBots
 
             ShowMeshDebug = Config.Bind("Debug", "Mesh Debug", false,
                 "Draw just the baked navmesh wireframe (without the full bot overlay).");
+
+            GetToMe = Config.Bind("Bots", "Get To Me", false,
+                "Every bot drops what it's doing and heads for your current position, " +
+                "repathing as you move. Overrides training work, pause and combat. " +
+                "Bots never teleport, so anywhere they can't reach is a real traversal gap.");
 
             LogPerfStats = Config.Bind("Debug", "Log Perf Stats", true,
                 "Write a one-line performance summary to the log every 10 seconds " +

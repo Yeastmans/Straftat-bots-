@@ -1208,10 +1208,15 @@ namespace StraftatBots
             // Mode selection
             bool trainingMode = NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training;
 
+            // GET TO ME overrides everything below: training work, the pause freeze,
+            // weapon hunting, combat. Checked before the freeze so a paused session
+            // still sends bots at the player.
+            bool getToMe = Plugin.GetToMe != null && Plugin.GetToMe.Value;
+
             // Training None = freeze bots in place.
             // EXCEPTION: if the graph is empty, auto-kickstart — bots explore anyway so
             // a fresh map gets trained by bots alone without requiring the user to flip a toggle.
-            if (trainingMode && Plugin.IsTrainingNone)
+            if (!getToMe && trainingMode && Plugin.IsTrainingNone)
             {
                 bool graphEmpty = NavGraph.Instance == null || NavGraph.Instance.NodeCount < 5;
                 if (!graphEmpty)
@@ -1223,7 +1228,11 @@ namespace StraftatBots
                 // Fall through — graph is empty, let bot wander to seed initial data.
             }
 
-            if (trainingMode)
+            if (getToMe)
+            {
+                HandleGetToMe();
+            }
+            else if (trainingMode)
             {
                 if (Plugin.IsValidateMode) HandleTrainingValidation();
                 else Wander();
@@ -2459,6 +2468,8 @@ namespace StraftatBots
             if (IsDead || _frozen || _onLadder) return;
             // Combat strafing legitimately covers ground without displacement.
             if (State == BotState.Hunt || _playerTarget != null) return;
+            // Get-To-Me: dropping the objective is exactly what must NOT happen.
+            if (Plugin.GetToMe != null && Plugin.GetToMe.Value) return;
 
             _oscSampleTimer -= Time.deltaTime;
             if (_oscSampleTimer > 0f) return;

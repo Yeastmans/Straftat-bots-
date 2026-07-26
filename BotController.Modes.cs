@@ -145,6 +145,13 @@ namespace StraftatBots
         private void UpdateZoneDwell()
         {
             Vector3 pos = transform.position;
+            // Get-To-Me owns the objective — dwelling near the player is the POINT.
+            if (Plugin.GetToMe != null && Plugin.GetToMe.Value)
+            {
+                _dwellAnchor = pos;
+                _dwellTimer = 0f;
+                return;
+            }
             if (HorizontalDist(pos, _dwellAnchor) > 12f)
             {
                 _dwellAnchor = pos;
@@ -934,6 +941,73 @@ namespace StraftatBots
         }
 
         private int _validationSearchFails; // consecutive empty validation searches
+
+        // ===================== GET TO ME =====================
+        // Every bot beelines for the local player and keeps repathing as they move.
+        // Deliberately does NOT teleport or disable the void/kill-zone safeties: if a
+        // bot can't get to you, that's a real traversal gap worth seeing.
+        private static Transform _localPlayerTf;
+        private static float _localPlayerLookupAt;
+        private float _getToMeStuckLogAt;
+
+        private static Transform GetLocalPlayerTransform()
+        {
+            if (_localPlayerTf != null && Time.time < _localPlayerLookupAt) return _localPlayerTf;
+            _localPlayerLookupAt = Time.time + 1f;
+            try
+            {
+                var ci = ClientInstance.Instance;
+                var fpc = ci != null && ci.PlayerSpawner != null ? ci.PlayerSpawner.player : null;
+                _localPlayerTf = fpc != null ? fpc.transform : null;
+            }
+            catch { _localPlayerTf = null; }
+            return _localPlayerTf;
+        }
+
+        private void HandleGetToMe()
+        {
+            var playerTf = GetLocalPlayerTransform();
+            if (playerTf == null) { Wander(); return; } // not in a match yet
+
+            Vector3 p = playerTf.position;
+            float flat = HorizontalDist(transform.position, p);
+
+            // Arrived — hold station facing the player instead of shoving them around.
+            if (flat < 2.5f && Mathf.Abs(p.y - transform.position.y) < 3f)
+            {
+                _currentHorizInput = 0f;
+                LookAtTarget(p);
+                if (_cc != null && _cc.enabled && !_movedThisFrame)
+                    DoMove(new Vector3(0f, _verticalVelocity * Time.deltaTime, 0f));
+                _getToMeStuckLogAt = 0f;
+                return;
+            }
+
+            // Keep every other system pointed at the player too (route validity checks,
+            // stuck recovery and the debug overlay all read the wander target).
+            _wanderTarget = p;
+            _hasWanderTarget = true;
+            _wanderChangeTimer = 2f;
+            _exploreState = ExploreState.None;
+
+            // The player moved far from what the current route was built for — rebuild
+            // now rather than waiting for the route to drift stale.
+            if (HorizontalDist(p, _lastPathTarget) > 5f)
+            {
+                _graphPath.Clear();
+                _graphPathIndex = 0;
+                _repathTimer = 0f;
+            }
+
+            // Reachability diagnostic: say so when a bot genuinely can't close in.
+            if (_progressState == ProgressState.HardStuck && Time.time >= _getToMeStuckLogAt)
+            {
+                _getToMeStuckLogAt = Time.time + 15f;
+                Plugin.Log.LogInfo($"[{BotName}] Get-To-Me: stuck {flat:F0}m from player at {transform.position} (src={_pathSource})");
+            }
+
+            MoveToward(p, _sprintSpeed);
+        }
 
         private void Wander()
         {
