@@ -60,6 +60,7 @@ namespace StraftatBots
         // ===== Debug =====
         // Single overlay toggle — covers nodes, edges, bot paths, markers, and info text.
         public static ConfigEntry<bool> ShowOverlay;
+        public static ConfigEntry<bool> ShowCoverageMap;
         // One-line perf summary every 10s (fps, bot CPU ms/frame, GC pressure).
         public static ConfigEntry<bool> LogPerfStats;
         // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
@@ -201,6 +202,10 @@ namespace StraftatBots
             ShowOverlay = Config.Bind("Debug", "Show Overlay", false,
                 "Draw navigation nodes, edges, bot paths, and bot info text. " +
                 "Costs real frame time — leave off except when debugging bots.");
+
+            ShowCoverageMap = Config.Bind("Debug", "Coverage Map", true,
+                "During training: tint walked ground green and unwalked ground orange " +
+                "so you can see exactly what the bots still have to cover.");
 
             LogPerfStats = Config.Bind("Debug", "Log Perf Stats", true,
                 "Write a one-line performance summary to the log every 10 seconds " +

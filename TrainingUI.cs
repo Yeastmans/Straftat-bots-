@@ -345,6 +345,15 @@ namespace StraftatBots
                     NavGraph.Instance?.AdvanceTrainingStage();
                 y += 32f;
 
+                // Coverage tint toggle — green walked / orange unwalked ground.
+                bool covOn = Plugin.ShowCoverageMap != null && Plugin.ShowCoverageMap.Value;
+                if (GUI.Button(new Rect(x, y, w, 24), covOn ? "Coverage Map: ON" : "Coverage Map: OFF",
+                        covOn ? _activeButtonStyle : _buttonStyle))
+                {
+                    if (Plugin.ShowCoverageMap != null) Plugin.ShowCoverageMap.Value = !covOn;
+                }
+                y += 30f;
+
                 // Debug overlay toggle — same setting as the lobby Bots box button.
                 bool overlayOn = Plugin.ShowOverlay != null && Plugin.ShowOverlay.Value;
                 if (GUI.Button(new Rect(x, y, w, 24), overlayOn ? "Debug: ON" : "Debug: OFF", _buttonStyle))

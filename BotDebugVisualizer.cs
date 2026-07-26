@@ -71,17 +71,35 @@ namespace StraftatBots
         {
             if (cam == null || _glMat == null) return;
 
-            // Toggle FIRST: this callback fires for every camera every frame, and
-            // Camera.allCameras below allocates — with the overlay off it must cost
-            // nothing.
+            // Toggles FIRST: this callback fires for every camera every frame, and
+            // Camera.allCameras below allocates — with everything off it must cost
+            // nothing. The coverage tint is independent of the debug overlay: it is
+            // a TRAINING aid (walked vs unwalked ground), not a debugging view.
             bool showOverlay = Plugin.ShowOverlay?.Value ?? false;
-            if (!showOverlay) return;
+            bool showCoverage = (Plugin.ShowCoverageMap?.Value ?? false)
+                && NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training
+                && BotNavMesh.Ready;
+            if (!showOverlay && !showCoverage) return;
 
             if (cam.targetTexture != null) return;
             foreach (var c in Camera.allCameras)
             {
                 if (c.targetTexture != null) continue;
                 if (c.depth < cam.depth) return;
+            }
+
+            if (showCoverage && !showOverlay)
+            {
+                _glMat.SetPass(0);
+                GL.PushMatrix();
+                try
+                {
+                    GL.LoadProjectionMatrix(GL.GetGPUProjectionMatrix(cam.projectionMatrix, false));
+                    GL.modelview = cam.worldToCameraMatrix;
+                    DrawCoverageMap(cam);
+                }
+                finally { GL.PopMatrix(); }
+                return;
             }
 
             bool showText = showOverlay;
@@ -107,6 +125,7 @@ namespace StraftatBots
                 GL.LoadProjectionMatrix(GL.GetGPUProjectionMatrix(cam.projectionMatrix, false));
                 GL.modelview = cam.worldToCameraMatrix;
 
+                if (showCoverage) DrawCoverageMap(cam);
                 if (showEdges) DrawNavMesh(cam);
                 if (showNodes) DrawGraphNodes(cam);
                 if (showEdges) DrawGraphEdges(cam);
@@ -121,6 +140,43 @@ namespace StraftatBots
             {
                 GL.PopMatrix();
             }
+        }
+
+        // ============ TRAINING COVERAGE MAP ============
+        // Flat tint quads over the scan cells near the camera: green = walked,
+        // orange = still uncovered. Cell list refreshed every 0.5s, not per frame.
+        private static readonly List<KeyValuePair<Vector3, bool>> _covCells
+            = new List<KeyValuePair<Vector3, bool>>(1024);
+        private static float _covRefreshAt;
+        private static Vector3 _covRefreshPos;
+
+        static void DrawCoverageMap(Camera cam)
+        {
+            Vector3 camPos = cam.transform.position;
+            if (Time.time >= _covRefreshAt || (camPos - _covRefreshPos).sqrMagnitude > 100f)
+            {
+                _covRefreshAt = Time.time + 0.5f;
+                _covRefreshPos = camPos;
+                BotNavMesh.GetCoverageCellsNear(camPos, 50f, 900, _covCells);
+            }
+            if (_covCells.Count == 0) return;
+
+            float h = BotNavMesh.CellSize * 0.42f; // slight gap between quads reads as a grid
+            Color walkedCol = new Color(0.25f, 0.9f, 0.4f, 0.13f);
+            Color unwalkedCol = new Color(1f, 0.55f, 0.15f, 0.32f);
+
+            GL.Begin(GL.QUADS);
+            for (int i = 0; i < _covCells.Count; i++)
+            {
+                Vector3 p = _covCells[i].Key;
+                GL.Color(_covCells[i].Value ? walkedCol : unwalkedCol);
+                float y = p.y + 0.06f;
+                GL.Vertex3(p.x - h, y, p.z - h);
+                GL.Vertex3(p.x + h, y, p.z - h);
+                GL.Vertex3(p.x + h, y, p.z + h);
+                GL.Vertex3(p.x - h, y, p.z + h);
+            }
+            GL.End();
         }
 
         // ============ BLACKLISTED WEAPONS ============

@@ -68,6 +68,26 @@ namespace StraftatBots
 
         public static int ReachableCellCount => _reachableCells.Count;
         public static int WalkedCellCount => _walkedCells.Count;
+        public static float CellSize => _cellSize;
+
+        /// <summary>Reachable coverage cells within radius of a point, with their
+        /// walked flag — feeds the training coverage indicator. Buffer is cleared
+        /// first; collection stops at maxCells (visual density cap, not fairness).</summary>
+        public static void GetCoverageCellsNear(Vector3 center, float radius, int maxCells,
+            List<KeyValuePair<Vector3, bool>> buffer)
+        {
+            buffer.Clear();
+            if (!_baked) return;
+            float r2 = radius * radius;
+            foreach (long k in _reachableCells)
+            {
+                Vector3 p = CellToWorld(k);
+                float dx = p.x - center.x, dz = p.z - center.z;
+                if (dx * dx + dz * dz > r2) continue;
+                buffer.Add(new KeyValuePair<Vector3, bool>(p, _walkedCells.Contains(k)));
+                if (buffer.Count >= maxCells) return;
+            }
+        }
 
         public static bool Ready => _baked && (Plugin.UseNavMesh == null || Plugin.UseNavMesh.Value);
         public static string BakedScene => _bakedScene;
