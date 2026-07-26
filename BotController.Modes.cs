@@ -170,6 +170,8 @@ namespace StraftatBots
         private bool _edgeWalkFlipped;             // Already tried other direction
         private Vector3 _probeTarget;              // Platform detected by PlatformProbe
         private bool _probeJumpAttempted;          // Already tried jumping this probe cycle
+        private Vector3 _smartExploreFailPos;      // Last target a full session failed at
+        private float _smartExploreFailTime = -999f; // When — gates immediate re-sessions
 
         private void BeginSmartExplore(Vector3 target)
         {
@@ -932,8 +934,19 @@ namespace StraftatBots
                 _exploreTotalTimer -= Time.deltaTime;
                 if (_exploreTotalTimer <= 0f || _exploreStateAttempts >= 7)
                 {
+                    // Session FAILED (success exits inside SmartExplore before the
+                    // timer runs out). Burn the target for 45s across ALL pickers and
+                    // drop it NOW — keeping it meant walking back to the same wall and
+                    // re-running the whole stuck→SmartExplore loop (visible ping-pong).
+                    if (_hasWanderTarget && _wanderTarget != Vector3.zero)
+                        RememberVisit(_wanderTarget);
+                    _smartExploreFailPos = _wanderTarget;
+                    _smartExploreFailTime = Time.time;
+                    _hasWanderTarget = false;
+                    _wanderChangeTimer = 0f;
                     _exploreState = ExploreState.None;
                     _stuckTimer = 0f;
+                    Plugin.Log.LogInfo($"[{BotName}] SmartExplore failed — burning target {_smartExploreFailPos}");
                 }
                 else
                 {
@@ -961,16 +974,26 @@ namespace StraftatBots
                 }
                 if (meshCantRoute)
                 {
-                    if (NavGraph.Instance != null)
+                    // Repeat guard: a SmartExplore session at (nearly) this target just
+                    // failed. Running another is the wall ping-pong the player sees —
+                    // burn the target and fall through to the re-pick instead.
+                    bool repeatFail = Time.time - _smartExploreFailTime < 30f
+                        && HorizontalDist(_wanderTarget, _smartExploreFailPos) < 6f;
+                    if (!repeatFail)
                     {
-                        Vector3 approachDir = _wanderTarget - transform.position;
-                        approachDir.y = 0f;
-                        if (approachDir.sqrMagnitude > 0.01f) approachDir.Normalize();
-                        NavGraph.Instance.PushFrontier(_wanderTarget, approachDir, BotId);
+                        if (NavGraph.Instance != null)
+                        {
+                            Vector3 approachDir = _wanderTarget - transform.position;
+                            approachDir.y = 0f;
+                            if (approachDir.sqrMagnitude > 0.01f) approachDir.Normalize();
+                            NavGraph.Instance.PushFrontier(_wanderTarget, approachDir, BotId);
+                        }
+                        BeginSmartExplore(_wanderTarget);
+                        _stuckTimer = 0f;
+                        return;
                     }
-                    BeginSmartExplore(_wanderTarget);
-                    _stuckTimer = 0f;
-                    return;
+                    RememberVisit(_wanderTarget);
+                    _exploredStaleCount = 11; // stage pickers read this as "force distant"
                 }
 
                 _hasWanderTarget = false; // routable but stuck — re-pick below, no pacing
@@ -1063,7 +1086,9 @@ namespace StraftatBots
                     if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 2 && Random.value < 0.75f)
                     {
                         var (wPos, wLabel) = NavGraph.Instance.FindUnreachableMapLocation(transform.position);
-                        if (wPos != Vector3.zero
+                        // FindUnreachableMapLocation is deterministic (nearest unlinked) —
+                        // without the visited check a failed target gets re-picked forever.
+                        if (wPos != Vector3.zero && !IsRecentlyVisited(wPos)
                             && TryAssignExploreTarget(wPos, Random.Range(14f, 22f) * commitmentMultiplier, requireRoute: false))
                         {
                             Plugin.Log.LogInfo($"[{BotName}] Stage 2: targeting unlinked weapon '{wLabel}'");
@@ -1074,7 +1099,8 @@ namespace StraftatBots
                     // PRIORITY 0 — Frontier queue. A previous bot gave up on this cell;
                     // try it again from a different angle (≥45° off their approach).
                     if (NavGraph.Instance != null &&
-                        NavGraph.Instance.TryPopFrontier(BotId, out Vector3 frontierPos, out Vector3 avoidDir))
+                        NavGraph.Instance.TryPopFrontier(BotId, out Vector3 frontierPos, out Vector3 avoidDir)
+                        && !IsRecentlyVisited(frontierPos))
                     {
                         // If we have an avoid direction, stage a waypoint 6m away in the
                         // perpendicular (or reverse) direction so our approach to the cell
@@ -1110,7 +1136,9 @@ namespace StraftatBots
                     if (roll < 0.35f && NavGraph.Instance != null)
                     {
                         var cov = NavGraph.Instance.GetLowestVisitReachableCell(transform.position, 60f);
-                        if (cov.HasValue)
+                        // A cell the bot keeps failing to reach stays lowest-visit forever —
+                        // the visited check is what breaks that permanent magnet.
+                        if (cov.HasValue && !IsRecentlyVisited(cov.Value))
                         {
                             if (TryAssignExploreTarget(cov.Value, Random.Range(10f, 18f) * commitmentMultiplier, requireRoute: true))
                                 goto doneWanderPick;
@@ -1122,7 +1150,7 @@ namespace StraftatBots
                     if (roll < 0.5f && NavGraph.Instance != null)
                     {
                         var (unreachPos, unreachLabel) = NavGraph.Instance.FindUnreachableMapLocation(transform.position);
-                        if (unreachPos != Vector3.zero)
+                        if (unreachPos != Vector3.zero && !IsRecentlyVisited(unreachPos))
                         {
                             if (!TryAssignExploreTarget(unreachPos, Random.Range(15f, 25f) * commitmentMultiplier, requireRoute: false))
                                 roll = 0.55f;
@@ -1135,7 +1163,7 @@ namespace StraftatBots
                     {
                         var frontier = NavGraph.Instance.FindFrontierNode(transform.position, 5f,
                             avoidPos: otherBotsAvg, exploredCells: _exploredCells);
-                        if (frontier != null)
+                        if (frontier != null && !IsRecentlyVisited(frontier.Position))
                         {
                             if (!TryAssignExploreTarget(frontier.Position, Random.Range(10f, 18f) * commitmentMultiplier, requireRoute: true))
                                 roll = 0.85f;
@@ -1192,7 +1220,7 @@ namespace StraftatBots
                     if (roll2 < 0.45f && NavGraph.Instance != null && NavGraph.Instance.HasData)
                     {
                         var (locPos, locLabel, locPath) = NavGraph.Instance.FindReachableMapLocation(transform.position);
-                        if (locPath.Count > 0)
+                        if (locPath.Count > 0 && !IsRecentlyVisited(locPos))
                         {
                             _graphPath = locPath;
                             _graphPathIndex = 0;
@@ -1208,7 +1236,7 @@ namespace StraftatBots
                     if (roll2 >= 0.45f && roll2 < 0.7f && NavGraph.Instance != null && NavGraph.Instance.HasData)
                     {
                         var frontier = NavGraph.Instance.FindFrontierNode(transform.position, 5f, avoidPos: otherBotsAvg, exploredCells: _exploredCells);
-                        if (frontier != null)
+                        if (frontier != null && !IsRecentlyVisited(frontier.Position))
                         {
                             _wanderTarget = frontier.Position;
                             _hasWanderTarget = true;

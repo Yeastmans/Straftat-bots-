@@ -2677,10 +2677,57 @@ namespace StraftatBots
                     return test;
                 }
             }
-            // All blocked — commit to reverse for 2s
+            // All blocked — commit to reverse, briefly. The old 2s commit walked the
+            // bot ~8m back out, after which the unchanged objective drove it straight
+            // back into the pocket: the classic two-point wall ping-pong.
+            if (Time.time - _lastWallReverseTime > 6f) _wallReverseCount = 0;
+            _wallReverseCount++;
+            _lastWallReverseTime = Time.time;
+            if (_wallReverseCount >= 2)
+            {
+                // Second full reversal inside 6s = the objective is behind this wall
+                // pocket and unreachable from here. Burn it and force a fresh pick.
+                _wallReverseCount = 0;
+                if (_hasWanderTarget && _wanderTarget != Vector3.zero)
+                    RememberVisit(_wanderTarget);
+                _hasWanderTarget = false;
+                _wanderChangeTimer = 0f;
+                _exploredStaleCount = 11; // training pickers: force distant
+                _graphPath.Clear();
+                _graphPathIndex = 0;
+                _repathTimer = 0f;
+                Plugin.Log.LogInfo($"[{BotName}] Wall pocket — repeated reversals, dropping objective");
+            }
             _commitDir = -dir;
-            _commitTimer = 2f;
+            _commitTimer = 1.2f;
             return -dir;
+        }
+
+        private int _wallReverseCount;
+        private float _lastWallReverseTime = -999f;
+
+        // ---- Mid-air void-fall watchdog ----
+        private bool _voidRescueActive;
+        private float _voidRescueProbeTimer;
+
+        /// <summary>True when a descending bot has no plausible landing: nothing under
+        /// it, nothing under where its horizontal drift puts it in ~0.45s, and nothing
+        /// under its air-strafe target (when one is active). Probes are triggers-ignored,
+        /// so kill-water over solid floor still counts as ground — only true void hits.</summary>
+        private bool IsFallingIntoVoid()
+        {
+            Vector3 pos = transform.position;
+            if (Physics.Raycast(pos, Vector3.down, 40f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            Vector3 vel = _cc != null ? _cc.velocity : Vector3.zero;
+            vel.y = 0f;
+            Vector3 ahead = pos + vel * 0.45f;
+            if (Physics.Raycast(ahead + Vector3.up * 1f, Vector3.down, 45f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            if (_airStrafeActive
+                && Physics.Raycast(_airStrafeTarget + Vector3.up * 2f, Vector3.down, 12f, GROUND_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            return true;
         }
 
         // ---- Door interaction ----
@@ -3000,14 +3047,33 @@ namespace StraftatBots
                     && flat.magnitude < 14f
                     && (flat.sqrMagnitude < 0.25f || Vector3.Dot(flat.normalized, dir) > 0.5f))
                 {
-                    // Authorize ONLY if stepping off here actually lands on something.
-                    // A below-waypoint across a chasm means the route wants a JUMP —
-                    // if the jump logic didn't fire, walking off is a void death
-                    // (this exact regression killed bots on jump-y paths).
-                    Vector3 stepProbe = myPos + dir * 1.1f + Vector3.up * 0.4f;
-                    if (Physics.Raycast(stepProbe, Vector3.down, drop + 5f,
+                    // Authorize ONLY if stepping off here actually lands on a FOOTPRINT
+                    // of ground, not one lucky ray down a sliver. A below-waypoint across
+                    // a chasm means the route wants a JUMP — if the jump logic didn't
+                    // fire, walking off is a void death (this exact regression killed
+                    // bots on jump-y paths); and a rail/prop under the lip could pass
+                    // the old single-ray probe while the actual capsule missed it.
+                    Vector3 side = Vector3.Cross(Vector3.up, dir).normalized * 0.35f;
+                    Vector3 probeBase = myPos + dir * 1.1f + Vector3.up * 0.4f;
+                    float probeDepth = drop + 5f;
+                    if (!Physics.Raycast(probeBase, Vector3.down, probeDepth,
                             GROUND_MASK, QueryTriggerInteraction.Ignore))
-                        return true;
+                        continue;
+                    if (!Physics.Raycast(probeBase + side, Vector3.down, probeDepth,
+                            GROUND_MASK, QueryTriggerInteraction.Ignore)
+                        && !Physics.Raycast(probeBase - side, Vector3.down, probeDepth,
+                            GROUND_MASK, QueryTriggerInteraction.Ignore))
+                        continue;
+
+                    // Track the waypoint through the fall. Without steering, long drops
+                    // drifted off narrow landings — air-strafe takes over once airborne,
+                    // and the short intent window arms it (which also stands the lip
+                    // safety down; that is exactly what authorization means). Only fires
+                    // at the lip: the caller already found no ground ahead.
+                    _airStrafeTarget = node.Position;
+                    _airStrafeActive = true;
+                    _intentionalJumpTimer = Mathf.Max(_intentionalJumpTimer, 0.45f);
+                    return true;
                 }
             }
             return false;
@@ -3249,7 +3315,16 @@ namespace StraftatBots
                     }
                     else
                     {
-                        dir = -dir;
+                        // Same treatment with graph data: an uncommitted per-frame -dir
+                        // flipped the steering every frame (vibrating at the lip). Prefer
+                        // a side that still has ground; commit so the choice sticks.
+                        Vector3 side = Vector3.Cross(Vector3.up, dir).normalized;
+                        if ((BotId & 1) == 0) side = -side;
+                        if (HasGroundFootprintAhead(side, 0.8f)) dir = side;
+                        else if (HasGroundFootprintAhead(-side, 0.8f)) dir = -side;
+                        else dir = -dir;
+                        _commitDir = dir;
+                        _commitTimer = 0.6f;
                     }
                 }
             }
@@ -4419,6 +4494,7 @@ namespace StraftatBots
                     _activeJumpReason = JumpReason.None; // Landed — clear priority lock
                     // Air-strafe is only valid while airborne — clear on landing.
                     _airStrafeActive = false;
+                    _voidRescueActive = false;
                 }
             }
             else
@@ -4429,6 +4505,38 @@ namespace StraftatBots
                     : (_verticalVelocity > 0 ? _gravityJump : _gravityNormal);
                 _verticalVelocity -= grav * _gravityZoneMultiplier * Time.deltaTime;
                 if (_verticalVelocity < _maxFallSpeed) _verticalVelocity = _maxFallSpeed;
+
+                // MID-AIR LANDING WATCHDOG: descending with no plausible ground below,
+                // ahead along the current drift, OR under the air-strafe target means
+                // this fall ends in the void — every grounded safety is useless by now.
+                // Steer hard back toward the last stood-on ground; worst case the bot
+                // hugs the cliff face and dies exactly as it would have, best case it
+                // re-catches the lip it slipped off. Zone launches are excluded — pads
+                // intentionally throw bots far, and fighting the ride breaks it.
+                if (_verticalVelocity < -2f && _zoneForceDuration <= 0f && !_zoneVerticalActive)
+                {
+                    _voidRescueProbeTimer -= Time.deltaTime;
+                    if (_voidRescueProbeTimer <= 0f)
+                    {
+                        _voidRescueProbeTimer = 0.15f;
+                        bool wasRescuing = _voidRescueActive;
+                        _voidRescueActive = IsFallingIntoVoid();
+                        if (_voidRescueActive && !wasRescuing)
+                        {
+                            // The landing plan (if any) has failed — stop trusting it.
+                            _airStrafeActive = false;
+                            _intentionalJumpTimer = 0f;
+                            Plugin.Log.LogInfo($"[{BotName}] Void fall detected mid-air — steering back to last ground");
+                        }
+                    }
+                }
+                if (_voidRescueActive)
+                {
+                    Vector3 back = _lastGroundedPos - transform.position;
+                    back.y = 0f;
+                    if (back.sqrMagnitude > 0.04f)
+                        _cc.Move(back.normalized * (6f * Time.deltaTime));
+                }
 
                 // AIR STRAFE: nudge horizontally toward the intended landing point.
                 // Applies whenever an airborne bot has an active strafe target — bridges the

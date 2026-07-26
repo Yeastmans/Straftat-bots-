@@ -2464,6 +2464,14 @@ namespace StraftatBots
             if (walked > 14f && net < 3f)
             {
                 Plugin.Log.LogInfo($"[{BotName}] Pacing detected (walked {walked:F0}m, net {net:F1}m) — dropping objective and route");
+                // Burn BOTH ends of the failed run for 45s: the objective (so every
+                // picker rejects it — dropping it alone let deterministic pickers hand
+                // it right back) and the ground being paced (so nearby cells lose appeal).
+                Vector3 pacingObjective = GetCurrentObjective();
+                if (HorizontalDist(pacingObjective, transform.position) > 0.5f)
+                    RememberVisit(pacingObjective);
+                RememberVisit(transform.position);
+                _exploredStaleCount = 11; // training pickers read this as "force distant"
                 _oscCount = 0;
                 _hasWanderTarget = false;
                 _wanderChangeTimer = 0f;

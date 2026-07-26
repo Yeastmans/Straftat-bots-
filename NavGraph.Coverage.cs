@@ -47,6 +47,7 @@ namespace StraftatBots
             public Vector3 Pos;
             public Vector3 ApproachDir;  // unit vector from bot -> pos at the moment of giving up (may be zero)
             public int     BotId;        // who gave up, so we can bias away from them (optional)
+            public float   PushTime;     // when it was pushed — gates same-bot immediate re-pop
         }
         private readonly Queue<FrontierEntry> _frontier = new Queue<FrontierEntry>();
         private const int FRONTIER_CAP = 32;
@@ -223,7 +224,7 @@ namespace StraftatBots
             if (dir.sqrMagnitude > 0.01f) dir.Normalize();
             else dir = Vector3.zero;
 
-            _frontier.Enqueue(new FrontierEntry { Pos = pos, ApproachDir = dir, BotId = botId });
+            _frontier.Enqueue(new FrontierEntry { Pos = pos, ApproachDir = dir, BotId = botId, PushTime = Time.time });
             while (_frontier.Count > FRONTIER_CAP) _frontier.Dequeue();
         }
 
@@ -243,13 +244,26 @@ namespace StraftatBots
         /// </summary>
         public bool TryPopFrontier(int callerBotId, out Vector3 pos, out Vector3 avoidDir)
         {
-            if (_frontier.Count == 0) { pos = Vector3.zero; avoidDir = Vector3.zero; return false; }
-            var entry = _frontier.Dequeue();
-            pos = entry.Pos;
-            // If the last attempt was by the *same* bot, avoidDir is its own dir; otherwise
-            // we still bias away — different-angle attempts compound information fastest.
-            avoidDir = entry.ApproachDir;
-            return true;
+            // A bot must NOT get its own just-failed cell handed straight back —
+            // that was a guaranteed return trip to the same wall (visible ping-pong).
+            // Rotate own-recent entries to the back so OTHER bots (or a later self,
+            // once the 30s cooldown passes) pick them up instead.
+            int n = _frontier.Count;
+            for (int i = 0; i < n; i++)
+            {
+                var entry = _frontier.Dequeue();
+                if (entry.BotId == callerBotId && Time.time - entry.PushTime < 30f)
+                {
+                    _frontier.Enqueue(entry);
+                    continue;
+                }
+                pos = entry.Pos;
+                // If the last attempt was by the *same* bot, avoidDir is its own dir; otherwise
+                // we still bias away — different-angle attempts compound information fastest.
+                avoidDir = entry.ApproachDir;
+                return true;
+            }
+            pos = Vector3.zero; avoidDir = Vector3.zero; return false;
         }
 
         /// <summary>

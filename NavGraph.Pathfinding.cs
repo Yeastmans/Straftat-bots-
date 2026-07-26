@@ -123,16 +123,37 @@ namespace StraftatBots
 
                     if (Mode == NavMode.Play && fromN != null && toN != null)
                     {
+                        // SOFT gating (was a hard skip). Hard-skipping merely-untrusted
+                        // special edges on lightly-trained maps severed every vertical
+                        // route; the "no path" result cascaded bots into the nodeless
+                        // DirectTacticalRoute fallback — the mode with the least void
+                        // protection and the source of most map-edge deaths. Keep them
+                        // routable at a steep premium so a trusted route always wins when
+                        // one exists. Genuinely bad edges (Blocked/NeedsDemo) are still
+                        // hard-skipped by IsBadForPlay above.
                         if ((edge.Type == EdgeType.Jump || edge.Type == EdgeType.WallJump)
                             && !IsTrustedForPlay(edge)
                             && (!fromN.PlayerSourced || !toN.PlayerSourced))
-                            continue;
+                            edgeCost *= 4f;
 
                         if (edge.Type == EdgeType.Fall)
                         {
                             float drop = fromN.Position.y - toN.Position.y;
-                            if (!IsTrustedForPlay(edge) || drop > 2.75f || toN.NearEdge)
-                                continue;
+                            if (IsTrustedForPlay(edge))
+                            {
+                                // A validated fall of any survivable size is usable — the
+                                // game has no fall damage, and refusing >2.75m drops made
+                                // stage-3 validation of big drops permanently useless in
+                                // Play. Execution still landing-probes every walk-off.
+                                if (drop > 30f) continue;
+                                if (toN.NearEdge) edgeCost *= 2f; // lip landing: usable, not preferred
+                            }
+                            else
+                            {
+                                // Untrusted falls: step-down height only, at a premium.
+                                if (drop > 2.75f || toN.NearEdge) continue;
+                                edgeCost *= 3f;
+                            }
                         }
                     }
 
