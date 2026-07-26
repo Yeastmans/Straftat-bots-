@@ -1050,6 +1050,11 @@ namespace StraftatBots
             _movedThisFrame = false;
             if (IsDead) return;
 
+            // Route anti-repeat inputs run in EVERY mode: breadcrumb trail (picker/score
+            // repulsion) and the zone-dwell breaker (bot pinned in one area too long).
+            SampleWalkTrail();
+            UpdateZoneDwell();
+
             // Per-bot skill — re-read from config on a slow cadence so mod-menu
             // changes apply live to bots already in the match.
             _skillRefreshTimer -= Time.deltaTime;

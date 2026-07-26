@@ -11,7 +11,12 @@ namespace StraftatBots
         /// Find a path from start position to target position.
         /// Returns list of nodes to follow, or empty if no path.
         /// </summary>
-        public List<NavNode> FindPath(Vector3 startPos, Vector3 targetPos, float jitter = 0.15f, float searchRadius = 30f, bool playerOnly = false, bool preferHeight = false)
+        /// <param name="edgeCostScale">Optional per-caller cost multiplier (from,to) —
+        /// bots pass their recent-edge memory so consecutive routes through the same
+        /// zone are pushed onto different corridors instead of re-deriving the
+        /// identical (deterministic) path every repath.</param>
+        public List<NavNode> FindPath(Vector3 startPos, Vector3 targetPos, float jitter = 0.15f, float searchRadius = 30f, bool playerOnly = false, bool preferHeight = false,
+            System.Func<int, int, float> edgeCostScale = null)
         {
             var startNode = playerOnly ? FindNearestPlayerNode(startPos, searchRadius) : FindNearestNode(startPos, searchRadius);
             var endNode = playerOnly ? FindNearestPlayerNode(targetPos, searchRadius) : FindNearestNode(targetPos, searchRadius);
@@ -209,6 +214,11 @@ namespace StraftatBots
                         }
                     }
 
+                    // Per-caller repeat penalty — recently traversed edges cost more for
+                    // THIS bot, so its next route through the zone takes different ground.
+                    if (edgeCostScale != null)
+                        edgeCost *= edgeCostScale(edge.From, edge.To);
+
                     // DETERMINISTIC tie-break instead of per-call randomness. A stable per-edge
                     // hash means the SAME start/target returns the SAME path every recompute, so
                     // bots stop flip-flopping between near-equal routes — the biggest source of the
@@ -242,7 +252,8 @@ namespace StraftatBots
         /// temporarily blacklists nodes near avoidPos and pathfinds with wider search radius
         /// to force a detour around the obstacle.
         /// </summary>
-        public List<NavNode> FindPathAvoiding(Vector3 startPos, Vector3 targetPos, Vector3 avoidPos, float avoidRadius = 5f, float searchRadius = 40f)
+        public List<NavNode> FindPathAvoiding(Vector3 startPos, Vector3 targetPos, Vector3 avoidPos, float avoidRadius = 5f, float searchRadius = 40f,
+            System.Func<int, int, float> edgeCostScale = null)
         {
             // Temporarily blacklist nodes in the avoid zone
             var tempAvoided = new List<int>();
@@ -259,14 +270,14 @@ namespace StraftatBots
             }
 
             // Now pathfind with wider search radius — forces A* to go around the avoided area
-            var path = FindPath(startPos, targetPos, jitter: 0.05f, searchRadius: searchRadius);
+            var path = FindPath(startPos, targetPos, jitter: 0.05f, searchRadius: searchRadius, edgeCostScale: edgeCostScale);
 
             // If direct path failed, try reaching closest reachable node near target
             if (path.Count == 0)
             {
                 var reachable = FindClosestReachableNode(startPos, targetPos);
                 if (reachable != null)
-                    path = FindPath(startPos, reachable.Position, jitter: 0.05f, searchRadius: searchRadius);
+                    path = FindPath(startPos, reachable.Position, jitter: 0.05f, searchRadius: searchRadius, edgeCostScale: edgeCostScale);
             }
 
             // If still no path, try progress node (gets closer even if can't reach target)
@@ -274,7 +285,7 @@ namespace StraftatBots
             {
                 var progress = FindProgressNode(startPos, targetPos, searchRadius);
                 if (progress != null)
-                    path = FindPath(startPos, progress.Position, jitter: 0.05f, searchRadius: searchRadius);
+                    path = FindPath(startPos, progress.Position, jitter: 0.05f, searchRadius: searchRadius, edgeCostScale: edgeCostScale);
             }
 
             // Clean up temp blacklist entries we added (let normal blacklist persist)

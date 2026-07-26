@@ -86,6 +86,79 @@ namespace StraftatBots
         private bool RejectStage1CellOrTrail(Vector3 pos)
             => RejectStage1Cell(pos) || IsOnRecentTrail(pos);
 
+        // ---- Route anti-repeat (ALL modes) ----
+        // Graph edges this bot walked recently cost extra in ITS pathfinding for 25s,
+        // so consecutive routes through the same zone land on different corridors.
+        // A* went deterministic on purpose (route flip-flop) — without this, a bot
+        // whose objectives keep it in one zone re-derives the identical path every
+        // repath and visibly grinds the same lane.
+        private readonly Dictionary<long, float> _recentEdgeUse = new Dictionary<long, float>(64);
+        private System.Func<int, int, float> _routeRepeatPenalty; // cached delegate, no per-call alloc
+        private System.Func<int, int, float> RoutePenaltyFunc
+            => _routeRepeatPenalty ?? (_routeRepeatPenalty = RouteRepeatPenalty);
+
+        private const float EDGE_REPEAT_MEMORY = 25f;
+        private const float EDGE_REPEAT_PENALTY = 3.5f;
+
+        private static long EdgeUseKey(int from, int to) => ((long)(uint)from << 32) | (uint)to;
+
+        private void StampEdgeUse(int from, int to)
+        {
+            if (from < 0 || to < 0) return; // synthetic navmesh-corner ids
+            float now = Time.time;
+            _recentEdgeUse[EdgeUseKey(from, to)] = now;
+            _recentEdgeUse[EdgeUseKey(to, from)] = now; // reverse = the oscillation we're killing
+            if (_recentEdgeUse.Count > 96)
+            {
+                _edgeUsePruneBuf.Clear();
+                foreach (var kv in _recentEdgeUse)
+                    if (now - kv.Value > EDGE_REPEAT_MEMORY) _edgeUsePruneBuf.Add(kv.Key);
+                foreach (long k in _edgeUsePruneBuf) _recentEdgeUse.Remove(k);
+            }
+        }
+        private static readonly List<long> _edgeUsePruneBuf = new List<long>(96);
+
+        private float RouteRepeatPenalty(int from, int to)
+        {
+            if (!_recentEdgeUse.TryGetValue(EdgeUseKey(from, to), out float t)) return 1f;
+            float age = Time.time - t;
+            if (age >= EDGE_REPEAT_MEMORY) return 1f;
+            return Mathf.Lerp(EDGE_REPEAT_PENALTY, 1f, age / EDGE_REPEAT_MEMORY);
+        }
+
+        // ---- Zone-dwell breaker (ALL non-combat states) ----
+        // A bot pinned inside a ~12m circle for 25s without fighting is grinding a
+        // zone. Mark the spot visited (45s picker rejection), dump the route, and
+        // force the next wander pick to go distant.
+        private Vector3 _dwellAnchor;
+        private float _dwellTimer;
+
+        private void UpdateZoneDwell()
+        {
+            Vector3 pos = transform.position;
+            if (HorizontalDist(pos, _dwellAnchor) > 12f)
+            {
+                _dwellAnchor = pos;
+                _dwellTimer = 0f;
+                return;
+            }
+            bool validating = Plugin.IsValidateMode && _validationRouteNodeIds.Count > 1;
+            if (State == BotState.Hunt || State == BotState.Dead || _onLadder || validating) return;
+            _dwellTimer += Time.deltaTime;
+            if (_dwellTimer < 25f) return;
+
+            Plugin.Log.LogInfo($"[{BotName}] Zone dwell — 25s inside 12m at {pos}, breaking out");
+            RememberVisit(pos);
+            _graphPath.Clear();
+            _graphPathIndex = 0;
+            _hasWanderTarget = false;
+            _wanderChangeTimer = 0f;
+            _repathTimer = 0f;
+            _exploredStaleCount = 11; // training pickers read this as "force distant"
+            _dwellAnchor = pos;
+            _dwellTimer = 0f;
+        }
+
         // SmartExplore state machine — replaces random explore
         private ExploreState _exploreState = ExploreState.None;
         private float _exploreStateTimer;          // Time remaining in current state
@@ -256,9 +329,9 @@ namespace StraftatBots
 
             bool wantsHeight = Mathf.Abs(target.y - transform.position.y) > 2.25f;
             Consider(NavGraph.Instance.FindPath(transform.position, target,
-                jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight), target);
+                jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight, edgeCostScale: RoutePenaltyFunc), target);
             Consider(NavGraph.Instance.FindPath(transform.position, target,
-                jitter: 0.04f, searchRadius: 90f, playerOnly: true, preferHeight: wantsHeight), target);
+                jitter: 0.04f, searchRadius: 90f, playerOnly: true, preferHeight: wantsHeight, edgeCostScale: RoutePenaltyFunc), target);
 
             // If the exact target is not connected, route to the closest reachable
             // staging node near it instead of walking directly into geometry.
@@ -268,7 +341,7 @@ namespace StraftatBots
                 if (staging != null && HorizontalDist(transform.position, staging.Position) > 2f)
                 {
                     Consider(NavGraph.Instance.FindPath(transform.position, staging.Position,
-                        jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight), staging.Position);
+                        jitter: 0.02f, searchRadius: 90f, preferHeight: wantsHeight, edgeCostScale: RoutePenaltyFunc), staging.Position);
                 }
             }
 
@@ -839,7 +912,6 @@ namespace StraftatBots
         private void Wander()
         {
             _wanderChangeTimer -= Time.deltaTime;
-            SampleWalkTrail();
 
             // Track explored areas — record current grid cell every 2s
             _exploredCellTimer -= Time.deltaTime;

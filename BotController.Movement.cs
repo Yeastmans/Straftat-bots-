@@ -539,10 +539,10 @@ namespace StraftatBots
 
             if (bestNode == null) return null;
             var path = NavGraph.Instance.FindPath(transform.position, bestNode.Position,
-                jitter: 0.02f, searchRadius: 80f, playerOnly: true, preferHeight: true);
+                jitter: 0.02f, searchRadius: 80f, playerOnly: true, preferHeight: true, edgeCostScale: RoutePenaltyFunc);
             if (path == null || path.Count <= 1)
                 path = NavGraph.Instance.FindPath(transform.position, bestNode.Position,
-                    jitter: 0.02f, searchRadius: 80f, preferHeight: true);
+                    jitter: 0.02f, searchRadius: 80f, preferHeight: true, edgeCostScale: RoutePenaltyFunc);
             return path;
         }
 
@@ -787,7 +787,7 @@ namespace StraftatBots
                         ConsiderCandidate(NavGraph.Instance.GetCachedRoute(transform.position, target), PathSource.GraphRoute);
                         if (!combatPath)
                         {
-                            var direct = NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight);
+                            var direct = NavGraph.Instance.FindPath(transform.position, target, preferHeight: wantHeight, edgeCostScale: RoutePenaltyFunc);
                             ConsiderCandidate(direct, PathSource.GraphRoute);
                             // 40f differs from the default 30f only in endpoint snapping —
                             // rerun only when widening can snap a different endpoint.
@@ -796,16 +796,16 @@ namespace StraftatBots
                             if ((direct == null || direct.Count == 0)
                                 && (NavGraph.Instance.FindNearestNode(transform.position, 30f) == null
                                     || NavGraph.Instance.FindNearestNode(target, 30f) == null))
-                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight), PathSource.GraphRoute);
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, searchRadius: 40f, preferHeight: wantHeight, edgeCostScale: RoutePenaltyFunc), PathSource.GraphRoute);
                         }
-                        var playerNear = NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true);
+                        var playerNear = NavGraph.Instance.FindPath(transform.position, target, jitter: 0.05f, searchRadius: 50f, playerOnly: true, preferHeight: true, edgeCostScale: RoutePenaltyFunc);
                         ConsiderCandidate(playerNear, PathSource.ExploreBuildRoute);
                         if (weaponPath)
                         {
                             if (playerNear == null || playerNear.Count == 0)
-                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true), PathSource.ExploreBuildRoute);
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, playerOnly: true, preferHeight: true, edgeCostScale: RoutePenaltyFunc), PathSource.ExploreBuildRoute);
                             if (InBudget())
-                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true), PathSource.GraphRoute);
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, target, jitter: 0.02f, searchRadius: 75f, preferHeight: true, edgeCostScale: RoutePenaltyFunc), PathSource.GraphRoute);
                         }
 
                         // Full node×edge scan + up to two more A* runs — the most expensive
@@ -819,7 +819,7 @@ namespace StraftatBots
                         {
                             var closestReachable = NavGraph.Instance.FindClosestReachableNode(transform.position, target);
                             if (closestReachable != null)
-                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f), PathSource.GraphRoute);
+                                ConsiderCandidate(NavGraph.Instance.FindPath(transform.position, closestReachable.Position, searchRadius: 45f, edgeCostScale: RoutePenaltyFunc), PathSource.GraphRoute);
                         }
 
                         ConsiderCandidate(NavGraph.Instance.FindNearestPatrolRoute(transform.position, target), PathSource.ExploreBuildRoute);
@@ -1018,6 +1018,11 @@ namespace StraftatBots
                         {
                             NavGraph.Instance.TryShortcut(_prevReachedNode.Id, _lastReachedNode.Id, reachedNode.Id);
                         }
+
+                        // Route anti-repeat: remember the edge just traversed so this
+                        // bot's next repaths get pushed onto different corridors.
+                        if (_lastReachedNode != null)
+                            StampEdgeUse(_lastReachedNode.Id, reachedNode.Id);
 
                         // Rotate the 2-deep history BEFORE overwriting _lastReachedNode
                         _prevReachedNode = _lastReachedNode;
