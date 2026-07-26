@@ -70,22 +70,38 @@ namespace StraftatBots
         public static int WalkedCellCount => _walkedCells.Count;
         public static float CellSize => _cellSize;
 
-        /// <summary>Reachable coverage cells within radius of a point, with their
-        /// walked flag — feeds the training coverage indicator. Buffer is cleared
-        /// first; collection stops at maxCells (visual density cap, not fairness).</summary>
+        private static readonly List<KeyValuePair<float, long>> _covScratch
+            = new List<KeyValuePair<float, long>>(8192);
+
+        /// <summary>Reachable coverage cells within radius of a point, with their walked
+        /// flag — feeds the training coverage indicator. NEAREST-FIRST when the cap bites:
+        /// _reachableCells is a HashSet, so truncating its raw iteration order scattered
+        /// the drawn cells randomly over the whole radius (the "sparse squares" bug)
+        /// instead of showing a solid carpet around the viewer.</summary>
         public static void GetCoverageCellsNear(Vector3 center, float radius, int maxCells,
             List<KeyValuePair<Vector3, bool>> buffer)
         {
             buffer.Clear();
             if (!_baked) return;
             float r2 = radius * radius;
+            _covScratch.Clear();
             foreach (long k in _reachableCells)
             {
                 Vector3 p = CellToWorld(k);
                 float dx = p.x - center.x, dz = p.z - center.z;
-                if (dx * dx + dz * dz > r2) continue;
-                buffer.Add(new KeyValuePair<Vector3, bool>(p, _walkedCells.Contains(k)));
-                if (buffer.Count >= maxCells) return;
+                float d2 = dx * dx + dz * dz;
+                if (d2 > r2) continue;
+                float dy = p.y - center.y;
+                if (dy > 30f || dy < -30f) continue; // far-off floors: clutter, not information
+                _covScratch.Add(new KeyValuePair<float, long>(d2, k));
+            }
+            if (_covScratch.Count > maxCells)
+                _covScratch.Sort((a, b) => a.Key.CompareTo(b.Key));
+            int n = Mathf.Min(_covScratch.Count, maxCells);
+            for (int i = 0; i < n; i++)
+            {
+                long k = _covScratch[i].Value;
+                buffer.Add(new KeyValuePair<Vector3, bool>(CellToWorld(k), _walkedCells.Contains(k)));
             }
         }
 

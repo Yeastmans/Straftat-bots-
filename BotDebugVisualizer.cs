@@ -62,8 +62,21 @@ namespace StraftatBots
                 _glMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
                 _glMat.SetInt("_ZWrite", 0);
                 _glMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always);
+
+                // Coverage tint gets its own material with REAL depth testing: the
+                // overlay's ZTest Always would paint the whole map's coverage through
+                // walls and floors. Ground you can't see isn't information, it's noise.
+                _covMat = new Material(shader);
+                _covMat.hideFlags = HideFlags.HideAndDontSave;
+                _covMat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                _covMat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                _covMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+                _covMat.SetInt("_ZWrite", 0);
+                _covMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.LessEqual);
             }
         }
+
+        private static Material _covMat;
 
         // ============ GL RENDERING ============
 
@@ -128,40 +141,76 @@ namespace StraftatBots
         }
 
         // ============ TRAINING COVERAGE MAP ============
-        // Flat tint quads over the scan cells near the camera: green = walked,
-        // orange = still uncovered. Cell list refreshed every 0.5s, not per frame.
+        // Tint quad per ground scan cell near the viewer: green = walked, orange =
+        // still uncovered. The cell set refreshes every 0.5s (or on a 6m move) and is
+        // baked into a MESH — immediate-mode GL.Vertex3 per quad per frame capped the
+        // affordable count in the low hundreds, which is why the carpet had to be
+        // thin; one cached mesh draws thousands for less.
+        private const float COV_RADIUS = 45f;
+        private const int COV_MAX_CELLS = 8000;   // 32k verts — under the 16-bit limit
+
         private static readonly List<KeyValuePair<Vector3, bool>> _covCells
-            = new List<KeyValuePair<Vector3, bool>>(1024);
+            = new List<KeyValuePair<Vector3, bool>>(COV_MAX_CELLS);
+        private static readonly List<Vector3> _covVerts = new List<Vector3>(COV_MAX_CELLS * 4);
+        private static readonly List<Color> _covColors = new List<Color>(COV_MAX_CELLS * 4);
+        private static readonly List<int> _covTris = new List<int>(COV_MAX_CELLS * 6);
+        private static Mesh _covMesh;
         private static float _covRefreshAt;
         private static Vector3 _covRefreshPos;
 
         static void DrawCoverageMap(Camera cam)
         {
             Vector3 camPos = cam.transform.position;
-            if (Time.time >= _covRefreshAt || (camPos - _covRefreshPos).sqrMagnitude > 100f)
+            if (_covMesh == null || Time.time >= _covRefreshAt
+                || (camPos - _covRefreshPos).sqrMagnitude > 36f)
             {
                 _covRefreshAt = Time.time + 0.5f;
                 _covRefreshPos = camPos;
-                BotNavMesh.GetCoverageCellsNear(camPos, 50f, 900, _covCells);
+                BotNavMesh.GetCoverageCellsNear(camPos, COV_RADIUS, COV_MAX_CELLS, _covCells);
+                RebuildCoverageMesh();
             }
+            if (_covMesh == null || _covMesh.vertexCount == 0) return;
+            if (_covMat != null) _covMat.SetPass(0);
+            Graphics.DrawMeshNow(_covMesh, Matrix4x4.identity);
+            _glMat.SetPass(0); // restore the pass the rest of the overlay draws with
+        }
+
+        static void RebuildCoverageMesh()
+        {
+            if (_covMesh == null)
+            {
+                _covMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+                _covMesh.MarkDynamic();
+            }
+            _covMesh.Clear();
+            _covVerts.Clear(); _covColors.Clear(); _covTris.Clear();
             if (_covCells.Count == 0) return;
 
-            float h = BotNavMesh.CellSize * 0.42f; // slight gap between quads reads as a grid
-            Color walkedCol = new Color(0.25f, 0.9f, 0.4f, 0.13f);
-            Color unwalkedCol = new Color(1f, 0.55f, 0.15f, 0.32f);
+            // Quads meet edge-to-edge (0.5 = exact cell size): walked ground reads as a
+            // continuous carpet rather than a dotted grid, so gaps mean UNWALKED.
+            float h = BotNavMesh.CellSize * 0.5f;
+            Color walkedCol = new Color(0.25f, 0.9f, 0.4f, 0.16f);
+            Color unwalkedCol = new Color(1f, 0.5f, 0.1f, 0.38f);
 
-            GL.Begin(GL.QUADS);
             for (int i = 0; i < _covCells.Count; i++)
             {
                 Vector3 p = _covCells[i].Key;
-                GL.Color(_covCells[i].Value ? walkedCol : unwalkedCol);
-                float y = p.y + 0.06f;
-                GL.Vertex3(p.x - h, y, p.z - h);
-                GL.Vertex3(p.x + h, y, p.z - h);
-                GL.Vertex3(p.x + h, y, p.z + h);
-                GL.Vertex3(p.x - h, y, p.z + h);
+                Color c = _covCells[i].Value ? walkedCol : unwalkedCol;
+                // Cell y is a 0.5m BAND centre, so true ground is within ±0.25m. Clear
+                // that margin or depth-testing hides quads that sit inside the floor.
+                float y = p.y + 0.3f;
+                int b = _covVerts.Count;
+                _covVerts.Add(new Vector3(p.x - h, y, p.z - h));
+                _covVerts.Add(new Vector3(p.x + h, y, p.z - h));
+                _covVerts.Add(new Vector3(p.x + h, y, p.z + h));
+                _covVerts.Add(new Vector3(p.x - h, y, p.z + h));
+                _covColors.Add(c); _covColors.Add(c); _covColors.Add(c); _covColors.Add(c);
+                _covTris.Add(b); _covTris.Add(b + 1); _covTris.Add(b + 2);
+                _covTris.Add(b); _covTris.Add(b + 2); _covTris.Add(b + 3);
             }
-            GL.End();
+            _covMesh.SetVertices(_covVerts);
+            _covMesh.SetColors(_covColors);
+            _covMesh.SetTriangles(_covTris, 0);
         }
 
         // ============ BLACKLISTED WEAPONS ============
