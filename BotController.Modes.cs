@@ -48,7 +48,16 @@ namespace StraftatBots
 
         private bool RejectStage1Cell(Vector3 pos)
             => IsRecentlyVisited(pos) || IsOtherBotTargetingNear(pos)
-            || (NavGraph.Instance != null && NavGraph.Instance.FallDeathPenalty(pos) >= 1.6f);
+            || (NavGraph.Instance != null && NavGraph.Instance.FallDeathPenalty(pos) >= 1.6f)
+            || IsHazardTarget(pos);
+
+        /// <summary>Target sits inside a lethal volume (kill water). The safeties refuse
+        /// to walk in, so assigning it guarantees a stall-and-grind at the shoreline.</summary>
+        private bool IsHazardTarget(Vector3 pos)
+        {
+            RefreshKillZoneCache();
+            return IsKillZoneAt(pos + Vector3.up * 0.3f);
+        }
 
         // Breadcrumb trail: the GROUND the bot actually walked, sampled every 0.5s.
         // RememberVisit only covers assigned TARGETS — the corridor walked between
@@ -155,6 +164,10 @@ namespace StraftatBots
             _wanderChangeTimer = 0f;
             _repathTimer = 0f;
             _exploredStaleCount = 11; // training pickers read this as "force distant"
+            // A weapon objective pins Play-mode bots to a zone exactly like a wander
+            // target does — drop and blacklist it too or the breakout re-acquires it.
+            if (_targetItem != null) { _blacklistedWeapons[_targetItem] = Time.time; _targetItem = null; }
+            _weaponTarget = null;
             _dwellAnchor = pos;
             _dwellTimer = 0f;
         }
@@ -904,10 +917,15 @@ namespace StraftatBots
                 return;
             }
 
-            // No certifiable route exists yet (or everything is on cooldown). Back off
-            // before searching again — the search is the expensive part — and gather
-            // more candidate data meanwhile without marking random movement validated.
+            // No pending special-edge work (or everything is on cooldown). Run ANCHOR
+            // CIRCUITS instead of aimless wandering: physically walk to each key map
+            // location once. This is what the stage-3 anchor bar now measures — bots
+            // visibly working the map instead of milling around — and reaching the
+            // anchor marks it walked via the passive location-visit tracker.
             _validationSearchTimer = 2f + Random.value * 1.5f;
+            Vector3 circuit = NavGraph.Instance.FindNextCircuitAnchor(transform.position, BotId, IsRecentlyVisited);
+            if (circuit != Vector3.zero)
+                TryAssignExploreTarget(circuit, 18f, requireRoute: false);
             Wander();
         }
 
@@ -1081,17 +1099,17 @@ namespace StraftatBots
                         }
                     }
 
-                    // STAGE 2 — WEAPONS: unlinked weapons are THE objective. Bots hammer
-                    // them until every weapon has a working route.
+                    // STAGE 2 — WEAPONS: every weapon must be PHYSICALLY visited by a
+                    // bot this session — that's what the stage bar measures now. (The
+                    // old objective, mesh-unlinked weapons, was empty the moment the
+                    // bake finished, so stage 2 read 100% and bots had nothing to do.)
                     if (NavGraph.Instance != null && NavGraph.Instance.TrainingStage == 2 && Random.value < 0.75f)
                     {
-                        var (wPos, wLabel) = NavGraph.Instance.FindUnreachableMapLocation(transform.position);
-                        // FindUnreachableMapLocation is deterministic (nearest unlinked) —
-                        // without the visited check a failed target gets re-picked forever.
-                        if (wPos != Vector3.zero && !IsRecentlyVisited(wPos)
+                        var (wPos, wLabel) = NavGraph.Instance.FindNearestUnvisitedWeapon(transform.position, IsRecentlyVisited);
+                        if (wPos != Vector3.zero
                             && TryAssignExploreTarget(wPos, Random.Range(14f, 22f) * commitmentMultiplier, requireRoute: false))
                         {
-                            Plugin.Log.LogInfo($"[{BotName}] Stage 2: targeting unlinked weapon '{wLabel}'");
+                            Plugin.Log.LogInfo($"[{BotName}] Stage 2: visiting weapon '{wLabel}'");
                             goto doneWanderPick;
                         }
                     }

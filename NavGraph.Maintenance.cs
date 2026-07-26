@@ -886,6 +886,37 @@ namespace StraftatBots
             }
         }
 
+        /// <summary>Permanently (for this session) blacklist every node sitting inside a
+        /// lethal trigger volume, so routes never pass through kill water. Bypasses the
+        /// training lock and node protection on purpose: a node in a Killz volume is
+        /// wrong no matter who recorded it. Confidence is left alone — the data stays
+        /// for the overlay/debugging, the node just becomes unroutable.</summary>
+        public void BlockNodesInsideHazards(Collider[] zones)
+        {
+            if (zones == null || zones.Length == 0) return;
+            int blocked = 0;
+            for (int i = 0; i < Nodes.Count; i++)
+            {
+                var node = Nodes[i];
+                if (node == null || node.Confidence <= 0f) continue;
+                Vector3 p = node.Position + Vector3.up * 0.25f;
+                for (int z = 0; z < zones.Length; z++)
+                {
+                    var col = zones[z];
+                    if (col == null) continue;
+                    if ((col.ClosestPoint(p) - p).sqrMagnitude < 0.0004f)
+                    {
+                        if (!_blacklistStrikes.TryGetValue(node.Id, out int s) || s < 2)
+                            _blacklistStrikes[node.Id] = 2;
+                        blocked++;
+                        break;
+                    }
+                }
+            }
+            if (blocked > 0)
+                Plugin.Log.LogInfo($"[NavGraph] Blacklisted {blocked} node(s) inside kill volumes");
+        }
+
         public void ReportBadNode(int nodeId, string reason, int strikes = 1, bool silent = false)
         {
             if (IsLocked) return;

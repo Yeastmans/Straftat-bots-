@@ -130,6 +130,7 @@ namespace StraftatBots
         private float _nodelessLockTimer;
         private int _nodelessBounceCount;    // Escalate lock duration on repeated bounces
         private float _lastBounceTime;       // Track recency so the escalation decays over time
+        private float _locVisitMarkTimer;    // Cadence for reporting map-location visits (training)
         private int _noPathRecoveryStreak;   // Consecutive failed stuck-repaths before nodeless lock
 
         // Projectile weapon cache
@@ -901,6 +902,10 @@ namespace StraftatBots
                 if (!lethalTick) return; // hurt, keep moving — death only on the lethal tick
             }
 
+            // Learn from it: environment deaths feed the same heatmap as fall deaths,
+            // so pickers and route scoring repel this water/hazard for the next 240s.
+            try { NavGraph.Instance?.ReportFallDeath(transform.position); } catch { }
+
             // Use game's RPCs so all clients see the death (same as real player)
             try { _playerHealth.RemoveHealth(_playerHealth.health + 10f); } catch { }
             try { _playerHealth.ChangeKilledState(true); } catch { }
@@ -1054,6 +1059,18 @@ namespace StraftatBots
             // repulsion) and the zone-dwell breaker (bot pinned in one area too long).
             SampleWalkTrail();
             UpdateZoneDwell();
+
+            // Training stages 2-3 measure locations bots have PHYSICALLY stood at —
+            // report standing near one on a slow cadence (training only, Play pays nothing).
+            if (NavGraph.Instance != null && NavGraph.Instance.Mode == NavMode.Training)
+            {
+                _locVisitMarkTimer -= Time.deltaTime;
+                if (_locVisitMarkTimer <= 0f)
+                {
+                    _locVisitMarkTimer = 0.5f;
+                    NavGraph.Instance.MarkBotAtPosition(transform.position);
+                }
+            }
 
             // Per-bot skill — re-read from config on a slow cadence so mod-menu
             // changes apply live to bots already in the match.
@@ -2998,6 +3015,71 @@ namespace StraftatBots
                 if ((c.ClosestPoint(probe) - probe).sqrMagnitude < 1.44f) return true;
                 if ((c.ClosestPoint(pos) - pos).sqrMagnitude < 1.44f) return true;
             }
+            return false;
+        }
+
+        // Lethal (Killz) trigger volumes, shared by all bots, rescanned per map / 30s.
+        // DamageZones are deliberately NOT here: some maps require crossing them
+        // (ice damage pools players sprint over) — those stay survivable-by-speed,
+        // and only teach through the death heatmap when they actually kill.
+        private static Collider[] _mapKillZones = System.Array.Empty<Collider>();
+        private static string _killZoneScene;
+        private static float _killZoneScanTime = -999f;
+
+        private static void RefreshKillZoneCache()
+        {
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            if (scene == _killZoneScene && Time.time - _killZoneScanTime < 30f) return;
+            bool newScene = scene != _killZoneScene;
+            _killZoneScene = scene;
+            _killZoneScanTime = Time.time;
+            var cols = new System.Collections.Generic.List<Collider>();
+            GameObject[] gos = System.Array.Empty<GameObject>();
+            try { gos = GameObject.FindGameObjectsWithTag("Killz"); } catch { }
+            foreach (var go in gos)
+            {
+                if (go == null) continue;
+                foreach (var c in go.GetComponentsInChildren<Collider>())
+                    if (c != null && c.isTrigger) cols.Add(c);
+            }
+            _mapKillZones = cols.ToArray();
+            if (newScene && _mapKillZones.Length > 0)
+                Plugin.Log.LogInfo($"[BOT] Kill-zone cache: {_mapKillZones.Length} lethal volume(s) on this map");
+            // Routes must never pass through kill water — blacklist submerged nodes.
+            if (_mapKillZones.Length > 0)
+                NavGraph.Instance?.BlockNodesInsideHazards(_mapKillZones);
+        }
+
+        private static bool IsKillZoneAt(Vector3 point)
+        {
+            for (int i = 0; i < _mapKillZones.Length; i++)
+            {
+                var c = _mapKillZones[i];
+                if (c == null) continue;
+                if ((c.ClosestPoint(point) - point).sqrMagnitude < 0.0004f) return true;
+            }
+            return false;
+        }
+
+        /// <summary>The next step (or the ground it lands on) is inside a lethal
+        /// volume. Used by the grounded safeties exactly like a void lip. Returns
+        /// false while the bot is ALREADY inside one — never block the escape.</summary>
+        private bool IsKillZoneAhead(Vector3 horizDir, float dist)
+        {
+            RefreshKillZoneCache();
+            if (_mapKillZones.Length == 0) return false;
+            Vector3 flat = new Vector3(horizDir.x, 0f, horizDir.z);
+            if (flat.sqrMagnitude < 0.0001f) return false;
+            Vector3 pos = transform.position;
+            if (IsKillZoneAt(pos + Vector3.up * 0.25f)) return false;
+            Vector3 probe = pos + flat.normalized * (dist + 0.4f);
+            if (IsKillZoneAt(probe + Vector3.up * 0.25f)) return true;
+            // Slopes and step-downs: the water sits BELOW the current foot height —
+            // test where the ground ahead actually is.
+            if (Physics.Raycast(probe + Vector3.up * 2.5f, Vector3.down, out RaycastHit gh, 8f,
+                    GROUND_MASK, QueryTriggerInteraction.Ignore)
+                && IsKillZoneAt(gh.point + Vector3.up * 0.3f))
+                return true;
             return false;
         }
 

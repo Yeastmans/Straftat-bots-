@@ -717,6 +717,114 @@ namespace StraftatBots
             return label != "Spawn" && label != "PatrolPoint" && label != "Teleporter";
         }
 
+        // ---- Bot ground-truth location visits (per map, session-only) ----
+        // Stage bars used to read from graph/mesh CONNECTIVITY, which the bake
+        // satisfies instantly — stage 2 opened at 100% and stage 3's anchor term was
+        // pre-filled, so training visibly "did nothing". These sets record locations
+        // bots have PHYSICALLY stood at this session; stages 2-3 measure them instead.
+        private string _botVisitMap;
+        private readonly HashSet<int> _botVisitedWeaponLocs = new HashSet<int>();
+        private readonly HashSet<int> _botWalkedAnchorLocs = new HashSet<int>();
+
+        private void EnsureBotVisitMap()
+        {
+            if (_botVisitMap == CurrentMap) return;
+            _botVisitMap = CurrentMap;
+            _botVisitedWeaponLocs.Clear();
+            _botWalkedAnchorLocs.Clear();
+        }
+
+        /// <summary>Called ~2Hz per bot (and for the player recorder) during Training.
+        /// Marks any map location within 2.5m as physically visited.</summary>
+        public void MarkBotAtPosition(Vector3 pos)
+        {
+            EnsureBotVisitMap();
+            for (int i = 0; i < MapLocations.Count; i++)
+            {
+                var (lpos, label, _) = MapLocations[i];
+                float dx = pos.x - lpos.x, dz = pos.z - lpos.z;
+                if (dx * dx + dz * dz > 6.25f || Mathf.Abs(pos.y - lpos.y) > 2.5f) continue;
+                if (label == "PatrolPoint") continue;
+                _botWalkedAnchorLocs.Add(i);
+                if (IsWeaponLocationLabel(label)) _botVisitedWeaponLocs.Add(i);
+            }
+        }
+
+        public float BotWeaponVisitProgress
+        {
+            get
+            {
+                EnsureBotVisitMap();
+                int total = 0;
+                for (int i = 0; i < MapLocations.Count; i++)
+                    if (IsWeaponLocationLabel(MapLocations[i].label)) total++;
+                return total > 0 ? Mathf.Clamp01(_botVisitedWeaponLocs.Count / (float)total) : 1f;
+            }
+        }
+
+        public float BotAnchorCircuitProgress
+        {
+            get
+            {
+                EnsureBotVisitMap();
+                int total = 0;
+                for (int i = 0; i < MapLocations.Count; i++)
+                    if (MapLocations[i].label != "PatrolPoint") total++;
+                return total > 0 ? Mathf.Clamp01(_botWalkedAnchorLocs.Count / (float)total) : 1f;
+            }
+        }
+
+        public List<Vector3> GetUnvisitedWeaponPositions()
+        {
+            EnsureBotVisitMap();
+            var outList = new List<Vector3>();
+            for (int i = 0; i < MapLocations.Count; i++)
+            {
+                if (!IsWeaponLocationLabel(MapLocations[i].label)) continue;
+                if (_botVisitedWeaponLocs.Contains(i)) continue;
+                outList.Add(MapLocations[i].pos);
+            }
+            return outList;
+        }
+
+        /// <summary>Nearest weapon location no bot has stood at yet this session.</summary>
+        public (Vector3 pos, string label) FindNearestUnvisitedWeapon(Vector3 fromPos, System.Func<Vector3, bool> reject = null)
+        {
+            EnsureBotVisitMap();
+            float bestDist = float.MaxValue;
+            Vector3 bestPos = Vector3.zero;
+            string bestLabel = "";
+            for (int i = 0; i < MapLocations.Count; i++)
+            {
+                var (lpos, label, _) = MapLocations[i];
+                if (!IsWeaponLocationLabel(label)) continue;
+                if (_botVisitedWeaponLocs.Contains(i)) continue;
+                if (reject != null && reject(lpos)) continue;
+                float dist = Vector3.Distance(fromPos, lpos);
+                if (dist < bestDist) { bestDist = dist; bestPos = lpos; bestLabel = label; }
+            }
+            return (bestPos, bestLabel);
+        }
+
+        /// <summary>Next unwalked anchor for a stage-3 circuit; botId offsets the pick
+        /// so multiple bots fan out over different anchors instead of converging.</summary>
+        public Vector3 FindNextCircuitAnchor(Vector3 fromPos, int botId, System.Func<Vector3, bool> reject = null)
+        {
+            EnsureBotVisitMap();
+            var candidates = new List<(float dist, Vector3 pos)>();
+            for (int i = 0; i < MapLocations.Count; i++)
+            {
+                var (lpos, label, _) = MapLocations[i];
+                if (label == "PatrolPoint") continue;
+                if (_botWalkedAnchorLocs.Contains(i)) continue;
+                if (reject != null && reject(lpos)) continue;
+                candidates.Add((Vector3.Distance(fromPos, lpos), lpos));
+            }
+            if (candidates.Count == 0) return Vector3.zero;
+            candidates.Sort((a, b) => a.dist.CompareTo(b.dist));
+            return candidates[Mathf.Abs(botId) % candidates.Count].pos;
+        }
+
         private void ApplyCertificationStage(MapCertificationReport report, List<int> weaponIds, List<int> anchorIds)
         {
             // Background hygiene (never shown as a stage): bad route points self-prune.
@@ -750,13 +858,13 @@ namespace StraftatBots
                     break;
                 case 2:
                     report.StageName = "STAGE 2/3 — WEAPONS";
-                    // Connected-out-of-ALL-weapons. The old metric divided validated by
-                    // *already-connected* weapons, so it read 100% while unreachable
-                    // weapons remained and DROPPED when a bot connected a new one.
-                    rawProgress = report.WeaponAnchorCount > 0
-                        ? Mathf.Clamp01(report.ConnectedWeaponCount / (float)report.WeaponAnchorCount)
-                        : 1f;
-                    report.StageInstruction = "Unlinked weapons are marked in the world — bots and you reach them to connect their routes.";
+                    // Bar = weapons a bot has PHYSICALLY stood at this session. The old
+                    // metric (mesh-connectivity from spawn) was satisfied by the bake
+                    // alone, so the stage opened at 100% with nothing to do. Bots now
+                    // run the full weapon circuit, banking nodes/edges along the way.
+                    rawProgress = BotWeaponVisitProgress;
+                    report.UnconnectedWeaponPositions = GetUnvisitedWeaponPositions();
+                    report.StageInstruction = "Unvisited weapons are marked in the world — bots run the circuit until every weapon has been reached.";
                     report.NextButtonLabel = "Next Stage: Confirmation";
                     report.RecommendedBehavior = "Explore";
                     break;
@@ -773,14 +881,15 @@ namespace StraftatBots
                         ? Mathf.Clamp01((report.TrustedSpecialEdges + report.NeedsDemoSpecialEdges
                             + 0.5f * report.InProgressSpecialEdges) / (float)report.SpecialEdges)
                         : 1f;
-                    float anchorProgress = report.AnchorCount > 1
-                        ? Mathf.Clamp01(report.ValidatedAnchorRoutes / (float)report.AnchorCount)
-                        : 1f;
-                    // Weighted blend, not min() — min() pinned the whole bar at the most
-                    // stubborn term (anchor routes read 0 on maps whose mesh bake failed,
-                    // so Confirmation NEVER rose regardless of edge work done).
-                    rawProgress = specialProgress * 0.65f + anchorProgress * 0.35f;
-                    report.StageInstruction = "Bots confirm jumps, ladders and routes to every key location.";
+                    // Anchor term = anchors bots have PHYSICALLY walked to this session
+                    // (the old mesh-validated count was pre-filled by the bake, which
+                    // made stage 3 look like it did nothing). With no special edges to
+                    // confirm, the circuit IS the whole stage.
+                    float anchorProgress = BotAnchorCircuitProgress;
+                    rawProgress = report.SpecialEdges > 0
+                        ? specialProgress * 0.65f + anchorProgress * 0.35f
+                        : anchorProgress;
+                    report.StageInstruction = "Bots confirm jumps, ladders and a walked route to every key location.";
                     report.NextButtonLabel = "Finish: Switch To Play";
                     report.RecommendedBehavior = "Validate";
                     break;

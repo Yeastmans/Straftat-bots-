@@ -987,6 +987,12 @@ namespace StraftatBots
                             _repathTimer = 0f;
                             _stuckTimer = 1f; // Trigger stuck recovery
 
+                            // Poison the bounced lane in THIS bot's A* — deterministic
+                            // pathfinding re-derived the identical A<->B hop on every
+                            // repath, which is why "breaking the loop" never broke it.
+                            if (_lastReachedNode != null && _lastReachedNode.Id >= 0 && reachedNode.Id >= 0)
+                                StampEdgeUse(_lastReachedNode.Id, reachedNode.Id);
+
                             _nodelessBounceCount = Mathf.Min(5, _nodelessBounceCount + 1);
                             _lastBounceTime = Time.time;
 
@@ -1004,6 +1010,20 @@ namespace StraftatBots
                                 _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
                                 SwitchPathSource(PathSource.DirectTacticalRoute);
                                 Plugin.Log.LogInfo($"[{BotName}] Nodeless lock engaged for {_nodelessLockTimer:F1}s (bounce #{_nodelessBounceCount})");
+                                if (_nodelessBounceCount >= 3)
+                                {
+                                    // Third bounce burst: the OBJECTIVE keeps sending the
+                                    // bot back into this loop. Burn it like the flip
+                                    // detector does and force a fresh pick elsewhere.
+                                    RememberVisit(target);
+                                    RememberVisit(transform.position);
+                                    if (_targetItem != null) { _blacklistedWeapons[_targetItem] = Time.time; _targetItem = null; }
+                                    _weaponTarget = null;
+                                    _hasWanderTarget = false;
+                                    _wanderChangeTimer = 0f;
+                                    _exploredStaleCount = 11;
+                                    Plugin.Log.LogInfo($"[{BotName}] Node ping-pong repeat — burning target {target}");
+                                }
                             }
                             break;
                         }
@@ -2379,9 +2399,10 @@ namespace StraftatBots
                 if (horizMove.sqrMagnitude > 0.01f)
                 {
                     float voidLookahead = Mathf.Clamp(horizMove.magnitude * 0.16f, 0.8f, 2.0f);
-                    if (!HasGroundFootprintAhead(horizMove, voidLookahead)
+                    bool voidAhead = !HasGroundFootprintAhead(horizMove, voidLookahead)
                         && !IsImpulseZoneAhead(horizMove, voidLookahead)
-                        && !RouteAuthorizesDrop(horizMove))
+                        && !RouteAuthorizesDrop(horizMove);
+                    if (voidAhead || IsKillZoneAhead(horizMove, voidLookahead))
                     {
                         if (TryGetSafeEdgeEscapeDir(horizMove, out Vector3 escapeDir))
                         {
@@ -2509,7 +2530,8 @@ namespace StraftatBots
                 if (hm.sqrMagnitude > 0.01f)
                 {
                     float voidLookahead = Mathf.Clamp(hm.magnitude * 0.16f, 0.8f, 2.0f);
-                    if (!HasGroundFootprintAhead(hm, voidLookahead) && !IsImpulseZoneAhead(hm, voidLookahead))
+                    if ((!HasGroundFootprintAhead(hm, voidLookahead) && !IsImpulseZoneAhead(hm, voidLookahead))
+                        || IsKillZoneAhead(hm, voidLookahead))
                     {
                         if (TryGetSafeEdgeEscapeDir(hm, out Vector3 escapeDir))
                         {
@@ -2551,6 +2573,28 @@ namespace StraftatBots
                         _repathTimer = 0f;
                         _nodelessLockTimer = Mathf.Min(7f, 1.75f + 1.25f * _nodelessBounceCount);
                         SwitchPathSource(PathSource.DirectTacticalRoute);
+                        if (_nodelessBounceCount >= 2)
+                        {
+                            // Bouncing AGAIN before the count decayed = the TARGET is the
+                            // problem, not the steering. Field logs showed breakout bursts
+                            // (#1..#5 back-to-back) because this handler reset counters and
+                            // re-drove at the same unreachable point forever. Burn every
+                            // reference to it and leave the area committed.
+                            RememberVisit(target);
+                            RememberVisit(transform.position);
+                            if (_targetItem != null) { _blacklistedWeapons[_targetItem] = Time.time; _targetItem = null; }
+                            _weaponTarget = null;
+                            _hasWanderTarget = false;
+                            _wanderChangeTimer = 0f;
+                            _exploredStaleCount = 11; // training pickers: force distant
+                            Plugin.Log.LogInfo($"[{BotName}] Oscillation repeat — burning target {target}");
+                            Vector3 escFrom = _lastMoveDir.sqrMagnitude > 0.01f ? _lastMoveDir : transform.forward;
+                            if (TryGetSafeEdgeEscapeDir(escFrom, out Vector3 esc))
+                            { _commitDir = esc; _commitTimer = 1.5f; }
+                            else
+                            { _commitDir = -escFrom; _commitTimer = 1.2f; }
+                            return;
+                        }
                         Plugin.Log.LogInfo($"[{BotName}] Direction oscillation — breaking out (bounce #{_nodelessBounceCount})");
                         MoveTowardNodeless(target, speed);
                         return;
@@ -2693,6 +2737,8 @@ namespace StraftatBots
                 _hasWanderTarget = false;
                 _wanderChangeTimer = 0f;
                 _exploredStaleCount = 11; // training pickers: force distant
+                if (_targetItem != null) { _blacklistedWeapons[_targetItem] = Time.time; _targetItem = null; }
+                _weaponTarget = null;
                 _graphPath.Clear();
                 _graphPathIndex = 0;
                 _repathTimer = 0f;
@@ -2860,6 +2906,7 @@ namespace StraftatBots
                 d.y = 0f;
                 d.Normalize();
                 if (!HasGroundFootprintAhead(d, 0.65f)) continue;
+                if (IsKillZoneAhead(d, 0.65f)) continue; // never escape INTO kill water
                 if (Physics.Raycast(transform.position + Vector3.up * 0.9f, d, 0.7f, WALL_MASK, QueryTriggerInteraction.Ignore))
                     continue;
 
