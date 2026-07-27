@@ -455,6 +455,17 @@ namespace StraftatBots
                     return;
                 }
 
+                // 2b. ROCKET JUMP — holding a launcher and the gap is past normal jump
+                // reach. A player in this spot shoots their feet rather than hunting for
+                // a crate, so try it before the ledge/wall scans instead of only after
+                // they fail. (Cheap: HoldingLauncher early-outs on maps with no launcher.)
+                if (heightDiff > 3.5f && HoldingLauncher())
+                {
+                    Vector3 toTargetFlat = target - pos; toTargetFlat.y = 0f;
+                    if (TryRocketJump(toTargetFlat, heightDiff))
+                        return;
+                }
+
                 // 3. Ledge/crate scan — look for jumpable surfaces above.
                 // EXPANDED: denser directional sweep (16 dirs) and wider height band
                 // (up to 3m above) so bots can find high platforms when no nodes exist.

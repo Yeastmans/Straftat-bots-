@@ -1556,6 +1556,49 @@ namespace StraftatBots
         private float GetWeaponSelfKnockback()
             => _heldWeapon == null ? 0f : ReadFloatField(_heldWeapon, "playerKnockback", 0f);
 
+        // Per-map: does this map carry a self-propelling weapon at all? Scanned once
+        // per scene so the rocket-jump path costs nothing on maps without one, and so
+        // the log says up front whether height-by-launcher is even possible here.
+        private static string _launcherScanScene;
+        private static bool _mapHasLauncher;
+
+        private static float ReadKnockbackOf(Weapon w)
+        {
+            if (w == null) return 0f;
+            try
+            {
+                var f = GetCachedField(w.GetType(), "playerKnockback");
+                if (f != null) return (float)f.GetValue(w);
+            }
+            catch { }
+            return 0f;
+        }
+
+        private static void EnsureLauncherCache()
+        {
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            if (scene == _launcherScanScene) return;
+            _launcherScanScene = scene;
+            _mapHasLauncher = false;
+            int launchers = 0;
+            foreach (var w in Object.FindObjectsOfType<Weapon>())
+            {
+                if (w == null) continue;
+                if (ReadKnockbackOf(w) >= 3f) launchers++;
+            }
+            _mapHasLauncher = launchers > 0;
+            Plugin.Log.LogInfo($"[BOT] Launcher cache: {launchers} self-propelling weapon(s) on this map"
+                + (_mapHasLauncher ? " — rocket jumps available" : " — no rocket jumps here"));
+        }
+
+        /// <summary>Holding a weapon that can launch this bot upward right now.</summary>
+        private bool HoldingLauncher()
+        {
+            EnsureLauncherCache();
+            if (!_mapHasLauncher) return false;
+            return GetWeaponSelfKnockback() >= 3f && HasShotAvailable();
+        }
+
         private bool HasShotAvailable()
         {
             if (_heldWeapon == null) return false;
@@ -1573,13 +1616,12 @@ namespace StraftatBots
             if (Time.time < _rocketJumpCooldown) return false;
             if (_isSliding || _onLadder || _nearLadder || _intentionalJumpTimer > 0f) return false;
             if (_zoneForceDuration > 0f) return false;
-            if (!HasShotAvailable()) return false;
+            if (!HoldingLauncher()) return false;   // no launcher on this map / in hand
             // Detonating at your own feet hurts (max health is 10) — don't trade the
             // round for a shortcut when already wounded.
             if (_playerHealth != null && _playerHealth.health <= 4f) return false;
 
             float kb = GetWeaponSelfKnockback();
-            if (kb < 3f) return false;              // too weak to clear anything worthwhile
             if (heightNeeded > kb * 1.6f) return false; // physically out of reach — don't waste ammo
 
             // Never launch into a ceiling: the bot would eat the self-damage and go nowhere.

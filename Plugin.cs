@@ -120,6 +120,14 @@ namespace StraftatBots
                         ShowOverlay.Value = false;
                         Log.LogInfo("[BOT] Overlay switched off with Play mode");
                     }
+                    // Get To Me is a testing aid, not a game mode — leaving it on made
+                    // every bot walk to the player and stand there instead of playing.
+                    if (GetToMe != null && GetToMe.Value)
+                    {
+                        GetToMe.Value = false;
+                        Log.LogInfo("[BOT] Get To Me switched off with Play mode");
+                    }
+
                     // Clean slate: kill all bots + player and start a real round on this
                     // map (training suppressed rounds, so the current one is stale).
                     BotManager.Instance?.StartFreshPlayRound();
