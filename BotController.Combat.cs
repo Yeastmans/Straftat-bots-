@@ -1574,6 +1574,31 @@ namespace StraftatBots
             return 0f;
         }
 
+        /// <summary>The ROCKET LAUNCHER specifically (weaponName "rocket launcher").
+        /// Knockback alone is the wrong test: nine weapons carry enough of it to pass a
+        /// threshold — hand canon 20, Gust 15, prophet 13, even the baseball bat at 13 —
+        /// and none of those are a rocket jump.</summary>
+        private static bool IsRocketLauncher(Weapon w)
+        {
+            if (w == null) return false;
+            string name = null;
+            try
+            {
+                var f = GetCachedField(w.GetType(), "weaponName");
+                if (f != null) name = f.GetValue(w) as string;
+            }
+            catch { }
+            if (string.IsNullOrEmpty(name))
+            {
+                var item = w.GetComponent<ItemBehaviour>();
+                if (item == null) item = w.GetComponentInParent<ItemBehaviour>();
+                if (item != null) name = item.weaponName;
+            }
+            if (string.IsNullOrEmpty(name)) name = w.gameObject.name;
+            return !string.IsNullOrEmpty(name)
+                && name.IndexOf("rocket", System.StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         private static void EnsureLauncherCache()
         {
             string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
@@ -1584,18 +1609,19 @@ namespace StraftatBots
             foreach (var w in Object.FindObjectsOfType<Weapon>())
             {
                 if (w == null) continue;
-                if (ReadKnockbackOf(w) >= 3f) launchers++;
+                if (IsRocketLauncher(w)) launchers++;
             }
             _mapHasLauncher = launchers > 0;
-            Plugin.Log.LogInfo($"[BOT] Launcher cache: {launchers} self-propelling weapon(s) on this map"
+            Plugin.Log.LogInfo($"[BOT] Launcher cache: {launchers} rocket launcher(s) on this map"
                 + (_mapHasLauncher ? " — rocket jumps available" : " — no rocket jumps here"));
         }
 
-        /// <summary>Holding a weapon that can launch this bot upward right now.</summary>
+        /// <summary>Holding a rocket launcher with a round ready, on a map that has one.</summary>
         private bool HoldingLauncher()
         {
             EnsureLauncherCache();
             if (!_mapHasLauncher) return false;
+            if (!IsRocketLauncher(_heldWeapon)) return false;
             return GetWeaponSelfKnockback() >= 3f && HasShotAvailable();
         }
 
