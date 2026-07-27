@@ -572,6 +572,11 @@ namespace StraftatBots
                     }
                 }
 
+                // 5. ROCKET JUMP — no ladder, ramp, ledge or wall to work with, but the
+                // held weapon self-propels. Some maps only open up this way.
+                if (TryRocketJump(targetHoriz, heightDiff))
+                    return;
+
                 // Nothing found — just walk toward target
                 MoveTowardNodeless(target, _sprintSpeed);
             }

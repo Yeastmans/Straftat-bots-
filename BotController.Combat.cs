@@ -1544,6 +1544,74 @@ namespace StraftatBots
             return field;
         }
 
+        // ===================== ROCKET JUMP =====================
+        // STRAFTAT's rocket jump is RECOIL, not blast: firing a launcher runs
+        // FirstPersonController.AddForce(-cam.forward, playerKnockback), which drops
+        // straight into moveDirection.y. Aim at your feet and the recoil throws you up.
+        // Bots never got it because FireOnce is our own implementation and never touched
+        // the game's knockback path — so we read the weapon's own playerKnockback and
+        // feed it through the same launch machinery the impulse pads use.
+        private float _rocketJumpCooldown;
+
+        private float GetWeaponSelfKnockback()
+            => _heldWeapon == null ? 0f : ReadFloatField(_heldWeapon, "playerKnockback", 0f);
+
+        private bool HasShotAvailable()
+        {
+            if (_heldWeapon == null) return false;
+            if (ReadBoolField(_heldWeapon, "reloadWeapon"))
+                return ReadFloatField(_heldWeapon, "chargedBullets", 0f) >= 1f;
+            return !_heldWeapon.needsAmmo || _heldWeapon.currentAmmo > 0;
+        }
+
+        /// <summary>Launch off the bot's own weapon to gain height. travelDir is the
+        /// horizontal direction to carry toward; heightNeeded is how far up the
+        /// objective sits. Returns true when the jump actually fired.</summary>
+        private bool TryRocketJump(Vector3 travelDir, float heightNeeded)
+        {
+            if (_cc == null || !_cc.isGrounded || IsDead) return false;
+            if (Time.time < _rocketJumpCooldown) return false;
+            if (_isSliding || _onLadder || _nearLadder || _intentionalJumpTimer > 0f) return false;
+            if (_zoneForceDuration > 0f) return false;
+            if (!HasShotAvailable()) return false;
+            // Detonating at your own feet hurts (max health is 10) — don't trade the
+            // round for a shortcut when already wounded.
+            if (_playerHealth != null && _playerHealth.health <= 4f) return false;
+
+            float kb = GetWeaponSelfKnockback();
+            if (kb < 3f) return false;              // too weak to clear anything worthwhile
+            if (heightNeeded > kb * 1.6f) return false; // physically out of reach — don't waste ammo
+
+            // Never launch into a ceiling: the bot would eat the self-damage and go nowhere.
+            if (Physics.Raycast(transform.position + Vector3.up * 1.9f, Vector3.up,
+                    Mathf.Min(6f, kb), WALL_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+
+            travelDir.y = 0f;
+            travelDir = travelDir.sqrMagnitude > 0.01f ? travelDir.normalized : transform.forward;
+
+            // Aim down and BACK along the travel direction: the push is -cam.forward, so
+            // a down-and-behind aim throws the bot up and forward, same as a player's.
+            Vector3 aimDir = (Vector3.down * 2.5f - travelDir).normalized;
+            if (_botCam != null)
+            {
+                _botCam.transform.position = transform.position + Vector3.up * 1.5f;
+                _botCam.transform.rotation = Quaternion.LookRotation(aimDir);
+            }
+            LookAtDirection(travelDir);
+
+            _rocketJumpCooldown = Time.time + 3.5f;
+            FireOnce();
+
+            // Mirror AddForce: vertical goes straight into velocity, horizontal rides as
+            // a decaying push. ApplyZoneImpulse already owns the launch window, the
+            // void-safety suppression and the no-air-steer arc.
+            Vector3 push = -aimDir * kb;
+            ApplyZoneImpulse(new Vector3(push.x * 0.7f, push.y, push.z * 0.7f));
+            Plugin.Log.LogInfo($"[{BotName}] Rocket jump: knockback {kb:F1}, needed {heightNeeded:F1}m up");
+            return true;
+        }
+
         private float ReadFloatField(object obj, string name, float fallback = 0f)
         {
             try
