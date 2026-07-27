@@ -949,6 +949,7 @@ namespace StraftatBots
         private static Transform _localPlayerTf;
         private static float _localPlayerLookupAt;
         private float _getToMeStuckLogAt;
+        private float _getToMeSeekCooldown; // backoff after a failed climb attempt
 
         private static Transform GetLocalPlayerTransform()
         {
@@ -990,15 +991,17 @@ namespace StraftatBots
 
             Vector3 p = playerTf.position;
             float flat = HorizontalDist(transform.position, p);
+            float heightDiff = p.y - transform.position.y;
 
             // Arrived — hold station facing the player instead of shoving them around.
-            if (flat < 2.5f && Mathf.Abs(p.y - transform.position.y) < 3f)
+            if (flat < 2.5f && Mathf.Abs(heightDiff) < 3f)
             {
                 _currentHorizInput = 0f;
                 LookAtTarget(p);
                 if (_cc != null && _cc.enabled && !_movedThisFrame)
                     DoMove(new Vector3(0f, _verticalVelocity * Time.deltaTime, 0f));
                 _getToMeStuckLogAt = 0f;
+                _exploreState = ExploreState.None;
                 return;
             }
 
@@ -1007,11 +1010,48 @@ namespace StraftatBots
             _wanderTarget = p;
             _hasWanderTarget = true;
             _wanderChangeTimer = 2f;
-            _exploreState = ExploreState.None;
+
+            // A SmartExplore session is running (climbing to reach the player) — let it
+            // finish; it owns movement while active.
+            if (_exploreState != ExploreState.None)
+            {
+                _exploreTotalTimer -= Time.deltaTime;
+                if (_exploreTotalTimer <= 0f || _exploreStateAttempts >= 7)
+                {
+                    _exploreState = ExploreState.None;
+                    _getToMeSeekCooldown = Time.time + 4f;
+                }
+                else
+                {
+                    SmartExplore(p);
+                    return;
+                }
+            }
+            // Player is ABOVE us and we're already near/under them: pathing alone can't
+            // finish this, because a target on a ledge resolves to the floor beneath it —
+            // which is precisely how bots end up milling around below the player. Hand
+            // over to the ladder / ramp / ledge seeker, which exists for this.
+            else if (heightDiff > 3f && flat < 12f && Time.time >= _getToMeSeekCooldown
+                     && (flat < 5f || _progressState != ProgressState.Progressing))
+            {
+                BeginSmartExplore(p);
+                SmartExplore(p);
+                return;
+            }
+
+            // Route to a node at the PLAYER'S level rather than the raw position: node
+            // snapping is a 3D nearest search, so it prefers the floor a few metres
+            // below a balcony over the balcony itself.
+            Vector3 routeTarget = p;
+            if (NavGraph.Instance != null && Mathf.Abs(heightDiff) > 1.5f)
+            {
+                var atLevel = NavGraph.Instance.FindNearestNodeAtHeight(p, 8f, 2.5f);
+                if (atLevel != null) routeTarget = atLevel.Position;
+            }
 
             // The player moved far from what the current route was built for — rebuild
             // now rather than waiting for the route to drift stale.
-            if (HorizontalDist(p, _lastPathTarget) > 5f)
+            if (HorizontalDist(routeTarget, _lastPathTarget) > 5f)
             {
                 _graphPath.Clear();
                 _graphPathIndex = 0;
@@ -1022,10 +1062,10 @@ namespace StraftatBots
             if (_progressState == ProgressState.HardStuck && Time.time >= _getToMeStuckLogAt)
             {
                 _getToMeStuckLogAt = Time.time + 15f;
-                Plugin.Log.LogInfo($"[{BotName}] Get-To-Me: stuck {flat:F0}m from player at {transform.position} (src={_pathSource})");
+                Plugin.Log.LogInfo($"[{BotName}] Get-To-Me: stuck {flat:F0}m out, {heightDiff:F1}m below player at {transform.position} (src={_pathSource})");
             }
 
-            MoveToward(p, _sprintSpeed);
+            MoveToward(routeTarget, _sprintSpeed);
         }
 
         private void Wander()

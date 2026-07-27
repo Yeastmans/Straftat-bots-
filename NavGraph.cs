@@ -972,6 +972,43 @@ namespace StraftatBots
         /// <summary>
         /// Find the nearest node to a position within maxDist.
         /// </summary>
+        /// <summary>Nearest node measured HORIZONTALLY, restricted to roughly the same
+        /// height as pos. FindNearestNode is a 3D search, so a target standing on a
+        /// balcony resolves to the floor node directly beneath it (a few metres down)
+        /// rather than the balcony node (further away horizontally) — routes built from
+        /// it then end UNDER the target instead of at it.</summary>
+        public NavNode FindNearestNodeAtHeight(Vector3 pos, float horizRadius, float maxYDelta)
+        {
+            float bestSqr = horizRadius * horizRadius;
+            NavNode best = null;
+
+            int cells = Mathf.Max(1, Mathf.CeilToInt(horizRadius / GRID_CELL));
+            int yCells = Mathf.Max(1, Mathf.CeilToInt(maxYDelta / GRID_CELL));
+            int cx = Mathf.FloorToInt(pos.x / GRID_CELL);
+            int cz = Mathf.FloorToInt(pos.z / GRID_CELL);
+            int cy = Mathf.FloorToInt(pos.y / GRID_CELL);
+
+            for (int dx = -cells; dx <= cells; dx++)
+            for (int dy = -yCells; dy <= yCells; dy++)
+            for (int dz = -cells; dz <= cells; dz++)
+            {
+                long key = GridKey(cx + dx, cy + dy, cz + dz);
+                if (!_spatialGrid.TryGetValue(key, out var list)) continue;
+                foreach (int idx in list)
+                {
+                    if (idx < 0 || idx >= Nodes.Count) continue;
+                    var node = Nodes[idx];
+                    if (node == null || node.Confidence <= 0) continue;
+                    if (Mathf.Abs(node.Position.y - pos.y) > maxYDelta) continue;
+                    if (IsBlacklisted(node.Id)) continue;
+                    float ddx = node.Position.x - pos.x, ddz = node.Position.z - pos.z;
+                    float sqr = ddx * ddx + ddz * ddz;
+                    if (sqr < bestSqr) { bestSqr = sqr; best = node; }
+                }
+            }
+            return best;
+        }
+
         public NavNode FindNearestNode(Vector3 pos, float maxDist)
         {
             float bestSqr = maxDist * maxDist;
