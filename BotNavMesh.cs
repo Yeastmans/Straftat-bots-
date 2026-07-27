@@ -105,7 +105,7 @@ namespace StraftatBots
             }
         }
 
-        public static bool Ready => _baked && (Plugin.UseNavMesh == null || Plugin.UseNavMesh.Value);
+        public static bool Ready => _baked;
         public static string BakedScene => _bakedScene;
         public static string Status { get; private set; } = "not baked";
 

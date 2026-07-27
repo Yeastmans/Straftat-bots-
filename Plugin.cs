@@ -23,7 +23,8 @@ namespace StraftatBots
 
         // ===== Gameplay =====
         public static ConfigEntry<bool> LockGraph;
-        public static ConfigEntry<bool> UseNavMesh;
+        // Auto ground navigation is ALWAYS on — bots that can't walk the map are never
+        // the behaviour anyone wants, so it is not a setting and has no mod-menu entry.
 
         // ===== Training =====
         // Behavior is STAGE-DRIVEN now (Explore for stages 1-2, Validate for stage 3,
@@ -178,10 +179,6 @@ namespace StraftatBots
             LockGraph = Config.Bind("Gameplay", "Freeze Map Data", false,
                 "Freeze the navigation graph. Nothing is created, deleted, or modified. " +
                 "Use when you're happy with the trained data and want to preserve it exactly.");
-            UseNavMesh = Config.Bind("Gameplay", "Auto Ground Navigation", true,
-                "Automatically generate a walkable navigation mesh for every map at load. " +
-                "Bots can walk anywhere immediately with no training; learned data is still " +
-                "used for jumps, ladders and special routes. Disable to use only learned paths.");
             // ================================================================
             //  TRAINING — behavior is stage-driven (no Bot Behavior knob anymore).
             // ================================================================

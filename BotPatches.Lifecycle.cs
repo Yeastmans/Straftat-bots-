@@ -98,10 +98,8 @@ namespace StraftatBots
 
                 // Auto-bake ground navigation for this map — bots can walk anywhere without
                 // training; the learned graph stays in charge of jumps/ladders/teleporters.
-                if (Plugin.UseNavMesh == null || Plugin.UseNavMesh.Value)
-                    BotNavMesh.Bake(mapName);
-                else
-                    BotNavMesh.Clear();
+                // Always on, no setting: bots that can't walk the map are never wanted.
+                BotNavMesh.Bake(mapName);
 
                 // Register spawn points and weapon spawners as fixed nodes
                 NavGraph.Instance.RegisterMapLocations();
