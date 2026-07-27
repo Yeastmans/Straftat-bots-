@@ -2232,6 +2232,8 @@ namespace StraftatBots
                 bool isOtherBot = IsBot(ph);
                 BotController otherBot = isOtherBot ? ph.GetComponent<BotController>() : null;
                 if (otherBot != null && otherBot.IsDead) continue;
+                // Spectating host is not a target.
+                if (!isOtherBot && Plugin.HostSpectate != null && Plugin.HostSpectate.Value) continue;
 
                 float dist = HorizontalDist(transform.position, ph.transform.position);
                 if (dist >= _detectionRange) continue;
@@ -2275,6 +2277,15 @@ namespace StraftatBots
             _allHumansDeadTimer -= Time.deltaTime;
             if (_allHumansDeadTimer > 0f) return _cachedAllHumansDead;
             _allHumansDeadTimer = 0.5f;
+
+            // Host Spectate: the host is out of play, so bots must treat the match as
+            // bot-only — otherwise they hold fire waiting on a "live human" who never
+            // fights, and never engage each other.
+            if (Plugin.HostSpectate != null && Plugin.HostSpectate.Value)
+            {
+                _cachedAllHumansDead = true;
+                return true;
+            }
 
             _cachedAllHumansDead = true;
             foreach (var ph in GetCachedPlayers())

@@ -191,6 +191,9 @@ namespace StraftatBots
                 if (BotManager.Instance != null)
                     BotManager.Instance.SpawnAllBots();
 
+                // Host Spectate is decided per round, once the player object exists.
+                BotManager.ApplyHostSpectateIfEnabled();
+
                 if (NavGraph.Instance != null && NavGraph.Instance.HasData)
                     NavGraph.Instance.CacheKeyRoutes();
             }

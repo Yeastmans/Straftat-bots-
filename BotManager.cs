@@ -319,6 +319,49 @@ namespace StraftatBots
             }
         }
 
+        // ---- Host Spectate ----
+        // Bot-only matches: the host doesn't play. The body is stripped of its hittable
+        // colliders and renderers (so bots can't shoot what isn't really there) and the
+        // camera detaches into freecam. Bots also stop counting the host as a live human
+        // — see AllHumansDead/FindNearestPlayer — so they fight each other instead of
+        // standing around waiting for a player who will never engage.
+        private static bool _hostSpectateApplied;
+
+        public static void ApplyHostSpectateIfEnabled()
+        {
+            bool want = Plugin.HostSpectate != null && Plugin.HostSpectate.Value;
+            if (!want && !_hostSpectateApplied) return;
+
+            FirstPersonController fpc = null;
+            try { fpc = ClientInstance.Instance?.PlayerSpawner?.player; } catch { }
+
+            if (want)
+            {
+                if (fpc != null)
+                {
+                    foreach (var col in fpc.GetComponentsInChildren<Collider>(true))
+                    {
+                        // Keep the CharacterController: it isn't a shootable hitbox and
+                        // disabling it upsets the controller the freecam freezes.
+                        if (col == null || col is CharacterController) continue;
+                        col.enabled = false;
+                    }
+                    foreach (var r in fpc.GetComponentsInChildren<Renderer>(true))
+                        if (r != null) r.enabled = false;
+                }
+                if (!FreeCam.Active) FreeCam.Toggle();
+                _hostSpectateApplied = true;
+                Plugin.Log.LogInfo("[BOT] Host Spectate: host is out of play, bots only");
+            }
+            else
+            {
+                // Turned off — the fresh round object spawns intact; just land the camera.
+                _hostSpectateApplied = false;
+                if (FreeCam.Active) FreeCam.Toggle();
+                Plugin.Log.LogInfo("[BOT] Host Spectate off — host plays this round");
+            }
+        }
+
         /// <summary>
         /// Kill all alive bots to force a draw when no humans remain.
         /// </summary>

@@ -23,6 +23,7 @@ namespace StraftatBots
 
         // ===== Gameplay =====
         public static ConfigEntry<bool> LockGraph;
+        public static ConfigEntry<bool> HostSpectate;
         // Auto ground navigation is ALWAYS on — bots that can't walk the map are never
         // the behaviour anyone wants, so it is not a setting and has no mod-menu entry.
 
@@ -100,8 +101,15 @@ namespace StraftatBots
                 new ConfigDescription("How many AI bots to spawn into matches.",
                     new AcceptableValueRange<int>(0, 8)));
 
-            DrawTimer = Config.Bind("Bots", "Draw Timeout", 25,
-                "When only bots remain alive, end the round after this many seconds (1-900).");
+            HostSpectate = Config.Bind("Bots", "Host Spectate", false,
+                "Watch bot-only matches: you don't spawn, you spectate in freecam and " +
+                "bots ignore you entirely. Applies from the next round start; turn it off " +
+                "and you spawn normally on the round after.");
+
+            DrawTimer = Config.Bind("Bots", "Draw Timeout", 900,
+                "When only bots remain alive, end the round after this many seconds (1-900). " +
+                "Defaults high so bot-only matches (see Host Spectate) run to a real finish " +
+                "instead of being cut short — lower it if you want faster draws.");
 
             NavGraphMode = Config.Bind("Bots", "Mode", "Play",
                 new ConfigDescription(
