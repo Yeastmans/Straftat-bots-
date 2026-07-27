@@ -1227,7 +1227,7 @@ namespace StraftatBots
             // GET TO ME overrides everything below: training work, the pause freeze,
             // weapon hunting, combat. Checked before the freeze so a paused session
             // still sends bots at the player.
-            bool getToMe = Plugin.GetToMe != null && Plugin.GetToMe.Value;
+            bool getToMe = Plugin.GetToMe;
 
             // Training None = freeze bots in place.
             // EXCEPTION: if the graph is empty, auto-kickstart — bots explore anyway so
@@ -2485,7 +2485,7 @@ namespace StraftatBots
             // Combat strafing legitimately covers ground without displacement.
             if (State == BotState.Hunt || _playerTarget != null) return;
             // Get-To-Me: dropping the objective is exactly what must NOT happen.
-            if (Plugin.GetToMe != null && Plugin.GetToMe.Value) return;
+            if (Plugin.GetToMe) return;
 
             _oscSampleTimer -= Time.deltaTime;
             if (_oscSampleTimer > 0f) return;

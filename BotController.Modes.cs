@@ -146,7 +146,7 @@ namespace StraftatBots
         {
             Vector3 pos = transform.position;
             // Get-To-Me owns the objective — dwelling near the player is the POINT.
-            if (Plugin.GetToMe != null && Plugin.GetToMe.Value)
+            if (Plugin.GetToMe)
             {
                 _dwellAnchor = pos;
                 _dwellTimer = 0f;

@@ -19,6 +19,8 @@ namespace StraftatBots
         public static void OnLoadSceneEnd_Postfix(PlayerManager __instance, SceneLoadEndEventArgs args)
         {
             Plugin.Log.LogInfo("[BOT] OnLoadSceneEnd fired");
+            // Every map load is a fresh match — Get To Me never carries into one.
+            Plugin.ForceGetToMeOff("match load");
             BotController.ClearStaticCaches(); // Clear stale references from previous scene
             if (InstanceFinder.NetworkManager == null || !InstanceFinder.NetworkManager.IsServer) return;
 

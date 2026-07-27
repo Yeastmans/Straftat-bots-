@@ -62,7 +62,19 @@ namespace StraftatBots
         public static ConfigEntry<bool> ShowOverlay;
         public static ConfigEntry<bool> ShowCoverageMap;
         public static ConfigEntry<bool> ShowMeshDebug;
-        public static ConfigEntry<bool> GetToMe;
+
+        // Get To Me — training-panel button ONLY. Deliberately NOT a ConfigEntry: a
+        // config entry shows up in the mod menu and persists across sessions, and this
+        // is a momentary testing aid that must never survive into a real match.
+        // Forced off at every match start (see ForceGetToMeOff callers).
+        public static bool GetToMe;
+
+        public static void ForceGetToMeOff(string reason)
+        {
+            if (!GetToMe) return;
+            GetToMe = false;
+            Log.LogInfo($"[BOT] Get To Me switched off ({reason})");
+        }
         // One-line perf summary every 10s (fps, bot CPU ms/frame, GC pressure).
         public static ConfigEntry<bool> LogPerfStats;
         // Intentionally not bound to config anymore; optional diagnostic logs stay quiet by default.
@@ -120,13 +132,7 @@ namespace StraftatBots
                         ShowOverlay.Value = false;
                         Log.LogInfo("[BOT] Overlay switched off with Play mode");
                     }
-                    // Get To Me is a testing aid, not a game mode — leaving it on made
-                    // every bot walk to the player and stand there instead of playing.
-                    if (GetToMe != null && GetToMe.Value)
-                    {
-                        GetToMe.Value = false;
-                        Log.LogInfo("[BOT] Get To Me switched off with Play mode");
-                    }
+                    ForceGetToMeOff("Play mode");
 
                     // Clean slate: kill all bots + player and start a real round on this
                     // map (training suppressed rounds, so the current one is stale).
@@ -221,10 +227,6 @@ namespace StraftatBots
             ShowMeshDebug = Config.Bind("Debug", "Mesh Debug", false,
                 "Draw just the baked navmesh wireframe (without the full bot overlay).");
 
-            GetToMe = Config.Bind("Bots", "Get To Me", false,
-                "Every bot drops what it's doing and heads for your current position, " +
-                "repathing as you move. Overrides training work, pause and combat. " +
-                "Bots never teleport, so anywhere they can't reach is a real traversal gap.");
 
             LogPerfStats = Config.Bind("Debug", "Log Perf Stats", true,
                 "Write a one-line performance summary to the log every 10 seconds " +

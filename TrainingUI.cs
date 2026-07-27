@@ -304,12 +304,12 @@ namespace StraftatBots
             cy += 28f;
 
             // ---- Get To Me — every bot comes to where you're standing ----
-            bool getToMe = Plugin.GetToMe != null && Plugin.GetToMe.Value;
+            bool getToMe = Plugin.GetToMe;
             if (GUI.Button(new Rect(cx, cy, cw, 24),
                     getToMe ? "Get To Me: ON (bots are coming)" : "Get To Me: OFF",
                     getToMe ? _activeButtonStyle : _buttonStyle))
             {
-                if (Plugin.GetToMe != null) Plugin.GetToMe.Value = !getToMe;
+                Plugin.GetToMe = !getToMe;
             }
             cy += 32f;
 

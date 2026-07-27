@@ -295,6 +295,7 @@ namespace StraftatBots
         {
             if (InstanceFinder.NetworkManager == null || !InstanceFinder.NetworkManager.IsServer) return;
 
+            Plugin.ForceGetToMeOff("round start");
             ResetDrawTimer();
             _trainingPlayerDeadTimer = 0f;
             DespawnAllBots();
