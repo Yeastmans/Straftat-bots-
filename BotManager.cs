@@ -194,6 +194,13 @@ namespace StraftatBots
             if (anyHumanAlive && !HasLivingHumanPlayerHealth())
                 anyHumanAlive = false;
 
+            // Host Spectate: the host is still registered in GameManager.alivePlayers
+            // and still has health — it's only the body that was taken out of play. Left
+            // counting as a live human, neither the last-bot-standing win nor the draw
+            // timer below can ever fire, so bot-only rounds ran forever.
+            if (Plugin.HostSpectate != null && Plugin.HostSpectate.Value)
+                anyHumanAlive = false;
+
             // Training mode: never end the round — bots need uninterrupted time.
             // But rounds never ending means a dead PLAYER would spectate forever, so
             // bring them back through the game's own round-spawn flow (same path the
